@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# tunure — Lure/Sulfur service management helper
+# Usage: tunure [status|start|stop|restart|logs]
+set -euo pipefail
+
+CMD="${1:-status}"
+PROFILES=(lure lure-proxy sulfur-lure sulfurproject-lure)
+
+for profile in "${PROFILES[@]}"; do
+    if systemctl list-units --full --all 2>/dev/null | grep -Fq "${profile}.service"; then
+        exec systemctl "${CMD}" "${profile}.service"
+    fi
+done
+
+# Fallback: show running processes
+echo "[tunure] No matching systemd service found. Checking processes..."
+if pgrep -a lure 2>/dev/null; then
+    echo "[tunure] Lure is running (see above)"
+else
+    echo "[tunure] Lure is not running"
+fi
