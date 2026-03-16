@@ -2,10 +2,11 @@ use std::{
     net::{SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
+    sync::Arc,
 };
 
 use clap::{Args, Parser, Subcommand};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use tun::{AgentHello, Intent, ServerMsg};
 
 #[derive(Parser)]
@@ -559,12 +560,15 @@ async fn handle_session(
 }
 
 async fn listen_once(ingress: SocketAddr, config: TunConfig) -> anyhow::Result<()> {
+    const MAX_CONCURRENT_TUNNEL_SESSIONS: usize = 1000;
+
     let mut listener = tun::connect_agent(ingress).await?;
     debug!(
         "connected to proxy: local={:?} peer={:?}",
         listener.local_addr().ok(),
         listener.peer_addr().ok()
     );
+    let session_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TUNNEL_SESSIONS));
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -600,6 +604,15 @@ async fn listen_once(ingress: SocketAddr, config: TunConfig) -> anyhow::Result<(
         if let ServerMsg::SessionOffer(session) = msg {
             let session_prefix = format!("{:02x}", session[0]);
             info!("session offered: session={session_prefix}");
+            let permit = match Arc::clone(&session_slots).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    warn!(
+                        "dropping session offer: session={session_prefix} active_session_limit={MAX_CONCURRENT_TUNNEL_SESSIONS}"
+                    );
+                    continue;
+                }
+            };
             let ingress = ingress;
             let config = TunConfig {
                 key_id: config.key_id,
@@ -608,6 +621,7 @@ async fn listen_once(ingress: SocketAddr, config: TunConfig) -> anyhow::Result<(
             match net::sock::backend_kind() {
                 net::sock::BackendKind::Tokio | net::sock::BackendKind::Epoll => {
                     tokio::task::spawn_local(async move {
+                        let _permit = permit;
                         if let Err(e) = handle_session(ingress, config, session).await {
                             error!("tun handle_session failed: {e}");
                         }
@@ -615,6 +629,7 @@ async fn listen_once(ingress: SocketAddr, config: TunConfig) -> anyhow::Result<(
                 }
                 net::sock::BackendKind::Uring => {
                     net::sock::uring::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = handle_session(ingress, config, session).await {
                             error!("tun handle_session failed: {e}");
                         }
@@ -627,7 +642,7 @@ async fn listen_once(ingress: SocketAddr, config: TunConfig) -> anyhow::Result<(
 
 async fn run(ingress: SocketAddr, config: TunConfig) -> anyhow::Result<()> {
     let mut delay = std::time::Duration::from_millis(250);
-    let max_delay = std::time::Duration::from_secs(10);
+    let max_delay = std::time::Duration::from_secs(5);
 
     loop {
         match listen_once(
