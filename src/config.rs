@@ -160,6 +160,20 @@ pub struct RouteFlagsConfig {
 pub struct TunnelConfig {
     /// List of registered tokens
     pub token: Vec<TokenEntry>,
+    #[serde(default)]
+    pub bootstrap_url: Option<String>,
+    #[serde(default)]
+    pub endpoints: Vec<EndpointInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct EndpointInfo {
+    pub uniqname: String,
+    pub city: String,
+    pub country: String,
+    pub desc: String,
+    pub host: String,
+    pub port: u16,
 }
 
 /// Individual token entry for tunnel authentication

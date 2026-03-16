@@ -145,6 +145,8 @@ pub struct TunnelRegistry {
     pending: RwLock<HashMap<SessionToken, PendingSession>>,
     /// Expired sessions counter
     expired_sessions: std::sync::atomic::AtomicU64,
+    /// Cached endpoint list from bootstrap poller
+    pub endpoint_cache: tokio::sync::RwLock<Vec<crate::config::EndpointInfo>>,
 }
 
 struct AgentRecord {
@@ -175,6 +177,7 @@ impl Default for TunnelRegistry {
             pending: RwLock::new(HashMap::new()),
             expired_sessions: std::sync::atomic::AtomicU64::new(0),
             agent_gen: std::sync::atomic::AtomicU64::new(1),
+            endpoint_cache: tokio::sync::RwLock::new(Vec::new()),
         }
     }
 }
@@ -604,6 +607,37 @@ impl TunnelRegistry {
             agents: agent_out,
             pending: pending_out,
         }
+    }
+
+    pub async fn start_bootstrap_poller(
+        self: &Arc<Self>,
+        bootstrap_url: String,
+    ) {
+        let registry = Arc::clone(self);
+        crate::utils::spawn_named("tunnel-bootstrap", async move {
+            let client = reqwest::Client::new();
+            let url = format!("{}/api/open/endpoints", bootstrap_url.trim_end_matches('/'));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                match client.get(&url).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        match resp.json::<Vec<crate::config::EndpointInfo>>().await {
+                            Ok(nodes) => {
+                                let count = nodes.len();
+                                *registry.endpoint_cache.write().await = nodes;
+                                log::info!("[tunnel-bootstrap] refreshed {} endpoints from {}", count, url);
+                            }
+                            Err(e) => log::warn!("[tunnel-bootstrap] JSON parse error: {e}"),
+                        }
+                    }
+                    Ok(resp) => log::warn!("[tunnel-bootstrap] HTTP {} from {}", resp.status(), url),
+                    Err(e) => log::warn!("[tunnel-bootstrap] fetch failed: {e}"),
+                }
+            }
+        })
+        .ok();
     }
 
     pub(crate) async fn cleanup_expired_sessions(&self) {

@@ -223,6 +223,8 @@ async fn run_suite(cfg: SuiteConfig) -> anyhow::Result<()> {
                 name: Some("instance_tcp_test".to_string()),
                 zone: None,
             }],
+            bootstrap_url: None,
+            endpoints: Vec::new(),
         };
         tunnel_config.route[0].flags = Some(RouteFlagsConfig {
             tunnel: true,

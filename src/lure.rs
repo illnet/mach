@@ -105,6 +105,16 @@ impl Lure {
         })
         .ok();
 
+        // Start bootstrap poller if configured
+        if let Some(url) = &config.tunnel.bootstrap_url {
+            let tunnels_clone = Arc::clone(&tunnels);
+            let url = url.clone();
+            spawn_named("tunnel-bootstrap-start", async move {
+                tunnels_clone.start_bootstrap_poller(url).await;
+            })
+            .ok();
+        }
+
         // Spawn cleanup task for tunnel registry
         let tunnels_clone = Arc::clone(&tunnels);
         spawn_named("tunnel-cleanup-task", async move {
