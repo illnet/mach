@@ -614,8 +614,17 @@ impl TunnelRegistry {
         bootstrap_url: String,
     ) {
         let registry = Arc::clone(self);
-        crate::utils::spawn_named("tunnel-bootstrap", async move {
-            let client = reqwest::Client::new();
+        let spawn_result = crate::utils::spawn_named("tunnel-bootstrap", async move {
+            let client = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+            {
+                Ok(client) => client,
+                Err(e) => {
+                    log::error!("[tunnel-bootstrap] failed to build HTTP client: {e}");
+                    return;
+                }
+            };
             let url = format!("{}/api/open/endpoints", bootstrap_url.trim_end_matches('/'));
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -636,8 +645,10 @@ impl TunnelRegistry {
                     Err(e) => log::warn!("[tunnel-bootstrap] fetch failed: {e}"),
                 }
             }
-        })
-        .ok();
+        });
+        if let Err(e) = spawn_result {
+            log::error!("[tunnel-bootstrap] failed to spawn task: {e}");
+        }
     }
 
     pub(crate) async fn cleanup_expired_sessions(&self) {

@@ -438,19 +438,19 @@ impl PacketEncode for LoginStartC2s<'_> {
     }
 }
 
-/// Login Transfer (S2C) — Minecraft 1.20.5+ only (protocol >= 766).
+/// Transfer in Configuration state (S2C) — Minecraft 1.20.5+ only (protocol >= 766).
 /// Instructs the client to reconnect to a different server.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoginTransferS2c<'a> {
+pub struct TransferConfigS2c<'a> {
     pub host: &'a str,
     pub port: u16,
 }
 
-impl LoginTransferS2c<'_> {
-    pub const ID: i32 = 0x65;
+impl TransferConfigS2c<'_> {
+    pub const ID: i32 = 0x0B;
 }
 
-impl PacketEncode for LoginTransferS2c<'_> {
+impl PacketEncode for TransferConfigS2c<'_> {
     const ID: i32 = Self::ID;
 
     fn encode_body(&self, out: &mut Vec<u8>) -> Result<()> {

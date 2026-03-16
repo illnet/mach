@@ -778,7 +778,7 @@ impl Lure {
         // Auto Redirect: for compatible clients on Redirection routes, send Transfer packet.
         const TRANSFER_MIN_PROTOCOL: i32 = 766; // MC 1.20.5+
         if resolved.route.redirection() && handshake.protocol_version >= TRANSFER_MIN_PROTOCOL {
-            let transfer = net::LoginTransferS2c {
+            let transfer = net::TransferConfigS2c {
                 host: &resolved.endpoint_host,
                 port: resolved.endpoint.port(),
             };
