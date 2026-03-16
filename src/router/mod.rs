@@ -44,6 +44,8 @@ pub enum RouteFlags {
     ProxyProtocol,
     PreserveHost,
     Tunnel,
+    Redirection,  // ordinal 6 → bitmask 64
+    AllowsLocal,  // ordinal 7 → bitmask 128
 }
 
 /// Authorization mode for tunnel routes
@@ -119,6 +121,18 @@ impl Route {
     #[must_use]
     pub fn override_query(&self) -> bool {
         self.read_flag(RouteFlags::OverrideQuery)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn redirection(&self) -> bool {
+        self.read_flag(RouteFlags::Redirection)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn allows_local(&self) -> bool {
+        self.read_flag(RouteFlags::AllowsLocal)
     }
 }
 

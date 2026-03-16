@@ -36,6 +36,18 @@ use crate::{
 };
 mod backend;
 mod query;
+
+fn is_local_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+        }
+    }
+}
+
 pub struct Lure {
     config: RwLock<LureConfig>,
     router: &'static RouterInstance,
@@ -737,6 +749,21 @@ impl Lure {
             .await;
             return Ok(());
         };
+
+        // Block local IP clients unless route explicitly permits or route uses tunnel.
+        if !resolved.route.allows_local() && !resolved.route.tunnel() {
+            let ip = address.ip();
+            if is_local_ip(ip) {
+                self.disconnect_login(&mut client, address, |config| {
+                    (
+                        config.string_value("LOCAL_NOT_ALLOWED"),
+                        format!("LOCAL_NOT_ALLOWED: local address {ip} not permitted on this route"),
+                    )
+                })
+                .await;
+                return Ok(());
+            }
+        }
 
         let Some((session, route)) = self
             .create_proxy_session(&mut client, address, hostname, &resolved, profile)

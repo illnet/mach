@@ -144,6 +144,10 @@ pub struct RouteFlagsConfig {
     pub override_query: bool,
     pub preserve_host: bool,
     pub tunnel: bool,
+    #[serde(default)]
+    pub redirection: bool,
+    #[serde(default)]
+    pub allows_local: bool,
     /// Authentication mode: "public", "protected", "restricted"
     pub auth_mode: String,
     /// For `auth_mode` = "restricted", list of allowed token `key_ids`
@@ -333,6 +337,12 @@ impl RouteFlagsConfig {
         }
         if self.tunnel {
             attr.set_flag(RouteFlags::Tunnel);
+        }
+        if self.redirection {
+            attr.set_flag(RouteFlags::Redirection);
+        }
+        if self.allows_local {
+            attr.set_flag(RouteFlags::AllowsLocal);
         }
         attr
     }
