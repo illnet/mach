@@ -765,6 +765,21 @@ impl Lure {
             }
         }
 
+        // Auto Redirect: for compatible clients on Redirection routes, send Transfer packet.
+        const TRANSFER_MIN_PROTOCOL: i32 = 766; // MC 1.20.5+
+        if resolved.route.redirection() && handshake.protocol_version >= TRANSFER_MIN_PROTOCOL {
+            let transfer = net::LoginTransferS2c {
+                host: &resolved.endpoint_host,
+                port: resolved.endpoint.port(),
+            };
+            if let Err(e) = client.send(&transfer).await {
+                debug!("LoginTransfer send failed: {e}");
+            }
+            let _ = client.as_inner_mut().shutdown().await;
+            return Ok(());
+        }
+        // protocol < 766 or no Redirection flag → fall through to normal proxy
+
         let Some((session, route)) = self
             .create_proxy_session(&mut client, address, hostname, &resolved, profile)
             .await
