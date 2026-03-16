@@ -12,8 +12,6 @@ use opentelemetry::{
     KeyValue,
     metrics::{Counter, Histogram, Meter},
 };
-use serde_json::to_string as json_string;
-
 use crate::{sock::LureConnection, telemetry::get_meter};
 
 pub(crate) struct EncodedConnection<'a> {
@@ -124,7 +122,7 @@ impl<'a> EncodedConnection<'a> {
     // }
 
     pub async fn disconnect_player(&mut self, reason: &str) -> anyhow::Result<()> {
-        let reason_json = json_string(reason)?;
+        let reason_json = serde_json::json!({"text": reason}).to_string();
         let kick = LoginDisconnectS2c {
             reason: &reason_json,
         };

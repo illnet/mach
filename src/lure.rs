@@ -539,6 +539,14 @@ impl Lure {
                 return Ok(());
             }
             debug!("CacheQuery cache miss for route {}, querying backend", route_id);
+
+            // Tunnel backends are unreachable via direct TCP; on cache miss serve placeholder.
+            if route.tunnel() {
+                debug!("CacheQuery cache miss for tunnel route {}, serving placeholder", route_id);
+                query::send_status_failure(&mut client, &config, "OVERRIDE_QUERY").await?;
+                query::handle_ping_pong_local(&mut client, self.threat).await?;
+                return Ok(());
+            }
         }
 
         // Live backend query path (used when cache_query is false, or on cache miss)
