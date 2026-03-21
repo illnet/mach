@@ -27,7 +27,7 @@ pub fn placeholder_status_json(config: &LureConfig, label: &str) -> String {
 }
 
 pub async fn send_status_failure(
-    client: &mut EncodedConnection<'_>,
+    client: &mut EncodedConnection,
     config: &LureConfig,
     label: &str,
 ) -> anyhow::Result<()> {
@@ -40,7 +40,7 @@ pub async fn send_status_failure(
 
 /// Send a cached or computed status response from raw JSON bytes
 pub async fn send_status_response(
-    client: &mut EncodedConnection<'_>,
+    client: &mut EncodedConnection,
     json_bytes: &[u8],
 ) -> anyhow::Result<()> {
     // Convert bytes to string for sending (StatusResponseS2c expects &str)
@@ -51,7 +51,7 @@ pub async fn send_status_response(
 
 /// Handle ping/pong locally by echoing the client's timestamp
 pub async fn handle_ping_pong_local(
-    client: &mut EncodedConnection<'_>,
+    client: &mut EncodedConnection,
     threat: &ThreatControlService,
 ) -> anyhow::Result<()> {
     let intent = ClientIntent {

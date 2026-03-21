@@ -14,15 +14,19 @@ use opentelemetry::{
 };
 use crate::{sock::LureConnection, telemetry::get_meter};
 
-pub(crate) struct EncodedConnection<'a> {
+/// An in-flight connection with packet encode/decode state.
+///
+/// Owns the underlying [`LureConnection`] for the duration of the handshake
+/// phase. Call [`EncodedConnection::into_inner`] to reclaim the connection
+/// for passthrough once all packet exchange is done.
+pub(crate) struct EncodedConnection {
     enc: PacketEncoder,
     dec: PacketDecoder,
     frame: PacketFrame,
-    stream: &'a mut LureConnection,
+    stream: LureConnection,
     read_buf: Vec<u8>,
     metric: ConnectionMetric,
     intent: KeyValue,
-    _reserved_lifetime: std::marker::PhantomData<&'a ()>,
 }
 
 pub struct LoginStartFrame<'a> {
@@ -77,8 +81,8 @@ impl PacketEncode for VersionedLoginStart<'_, '_> {
     }
 }
 
-impl<'a> EncodedConnection<'a> {
-    pub fn new(stream: &'a mut LureConnection, intent: SocketIntent) -> Self {
+impl EncodedConnection {
+    pub fn new(stream: LureConnection, intent: SocketIntent) -> Self {
         let metric = get_meter();
         Self {
             enc: PacketEncoder::new(),
@@ -91,12 +95,11 @@ impl<'a> EncodedConnection<'a> {
             read_buf: vec![0u8; MAX_CHUNK_SIZE],
             metric: ConnectionMetric::new(&metric),
             intent: intent.as_attr(),
-            _reserved_lifetime: std::marker::PhantomData,
         }
     }
 
     pub fn with_buffered(
-        stream: &'a mut LureConnection,
+        stream: LureConnection,
         intent: SocketIntent,
         buffered: Vec<u8>,
     ) -> Self {
@@ -248,15 +251,20 @@ impl<'a> EncodedConnection<'a> {
     }
 
     pub const fn as_inner_mut(&mut self) -> &mut LureConnection {
-        self.stream
+        &mut self.stream
     }
 
     pub const fn as_inner(&self) -> &LureConnection {
-        self.stream
+        &self.stream
     }
 
     pub fn take_pending_inbound(&mut self) -> Vec<u8> {
         self.dec.take_pending_bytes()
+    }
+
+    /// Consume this encoded connection and reclaim the underlying transport.
+    pub fn into_inner(self) -> LureConnection {
+        self.stream
     }
 }
 

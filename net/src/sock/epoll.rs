@@ -500,3 +500,158 @@ pub fn passthrough(_fd_a: RawFd, _fd_b: RawFd) -> io::Result<EpollStats> {
 pub fn close_fd(fd: RawFd) {
     let _ = unsafe { close(fd) };
 }
+
+// ── Global EpollBackend singleton ─────────────────────────────────────────────
+
+static GLOBAL_EPOLL: OnceLock<io::Result<Arc<EpollBackend>>> = OnceLock::new();
+
+/// Returns the global [`EpollBackend`], initialising it on first call.
+pub fn get_global_backend() -> io::Result<Arc<EpollBackend>> {
+    GLOBAL_EPOLL
+        .get_or_init(|| {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            EpollBackend::new(workers, 1024, 8192).map(Arc::new)
+        })
+        .as_ref()
+        .map(Arc::clone)
+        .map_err(|e| io::Error::other(e.to_string()))
+}
+
+// ── Sock trait implementation ─────────────────────────────────────────────────
+
+use std::{future::Future, pin::Pin, sync::OnceLock};
+
+impl Connection {
+    /// Start bidirectional proxy by duping both FDs and submitting to the
+    /// global [`EpollBackend`] worker pool.
+    pub(crate) fn into_proxy(
+        self,
+        peer: Box<dyn crate::sock::Sock>,
+    ) -> io::Result<crate::sock::ProxyHandle> {
+        use std::sync::atomic::Ordering;
+
+        let self_fd = self.as_ref().as_raw_fd();
+        let peer_fd = peer
+            .raw_fd()
+            .ok_or_else(|| io::Error::other("epoll proxy: peer has no raw fd"))?;
+
+        let fd_a = duplicate_fd(self_fd)?;
+        let fd_b = duplicate_fd(peer_fd)?;
+        drop(self); // deregister original fd from tokio's reactor
+        drop(peer); // same for peer
+
+        let backend = get_global_backend().inspect_err(|_| {
+            close_fd(fd_a);
+            close_fd(fd_b);
+        })?;
+
+        let (rx, ep_progress) = backend.spawn_pair_observed(fd_a, fd_b)?;
+
+        let progress = Arc::new(crate::sock::ProxyProgress::default());
+        let prog2 = Arc::clone(&progress);
+
+        let future: Pin<
+            Box<dyn Future<Output = io::Result<crate::sock::ProxyStats>> + Send + 'static>,
+        > = Box::pin(async move {
+            // Poll ep_progress at 100 ms cadence until completion to give live
+            // stats to the parent's metrics layer.
+            let done = {
+                let mut rx = rx;
+                loop {
+                    match tokio::time::timeout(
+                        tokio::time::Duration::from_millis(100),
+                        &mut rx,
+                    )
+                    .await
+                    {
+                        Ok(Ok(d)) => break d,
+                        Ok(Err(_)) => return Err(io::Error::other("epoll done channel closed")),
+                        Err(_) => {
+                            // 100 ms elapsed — update live progress and continue
+                            let snap = ep_progress.snapshot();
+                            prog2.c2s_bytes.store(snap.c2s_bytes, Ordering::Relaxed);
+                            prog2.s2c_bytes.store(snap.s2c_bytes, Ordering::Relaxed);
+                            prog2.c2s_chunks.store(snap.c2s_chunks, Ordering::Relaxed);
+                            prog2.s2c_chunks.store(snap.s2c_chunks, Ordering::Relaxed);
+                        }
+                    }
+                }
+            };
+
+            if done.result < 0 {
+                return Err(io::Error::from_raw_os_error(-done.result));
+            }
+
+            let stats = crate::sock::ProxyStats {
+                c2s_bytes: done.stats.c2s_bytes,
+                s2c_bytes: done.stats.s2c_bytes,
+                c2s_chunks: done.stats.c2s_chunks,
+                s2c_chunks: done.stats.s2c_chunks,
+            };
+            prog2.c2s_bytes.store(stats.c2s_bytes, Ordering::Relaxed);
+            prog2.s2c_bytes.store(stats.s2c_bytes, Ordering::Relaxed);
+            prog2.c2s_chunks.store(stats.c2s_chunks, Ordering::Relaxed);
+            prog2.s2c_chunks.store(stats.s2c_chunks, Ordering::Relaxed);
+            Ok(stats)
+        });
+
+        Ok(crate::sock::ProxyHandle { future, progress })
+    }
+}
+
+impl crate::sock::Sock for Connection {
+    fn backend_kind(&self) -> crate::sock::BackendKind {
+        crate::sock::BackendKind::Epoll
+    }
+
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        Connection::peer_addr(self)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Connection::local_addr(self)
+    }
+
+    fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        Connection::set_nodelay(self, nodelay)
+    }
+
+    fn raw_fd(&self) -> Option<i32> {
+        Some(self.as_ref().as_raw_fd())
+    }
+
+    fn try_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        Connection::try_read(self, buf)
+    }
+
+    fn read_chunk<'a>(
+        &'a mut self,
+        buf: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = io::Result<(usize, Vec<u8>)>> + Send + 'a>> {
+        Box::pin(async move { Connection::read_chunk(self, buf).await })
+    }
+
+    fn write_all<'a>(
+        &'a mut self,
+        buf: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send + 'a>> {
+        Box::pin(async move { Connection::write_all(self, buf).await })
+    }
+
+    fn flush<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
+        Box::pin(async move { Connection::flush(self).await })
+    }
+
+    fn shutdown<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
+        Box::pin(async move { Connection::shutdown(self).await })
+    }
+
+    fn into_proxy(
+        self: Box<Self>,
+        peer: Box<dyn crate::sock::Sock>,
+    ) -> io::Result<crate::sock::ProxyHandle> {
+        (*self).into_proxy(peer)
+    }
+}

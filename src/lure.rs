@@ -485,7 +485,7 @@ impl Lure {
         };
 
         let handler =
-            EncodedConnection::with_buffered(&mut connection, SocketIntent::GreetToProxy, buffered);
+            EncodedConnection::with_buffered(connection, SocketIntent::GreetToProxy, buffered);
         let state_attr = match hs.next_state {
             HandshakeNextState::Status => "status",
             HandshakeNextState::Login => "login",
@@ -523,7 +523,7 @@ impl Lure {
 
     async fn handle_status(
         &self,
-        mut client: EncodedConnection<'_>,
+        mut client: EncodedConnection,
         handshake: &OwnedHandshake,
         resolved: Option<ResolvedRoute>,
     ) -> anyhow::Result<()> {
@@ -575,7 +575,7 @@ impl Lure {
         let backend_addr = resolved.endpoint;
         let backend_label = backend_addr.to_string();
 
-        let mut backend = match backend::connect(
+        let backend = match backend::connect(
             backend_addr,
             handshake,
             Some(resolved.endpoint_host.as_str()),
@@ -623,7 +623,7 @@ impl Lure {
             }
         };
 
-        let mut server = EncodedConnection::new(&mut backend, SocketIntent::GreetToBackend);
+        let mut server = EncodedConnection::new(backend, SocketIntent::GreetToBackend);
 
         let req = match self
             .threat
@@ -718,9 +718,9 @@ impl Lure {
         Ok(())
     }
 
-    async fn handle_proxy<'a>(
+    async fn handle_proxy(
         &self,
-        mut client: EncodedConnection<'a>,
+        mut client: EncodedConnection,
         handshake: &OwnedHandshake,
         resolved: Option<ResolvedRoute>,
         handshake_raw: Vec<u8>,
@@ -888,7 +888,7 @@ impl Lure {
 
     async fn handle_tunnel_session(
         &self,
-        mut client: EncodedConnection<'_>,
+        mut client: EncodedConnection,
         handshake_raw: Vec<u8>,
         login_raw: &[u8],
         route: &Route,
@@ -911,13 +911,13 @@ impl Lure {
             )
             .await?;
 
-        let mut agent_connection = match timeout(Duration::from_secs(10), receiver).await {
+        let agent_connection = match timeout(Duration::from_secs(10), receiver).await {
             Ok(Ok(conn)) => conn,
             Ok(Err(_)) => anyhow::bail!("tunnel agent dropped session"),
             Err(_) => anyhow::bail!("tunnel agent connect timeout"),
         };
 
-        let mut agent = EncodedConnection::new(&mut agent_connection, SocketIntent::GreetToBackend);
+        let mut agent = EncodedConnection::new(agent_connection, SocketIntent::GreetToBackend);
         agent.send_raw(&handshake_raw).await?;
         agent.send_raw(login_raw).await?;
 
@@ -926,7 +926,7 @@ impl Lure {
             agent.send_raw(&pending).await?;
         }
 
-        passthrough_now(&mut client, &mut agent, session).await?;
+        passthrough_now(client.into_inner(), agent.into_inner(), session).await?;
         Ok(())
     }
 
@@ -1029,7 +1029,7 @@ impl Lure {
 
     async fn handle_proxy_session(
         &self,
-        mut client: EncodedConnection<'_>,
+        mut client: EncodedConnection,
         handshake: &OwnedHandshake,
         route: &Route,
         session: &Session,
@@ -1040,7 +1040,7 @@ impl Lure {
         let client_addr = session.client_addr;
         let hostname = handshake.server_address.as_ref();
 
-        let mut owned_stream = match backend::connect(
+        let owned_stream = match backend::connect(
             server_address,
             handshake,
             Some(session.endpoint_host.as_str()),
@@ -1080,7 +1080,7 @@ impl Lure {
                 return Err(err.into());
             }
         };
-        let mut server = EncodedConnection::new(&mut owned_stream, SocketIntent::GreetToBackend);
+        let mut server = EncodedConnection::new(owned_stream, SocketIntent::GreetToBackend);
         server.send_raw(login_raw).await?;
 
         let pending = client.take_pending_inbound();
@@ -1088,13 +1088,13 @@ impl Lure {
             server.send_raw(&pending).await?;
         }
 
-        passthrough_now(&mut client, &mut server, session).await?;
+        passthrough_now(client.into_inner(), server.into_inner(), session).await?;
         Ok(())
     }
 
     async fn status_error(
         &self,
-        client: &mut EncodedConnection<'_>,
+        client: &mut EncodedConnection,
         config: &LureConfig,
     ) -> anyhow::Result<()> {
         self.metrics.record_failure("status");
@@ -1103,7 +1103,7 @@ impl Lure {
 
     async fn disconnect_login<F, S, L>(
         &self,
-        client: &mut EncodedConnection<'_>,
+        client: &mut EncodedConnection,
         address: SocketAddr,
         make_reason: F,
     ) where
@@ -1125,7 +1125,7 @@ impl Lure {
 
     async fn create_proxy_session(
         &self,
-        client: &mut EncodedConnection<'_>,
+        client: &mut EncodedConnection,
         address: SocketAddr,
         hostname: &str,
         resolved: &ResolvedRoute,
@@ -1173,7 +1173,7 @@ impl Lure {
 
     async fn disconnect_backend_error(
         &self,
-        client: &mut EncodedConnection<'_>,
+        client: &mut EncodedConnection,
         client_addr: SocketAddr,
         server_address: SocketAddr,
         hostname: &str,
