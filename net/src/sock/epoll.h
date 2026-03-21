@@ -38,6 +38,54 @@ int lure_epoll_connection_main(
 int lure_epoll_connection_join(LureEpollConnection* conn);
 void lure_epoll_connection_free(LureEpollConnection* conn);
 
+/* ── N-worker pool ─────────────────────────────────────────────────────────── */
+
+/*
+ * Completion frame written to the shared done-pipe after each connection
+ * finishes.  sizeof(LureEpollDone) == 48, which fits inside PIPE_BUF, so
+ * every write is atomic even with multiple workers sharing one pipe.
+ */
+typedef struct {
+    uint64_t conn_id;
+    uint64_t c2s_bytes;
+    uint64_t s2c_bytes;
+    uint64_t c2s_chunks;
+    uint64_t s2c_chunks;
+    int32_t  result;
+    uint32_t _pad;
+} LureEpollDone;
+
+typedef struct LureEpollWorker LureEpollWorker;
+
+/*
+ * Create a new worker thread.  done_pipe_write_fd is the write end of a pipe
+ * shared with the Rust drain task; the worker writes LureEpollDone frames to
+ * it.  The caller retains ownership of the fd (worker does NOT close it).
+ * Returns NULL on failure.
+ */
+LureEpollWorker* lure_epoll_worker_new(int done_pipe_write_fd);
+
+/*
+ * Submit a connection pair to the worker.  The worker takes ownership of
+ * fd_a and fd_b (it will close them when done, including on error).
+ * Returns 0 on success or -ENOMEM if the submit node cannot be allocated
+ * (in which case fd_a/fd_b are closed by this function before returning).
+ */
+int lure_epoll_worker_submit(LureEpollWorker* w, int fd_a, int fd_b,
+                             uint64_t conn_id);
+
+/* Request abort of the connection identified by conn_id. No-op if not found. */
+void lure_epoll_worker_abort(LureEpollWorker* w, uint64_t conn_id);
+
+/*
+ * Signal the worker to drain remaining connections and exit cleanly.
+ * Blocks until the worker thread has exited.
+ */
+void lure_epoll_worker_shutdown(LureEpollWorker* w);
+
+/* Free all resources.  Must be called after lure_epoll_worker_shutdown. */
+void lure_epoll_worker_free(LureEpollWorker* w);
+
 #ifdef __cplusplus
 }
 #endif
