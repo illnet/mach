@@ -868,47 +868,41 @@ impl TunnelRegistry {
     }
 
     pub async fn start_bootstrap_poller(self: &Arc<Self>, bootstrap_url: String) {
-        let registry = Arc::clone(self);
-        let spawn_result = crate::utils::spawn_named("tunnel-bootstrap", async move {
-            let client = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-            {
-                Ok(client) => client,
-                Err(e) => {
-                    log::error!("[tunnel-bootstrap] failed to build HTTP client: {e}");
-                    return;
-                }
-            };
-            let url = format!("{}/api/open/endpoints", bootstrap_url.trim_end_matches('/'));
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                match client.get(&url).send().await {
-                    Ok(resp) if resp.status().is_success() => {
-                        match resp.json::<Vec<crate::config::EndpointInfo>>().await {
-                            Ok(nodes) => {
-                                let count = nodes.len();
-                                *registry.endpoint_cache.write().await = nodes;
-                                log::info!(
-                                    "[tunnel-bootstrap] refreshed {} endpoints from {}",
-                                    count,
-                                    url
-                                );
-                            }
-                            Err(e) => log::warn!("[tunnel-bootstrap] JSON parse error: {e}"),
-                        }
-                    }
-                    Ok(resp) => {
-                        log::warn!("[tunnel-bootstrap] HTTP {} from {}", resp.status(), url)
-                    }
-                    Err(e) => log::warn!("[tunnel-bootstrap] fetch failed: {e}"),
-                }
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        {
+            Ok(client) => client,
+            Err(e) => {
+                log::error!("[tunnel-bootstrap] failed to build HTTP client: {e}");
+                return;
             }
-        });
-        if let Err(e) = spawn_result {
-            log::error!("[tunnel-bootstrap] failed to spawn task: {e}");
+        };
+        let url = format!("{}/api/open/endpoints", bootstrap_url.trim_end_matches('/'));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<Vec<crate::config::EndpointInfo>>().await {
+                        Ok(nodes) => {
+                            let count = nodes.len();
+                            *self.endpoint_cache.write().await = nodes;
+                            log::info!(
+                                "[tunnel-bootstrap] refreshed {} endpoints from {}",
+                                count,
+                                url
+                            );
+                        }
+                        Err(e) => log::warn!("[tunnel-bootstrap] JSON parse error: {e}"),
+                    }
+                }
+                Ok(resp) => {
+                    log::warn!("[tunnel-bootstrap] HTTP {} from {}", resp.status(), url)
+                }
+                Err(e) => log::warn!("[tunnel-bootstrap] fetch failed: {e}"),
+            }
         }
     }
 

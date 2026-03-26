@@ -167,7 +167,7 @@ After receiving a tunnel hello, the server can send:
 ### Keep-Alive
 - **Not currently supported** - If the agent connection is idle, it may be closed by network infrastructure.
 - **Workaround**: Design agents to reconnect periodically or on any connection error.
-- **Future**: Keep-alive will be added in protocol v2.
+- **Future**: Keep-alive will be added in a future wire-protocol revision.
 
 ### Maximum Pending Sessions
 - **Default limit**: 10,000 pending sessions per Lure instance.
@@ -296,7 +296,7 @@ priority = 0
 
 [route.flags]
 tunnel = true
-tunnel_token = "8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b"
+tunnel_token = "8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f00112233445566778899aabb"
 ```
 
 ### Multi-agent for redundancy

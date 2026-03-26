@@ -1,6 +1,6 @@
 use std::{
     net::{IpAddr, SocketAddr, ToSocketAddrs},
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -82,6 +82,13 @@ fn enforce_local_ip_block() -> bool {
     })
 }
 
+fn normalize_optional_url(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 pub struct Lure {
     config: RwLock<LureConfig>,
     router: &'static RouterInstance,
@@ -90,6 +97,7 @@ pub struct Lure {
     errors: ErrorResponder,
     tunnels: Arc<TunnelRegistry>,
     tunnel_agents: Arc<TunnelAgentController>,
+    bootstrap_poller: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -142,15 +150,8 @@ impl Lure {
         })
         .ok();
 
-        // Start bootstrap poller if configured
-        if let Some(url) = &config.tunnel.bootstrap_url {
-            let tunnels_clone = Arc::clone(&tunnels);
-            let url = url.clone();
-            spawn_named("tunnel-bootstrap-start", async move {
-                tunnels_clone.start_bootstrap_poller(url).await;
-            })
-            .ok();
-        }
+        let bootstrap_poller = normalize_optional_url(config.tunnel.bootstrap_url.as_deref())
+            .and_then(|url| Self::spawn_bootstrap_poller(&tunnels, url));
 
         // Spawn cleanup task for tunnel registry
         let tunnels_clone = Arc::clone(&tunnels);
@@ -171,7 +172,35 @@ impl Lure {
             errors: ErrorResponder::new(),
             tunnels,
             tunnel_agents,
+            bootstrap_poller: Mutex::new(bootstrap_poller),
         }
+    }
+
+    fn spawn_bootstrap_poller(
+        tunnels: &Arc<TunnelRegistry>,
+        url: String,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let tunnels_clone = Arc::clone(tunnels);
+        match spawn_named("tunnel-bootstrap-start", async move {
+            tunnels_clone.start_bootstrap_poller(url).await;
+        }) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                error!("failed to spawn tunnel bootstrap poller: {err}");
+                None
+            }
+        }
+    }
+
+    fn replace_bootstrap_poller(&self, bootstrap_url: Option<String>) {
+        let mut poller = self
+            .bootstrap_poller
+            .lock()
+            .expect("bootstrap poller mutex poisoned");
+        if let Some(handle) = poller.take() {
+            handle.abort();
+        }
+        *poller = bootstrap_url.and_then(|url| Self::spawn_bootstrap_poller(&self.tunnels, url));
     }
 
     async fn config_snapshot(&self) -> LureConfig {
@@ -193,12 +222,20 @@ impl Lure {
     }
 
     pub async fn reload_config(&'static self, config: LureConfig) -> anyhow::Result<()> {
+        let old_bootstrap_url = {
+            let snapshot = self.config.read().await;
+            normalize_optional_url(snapshot.tunnel.bootstrap_url.as_deref())
+        };
+        let new_bootstrap_url = normalize_optional_url(config.tunnel.bootstrap_url.as_deref());
         let routes = config.default_routes()?;
         self.install_routes(routes).await;
         // Keep the tunnel registry in sync with runtime config reloads.
         self.tunnels.load_tokens(&config.tunnel).await?;
         {
             *self.config.write().await = config;
+        }
+        if old_bootstrap_url != new_bootstrap_url {
+            self.replace_bootstrap_poller(new_bootstrap_url);
         }
         Ok(())
     }
@@ -831,20 +868,16 @@ impl Lure {
             }
         }
 
-        // Auto Redirect: for compatible clients on Redirection routes, send Transfer packet.
+        // Transfer packets are Configuration-state only. This login-stage path must not emit them
+        // until the proxy has explicit configuration-state support, so fall through for now.
         const TRANSFER_MIN_PROTOCOL: i32 = 766; // MC 1.20.5+
         if resolved.route.redirection() && handshake.protocol_version >= TRANSFER_MIN_PROTOCOL {
-            let transfer = net::TransferConfigS2c {
-                host: &resolved.endpoint_host,
-                port: resolved.endpoint.port(),
-            };
-            if let Err(e) = client.send(&transfer).await {
-                debug!("LoginTransfer send failed: {e}");
-            }
-            let _ = client.as_inner_mut().shutdown().await;
-            return Ok(());
+            debug!(
+                "route redirection requested for host={}, but configuration-state transfer \
+                 is not implemented yet; using normal proxy flow",
+                hostname
+            );
         }
-        // protocol < 766 or no Redirection flag → fall through to normal proxy
 
         let Some((session, route)) = self
             .create_proxy_session(&mut client, address, hostname, &resolved, profile)
@@ -969,8 +1002,18 @@ impl Lure {
 
         let agent_connection = match timeout(Duration::from_secs(10), receiver).await {
             Ok(Ok(conn)) => conn,
-            Ok(Err(_)) => anyhow::bail!("tunnel agent dropped session"),
-            Err(_) => anyhow::bail!("tunnel agent connect timeout"),
+            Ok(Err(_)) => {
+                self.tunnels
+                    .rollback_local_session(key_id, session_token)
+                    .await;
+                anyhow::bail!("tunnel agent dropped session");
+            }
+            Err(_) => {
+                self.tunnels
+                    .rollback_local_session(key_id, session_token)
+                    .await;
+                anyhow::bail!("tunnel agent connect timeout");
+            }
         };
 
         let mut agent = EncodedConnection::new(agent_connection, SocketIntent::GreetToBackend);

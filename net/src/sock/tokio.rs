@@ -1,10 +1,9 @@
+#[cfg(unix)]
 use std::{
     future::Future,
-    io,
-    net::SocketAddr,
-    pin::Pin,
     sync::{Arc, atomic::Ordering},
 };
+use std::{io, net::SocketAddr, pin::Pin};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -130,101 +129,103 @@ impl Connection {
             .raw_fd()
             .ok_or_else(|| io::Error::other("tokio proxy: peer has no raw fd"))?;
 
-        let peer_stream = {
-            #[cfg(unix)]
-            {
+        #[cfg(not(unix))]
+        {
+            drop(peer);
+            let _ = peer_fd;
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "tokio proxy: not supported on non-unix",
+            ));
+        }
+
+        #[cfg(unix)]
+        {
+            let peer_stream: TcpStream = {
                 use std::os::unix::io::FromRawFd;
                 let fd_dup = crate::sock::duplicate_fd(peer_fd)?;
                 drop(peer); // deregister peer's original fd from tokio's reactor
                 let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd_dup) };
                 std_stream.set_nonblocking(true)?;
                 TcpStream::from_std(std_stream)?
-            }
-            #[cfg(not(unix))]
-            {
-                drop(peer);
-                drop(peer_fd);
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "tokio proxy: not supported on non-unix",
-                ));
-            }
-        };
+            };
 
-        let progress = Arc::new(crate::sock::ProxyProgress::default());
-        let prog_c2s = Arc::clone(&progress);
-        let prog_s2c = Arc::clone(&progress);
-        let prog_final = Arc::clone(&progress);
+            let progress = Arc::new(crate::sock::ProxyProgress::default());
+            let prog_c2s = Arc::clone(&progress);
+            let prog_s2c = Arc::clone(&progress);
+            let prog_final = Arc::clone(&progress);
 
-        let (a_read, a_write) = self.stream.into_split();
-        let (b_read, b_write) = peer_stream.into_split();
+            let (a_read, a_write) = self.stream.into_split();
+            let (b_read, b_write) = peer_stream.into_split();
 
-        let future: Pin<
-            Box<dyn Future<Output = io::Result<crate::sock::ProxyStats>> + Send + 'static>,
-        > = Box::pin(async move {
-            let mut c2s_task = tokio::spawn(async move {
-                copy_tracked(a_read, b_write, &prog_c2s.c2s_bytes, &prog_c2s.c2s_chunks).await
-            });
-            let mut s2c_task = tokio::spawn(async move {
-                copy_tracked(b_read, a_write, &prog_s2c.s2c_bytes, &prog_s2c.s2c_chunks).await
-            });
+            let future: Pin<
+                Box<dyn Future<Output = io::Result<crate::sock::ProxyStats>> + Send + 'static>,
+            > = Box::pin(async move {
+                let mut c2s_task = tokio::spawn(async move {
+                    copy_tracked(a_read, b_write, &prog_c2s.c2s_bytes, &prog_c2s.c2s_chunks).await
+                });
+                let mut s2c_task = tokio::spawn(async move {
+                    copy_tracked(b_read, a_write, &prog_s2c.s2c_bytes, &prog_s2c.s2c_chunks).await
+                });
 
-            let mut c2s_done = false;
-            let mut s2c_done = false;
+                let mut c2s_done = false;
+                let mut s2c_done = false;
 
-            while !c2s_done || !s2c_done {
-                tokio::select! {
-                    result = &mut c2s_task, if !c2s_done => {
-                        match result {
-                            Ok(Ok(())) => c2s_done = true,
-                            Ok(Err(err)) => {
-                                if !s2c_done {
-                                    s2c_task.abort();
-                                    let _ = (&mut s2c_task).await;
+                while !c2s_done || !s2c_done {
+                    tokio::select! {
+                        result = &mut c2s_task, if !c2s_done => {
+                            match result {
+                                Ok(Ok(())) => c2s_done = true,
+                                Ok(Err(err)) => {
+                                    if !s2c_done {
+                                        s2c_task.abort();
+                                        let _ = (&mut s2c_task).await;
+                                    }
+                                    return Err(io::Error::other(err));
                                 }
-                                return Err(io::Error::other(err));
-                            }
-                            Err(err) => {
-                                log::error!("c2s task join failed: {err:?}");
-                                if !s2c_done {
-                                    s2c_task.abort();
-                                    let _ = (&mut s2c_task).await;
+                                Err(err) => {
+                                    log::error!("c2s task join failed: {err:?}");
+                                    if !s2c_done {
+                                        s2c_task.abort();
+                                        let _ = (&mut s2c_task).await;
+                                    }
+                                    return Err(io::Error::other(err.to_string()));
                                 }
-                                return Err(io::Error::other(err.to_string()));
                             }
                         }
-                    }
-                    result = &mut s2c_task, if !s2c_done => {
-                        match result {
-                            Ok(Ok(())) => s2c_done = true,
-                            Ok(Err(err)) => {
-                                if !c2s_done {
-                                    c2s_task.abort();
-                                    let _ = (&mut c2s_task).await;
+                        result = &mut s2c_task, if !s2c_done => {
+                            match result {
+                                Ok(Ok(())) => s2c_done = true,
+                                Ok(Err(err)) => {
+                                    if !c2s_done {
+                                        c2s_task.abort();
+                                        let _ = (&mut c2s_task).await;
+                                    }
+                                    return Err(io::Error::other(err));
                                 }
-                                return Err(io::Error::other(err));
-                            }
-                            Err(err) => {
-                                log::error!("s2c task join failed: {err:?}");
-                                if !c2s_done {
-                                    c2s_task.abort();
-                                    let _ = (&mut c2s_task).await;
+                                Err(err) => {
+                                    log::error!("s2c task join failed: {err:?}");
+                                    if !c2s_done {
+                                        c2s_task.abort();
+                                        let _ = (&mut c2s_task).await;
+                                    }
+                                    return Err(io::Error::other(err.to_string()));
                                 }
-                                return Err(io::Error::other(err.to_string()));
                             }
                         }
                     }
                 }
-            }
 
-            Ok(prog_final.snapshot())
-        });
+                Ok(prog_final.snapshot())
+            });
 
-        Ok(crate::sock::ProxyHandle { future, progress })
+            Ok(crate::sock::ProxyHandle { future, progress })
+        }
     }
 }
 
 /// Copy all bytes from `from` to `to`, updating atomic progress counters.
+#[cfg(unix)]
 async fn copy_tracked(
     mut from: tokio::net::tcp::OwnedReadHalf,
     mut to: tokio::net::tcp::OwnedWriteHalf,
