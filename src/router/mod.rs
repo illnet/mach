@@ -915,4 +915,42 @@ mod tests {
         })
         .await;
     }
+
+    #[test]
+    fn route_flag_bits_for_redirection_and_allows_local_are_stable() {
+        assert_eq!(1 << RouteFlags::Redirection as u64, 64);
+        assert_eq!(1 << RouteFlags::AllowsLocal as u64, 128);
+
+        let mut attr = RouteAttr::default();
+        assert_eq!(attr.bits(), 0);
+        assert!(!attr.contains(RouteFlags::Redirection));
+        assert!(!attr.contains(RouteFlags::AllowsLocal));
+
+        attr.set_flag(RouteFlags::Redirection);
+        assert_eq!(attr.bits(), 64);
+        assert!(attr.contains(RouteFlags::Redirection));
+        assert!(!attr.contains(RouteFlags::AllowsLocal));
+
+        attr.set_flag(RouteFlags::AllowsLocal);
+        assert_eq!(attr.bits(), 64 | 128);
+        assert!(attr.contains(RouteFlags::Redirection));
+        assert!(attr.contains(RouteFlags::AllowsLocal));
+    }
+
+    #[test]
+    fn route_accessors_reflect_redirection_and_allows_local_flags() {
+        let route = Route {
+            flags: RouteAttr::from_flags(&[RouteFlags::Redirection, RouteFlags::AllowsLocal]),
+            ..Default::default()
+        };
+        assert!(route.redirection());
+        assert!(route.allows_local());
+
+        let route = Route {
+            flags: RouteAttr::default(),
+            ..Default::default()
+        };
+        assert!(!route.redirection());
+        assert!(!route.allows_local());
+    }
 }

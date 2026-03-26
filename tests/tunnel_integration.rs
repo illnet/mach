@@ -55,6 +55,7 @@ fn tunnel_protocol_agent_hello_roundtrip() {
     assert_eq!(decoded.timestamp, hello.timestamp);
     assert_eq!(decoded.hmac, hello.hmac);
     assert_eq!(decoded.session, hello.session);
+    assert_eq!(decoded.forward, hello.forward);
     assert_eq!(consumed, 86, "Connect message should be 86 bytes");
 
     // Test Listen intent
@@ -80,7 +81,49 @@ fn tunnel_protocol_agent_hello_roundtrip() {
     assert_eq!(decoded2.key_id, hello_listen.key_id);
     assert_eq!(decoded2.timestamp, hello_listen.timestamp);
     assert_eq!(decoded2.hmac, hello_listen.hmac);
+    assert_eq!(decoded2.forward, None);
     assert_eq!(consumed2, 54);
+}
+
+#[test]
+fn tunnel_protocol_agent_hello_forward_roundtrip() {
+    use tun::{
+        AgentHello, ForwardHello, Intent, TunnelAgentRequest, decode_agent_hello,
+        encode_agent_hello,
+    };
+
+    let hello = AgentHello {
+        version: tun::VERSION,
+        intent: Intent::Forward,
+        key_id: [24u8; 8],
+        timestamp: 123,
+        hmac: [26u8; 32],
+        session: None,
+        forward: Some(ForwardHello {
+            session: [27u8; 32],
+            ttl: 60,
+            request: TunnelAgentRequest {
+                from: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 25565),
+                to: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 25566),
+            },
+        }),
+    };
+
+    let mut buf = Vec::new();
+    encode_agent_hello(&hello, &mut buf).expect("encode should work");
+
+    let (decoded, consumed) = decode_agent_hello(&buf)
+        .expect("decode should work")
+        .expect("should have complete message");
+
+    assert_eq!(decoded.version, hello.version);
+    assert_eq!(decoded.intent, hello.intent);
+    assert_eq!(decoded.key_id, hello.key_id);
+    assert_eq!(decoded.timestamp, hello.timestamp);
+    assert_eq!(decoded.hmac, hello.hmac);
+    assert_eq!(decoded.session, hello.session);
+    assert_eq!(decoded.forward, hello.forward);
+    assert_eq!(consumed, buf.len());
 }
 
 #[test]
@@ -196,6 +239,10 @@ fn tunnel_hmac_computation() {
     let key_id = [0x01u8; 8];
     let timestamp = 1234567890u64;
     let session = [0x99u8; 32];
+    let request = tun::TunnelAgentRequest {
+        from: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 25565),
+        to: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42)), 25566),
+    };
 
     // Listen intent (no session)
     let hmac_listen =
@@ -232,5 +279,42 @@ fn tunnel_hmac_computation() {
     assert_ne!(
         hmac_listen, hmac_different_key,
         "Different key_id should produce different HMAC"
+    );
+
+    let hmac_forward = compute_agent_hmac(
+        &secret,
+        &key_id,
+        timestamp,
+        Intent::Forward,
+        Some(&session),
+        Some(&request),
+        60,
+    );
+    let hmac_forward_repeat = compute_agent_hmac(
+        &secret,
+        &key_id,
+        timestamp,
+        Intent::Forward,
+        Some(&session),
+        Some(&request),
+        60,
+    );
+    let hmac_forward_default = compute_agent_hmac(
+        &secret,
+        &key_id,
+        timestamp,
+        Intent::Forward,
+        Some(&session),
+        None,
+        0,
+    );
+    assert_eq!(hmac_forward.len(), 32, "Forward HMAC should be 32 bytes");
+    assert_eq!(
+        hmac_forward, hmac_forward_repeat,
+        "Forward HMAC should be deterministic"
+    );
+    assert_ne!(
+        hmac_forward, hmac_forward_default,
+        "Request payload and ttl should affect the HMAC"
     );
 }

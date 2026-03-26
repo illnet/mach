@@ -130,24 +130,26 @@ impl Connection {
             .raw_fd()
             .ok_or_else(|| io::Error::other("tokio proxy: peer has no raw fd"))?;
 
-        #[cfg(unix)]
         let peer_stream = {
-            use std::os::unix::io::FromRawFd;
-            let fd_dup = crate::sock::duplicate_fd(peer_fd)?;
-            drop(peer); // deregister peer's original fd from tokio's reactor
-            let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd_dup) };
-            std_stream.set_nonblocking(true)?;
-            TcpStream::from_std(std_stream)?
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::FromRawFd;
+                let fd_dup = crate::sock::duplicate_fd(peer_fd)?;
+                drop(peer); // deregister peer's original fd from tokio's reactor
+                let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd_dup) };
+                std_stream.set_nonblocking(true)?;
+                TcpStream::from_std(std_stream)?
+            }
+            #[cfg(not(unix))]
+            {
+                drop(peer);
+                drop(peer_fd);
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "tokio proxy: not supported on non-unix",
+                ));
+            }
         };
-        #[cfg(not(unix))]
-        {
-            drop(peer);
-            drop(peer_fd);
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "tokio proxy: not supported on non-unix",
-            ));
-        }
 
         let progress = Arc::new(crate::sock::ProxyProgress::default());
         let prog_c2s = Arc::clone(&progress);
@@ -168,8 +170,20 @@ impl Connection {
             });
             let (cr, sr) = tokio::join!(c2s_task, s2c_task);
             // Propagate first error; ignore the other direction's error.
-            let _ = cr.map_err(|e| io::Error::other(e.to_string()))?;
-            let _ = sr.map_err(|e| io::Error::other(e.to_string()))?;
+            let _ = match cr {
+                Ok(result) => result,
+                Err(err) => {
+                    log::error!("c2s task join failed: {err:?}");
+                    return Err(io::Error::other(err.to_string()));
+                }
+            }?;
+            let _ = match sr {
+                Ok(result) => result,
+                Err(err) => {
+                    log::error!("s2c task join failed: {err:?}");
+                    return Err(io::Error::other(err.to_string()));
+                }
+            }?;
             Ok(prog_final.snapshot())
         });
 

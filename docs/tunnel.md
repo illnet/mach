@@ -101,6 +101,12 @@ After receiving a tunnel hello, the server can send:
   - family `4`: 1 byte, port 2 bytes (be), IPv4 4 bytes
   - family `6`: 1 byte, port 2 bytes (be), IPv6 16 bytes
 - ForwardAck: `0x03` + 32-byte correlation/session id
+- ForwardRequest: `0x04` + 32-byte correlation/session id + 1-byte ttl +
+  `from` socket address + `to` socket address
+  - `from`/`to` use the same addr family + port + IP payload layout as
+    `TargetAddr`
+  - this is the master-to-agent request that pairs with `ForwardAck` in the
+    forwarded-session flow
 
 ## End-to-End Flow
 

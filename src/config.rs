@@ -149,8 +149,10 @@ pub struct RouteFlagsConfig {
     #[serde(default)]
     pub allows_local: bool,
     /// Authentication mode: "public", "protected", "restricted"
+    #[serde(default = "default_auth_mode")]
     pub auth_mode: String,
     /// For `auth_mode` = "restricted", list of allowed token `key_ids`
+    #[serde(default)]
     pub allowed_tokens: Vec<String>,
 }
 
@@ -459,4 +461,81 @@ pub enum LureConfigLoadError {
     Io(#[from] std::io::Error),
     #[error("Could not parse")]
     Parse(#[from] toml::de::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_redirection_default() {
+        let flags: RouteFlagsConfig =
+            toml::from_str("disabled = false\nproxy_protocol = false\ntunnel = true\n")
+                .expect("flags should deserialize");
+
+        assert!(!flags.redirection);
+        assert!(!flags.allows_local);
+        assert_eq!(flags.auth_mode, "protected");
+
+        let attr = flags.to_attr();
+        assert!(!attr.contains(RouteFlags::Redirection));
+        assert!(!attr.contains(RouteFlags::AllowsLocal));
+    }
+
+    #[test]
+    fn preserves_auth_mode_and_allowed_tokens() {
+        let flags: RouteFlagsConfig = toml::from_str(
+            r#"
+            tunnel = true
+            redirection = true
+            allows_local = true
+            auth_mode = "restricted"
+            allowed_tokens = ["0011223344556677", "8899aabbccddeeff"]
+            "#,
+        )
+        .expect("flags should deserialize");
+
+        let attr = flags.to_attr();
+        assert!(attr.contains(RouteFlags::Redirection));
+        assert!(attr.contains(RouteFlags::AllowsLocal));
+        assert_eq!(flags.auth_mode, "restricted");
+        assert_eq!(
+            flags.allowed_tokens,
+            vec![
+                "0011223344556677".to_string(),
+                "8899aabbccddeeff".to_string()
+            ]
+        );
+
+        match flags.parse_auth_mode(0).expect("auth mode should parse") {
+            AuthMode::Restricted { allowed_tokens } => {
+                assert_eq!(allowed_tokens.len(), 2);
+                assert_eq!(
+                    allowed_tokens[0],
+                    [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]
+                );
+                assert_eq!(
+                    allowed_tokens[1],
+                    [0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]
+                );
+            }
+            other => panic!("expected restricted auth mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tunnelconfig_defaults_and_to_attr_maps_fields() {
+        let config: TunnelConfig = toml::from_str("").expect("tunnel config should deserialize");
+
+        assert!(config.token.is_empty());
+        assert!(config.bootstrap_url.is_none());
+        assert!(config.master_url.is_none());
+        assert!(config.endpoints.is_empty());
+
+        let flags: RouteFlagsConfig = toml::from_str("redirection = true\nallows_local = true\n")
+            .expect("flags should deserialize");
+        let attr = flags.to_attr();
+        assert!(attr.contains(RouteFlags::Redirection));
+        assert!(attr.contains(RouteFlags::AllowsLocal));
+    }
 }

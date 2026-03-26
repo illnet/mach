@@ -115,7 +115,10 @@ impl LureLogger {
         from: &SocketAddr,
         target: &SocketAddr,
     ) {
-        debug!("Tunnel forward request received: token={token_prefix} from={from} target={target}");
+        debug!(
+            "Tunnel forward request received: token={token_prefix} \
+             from={from} target={target}"
+        );
     }
 
     pub fn tunnel_session_timeout(session_prefix: &str) {

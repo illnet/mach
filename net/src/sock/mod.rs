@@ -699,10 +699,26 @@ impl Sock for Connection {
 /// Duplicate a file descriptor (Unix only).
 #[cfg(unix)]
 pub fn duplicate_fd(fd: i32) -> io::Result<i32> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let rc = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let rc = unsafe { libc::dup(fd) };
+
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let setfd_rc = unsafe { libc::fcntl(rc, libc::F_SETFD, libc::FD_CLOEXEC) };
+        if setfd_rc < 0 {
+            let err = io::Error::last_os_error();
+            let _ = unsafe { libc::close(rc) };
+            return Err(err);
+        }
+    }
+
     Ok(rc)
 }
 

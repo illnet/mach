@@ -694,29 +694,30 @@ async fn run_tun_agent(
                 return Err(err);
             }
         };
-        if let tun::ServerMsg::ForwardRequest(forward) = msg {
-            let mut stop_rx2 = stop_rx.clone();
-            let session = forward.session;
-            let ingress = forward.request.from;
-            match net::sock::backend_kind() {
-                net::sock::BackendKind::Uring => {
-                    net::sock::uring::spawn(async move {
-                        if let Err(e) =
-                            handle_session(ingress, key_id, secret, session, &mut stop_rx2).await
-                        {
-                            error!("tun handle_session failed: {e}");
-                        }
-                    });
-                }
-                _ => {
-                    tokio::task::spawn_local(async move {
-                        if let Err(e) =
-                            handle_session(ingress, key_id, secret, session, &mut stop_rx2).await
-                        {
-                            error!("tun handle_session failed: {e}");
-                        }
-                    });
-                }
+        let (session, ingress) = match msg {
+            tun::ServerMsg::ForwardRequest(forward) => (forward.session, forward.request.from),
+            tun::ServerMsg::SessionOffer(session) => (session, ingress),
+            _ => continue,
+        };
+        let mut stop_rx2 = stop_rx.clone();
+        match net::sock::backend_kind() {
+            net::sock::BackendKind::Uring => {
+                net::sock::uring::spawn(async move {
+                    if let Err(e) =
+                        handle_session(ingress, key_id, secret, session, &mut stop_rx2).await
+                    {
+                        error!("tun handle_session failed: {e}");
+                    }
+                });
+            }
+            _ => {
+                tokio::task::spawn_local(async move {
+                    if let Err(e) =
+                        handle_session(ingress, key_id, secret, session, &mut stop_rx2).await
+                    {
+                        error!("tun handle_session failed: {e}");
+                    }
+                });
             }
         }
     }

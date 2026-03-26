@@ -997,6 +997,9 @@ impl Lure {
                 };
                 self.tunnel_agents
                     .dispatch_external_request(
+                        // dispatch_external_request only consumes the
+                        // MasterForwardTunnelRequest, so connection remains
+                        // available for the ForwardAck write below.
                         MasterForwardTunnelRequest {
                             tunnel_id: key_id,
                             session: SessionToken(forward.session),

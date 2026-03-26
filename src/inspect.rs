@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use net::ProxyProgress;
+use net::{ProxyProgress, ProxyStats};
 use opentelemetry::{KeyValue, metrics::Counter};
 
 use crate::{
@@ -32,13 +32,43 @@ pub(crate) fn transport_counters() -> (Counter<u64>, Counter<u64>) {
     (transport_volume_counter(), transport_packet_counter())
 }
 
+fn record_proxy_progress_delta(
+    inspect: &SessionInspectState,
+    volume_record: &Counter<u64>,
+    packet_record: &Counter<u64>,
+    c2st: &KeyValue,
+    s2ct: &KeyValue,
+    last: &mut ProxyStats,
+    snap: ProxyStats,
+) {
+    let dc2s_bytes = snap.c2s_bytes.saturating_sub(last.c2s_bytes);
+    let ds2c_bytes = snap.s2c_bytes.saturating_sub(last.s2c_bytes);
+    let dc2s_chunks = snap.c2s_chunks.saturating_sub(last.c2s_chunks);
+    let ds2c_chunks = snap.s2c_chunks.saturating_sub(last.s2c_chunks);
+
+    if dc2s_bytes > 0 || ds2c_bytes > 0 || dc2s_chunks > 0 || ds2c_chunks > 0 {
+        volume_record.add(dc2s_bytes, core::slice::from_ref(c2st));
+        volume_record.add(ds2c_bytes, core::slice::from_ref(s2ct));
+        packet_record.add(dc2s_chunks, core::slice::from_ref(c2st));
+        packet_record.add(ds2c_chunks, core::slice::from_ref(s2ct));
+        inspect.route.record_c2s(dc2s_bytes, dc2s_chunks);
+        inspect.route.record_s2c(ds2c_bytes, ds2c_chunks);
+        inspect.tenant.record_c2s(dc2s_bytes, dc2s_chunks);
+        inspect.tenant.record_s2c(ds2c_bytes, ds2c_chunks);
+        inspect.instance.record_c2s(dc2s_bytes, dc2s_chunks);
+        inspect.instance.record_s2c(ds2c_bytes, ds2c_chunks);
+    }
+
+    *last = snap;
+}
+
 /// Poll [`ProxyProgress`] every 100 ms and push byte/chunk deltas to OTEL
 /// counters and persistent route/tenant/instance stats.
 ///
-/// Run this concurrently with a proxy future; signal shutdown via the
-/// `shutdown` receiver when the proxy completes. Session-level `inspect.traffic`
-/// is NOT updated here — call `inspect.record_c2s/s2c` with the final
-/// [`net::ProxyStats`] totals after the proxy finishes.
+/// Run this concurrently with a proxy future and signal shutdown when the
+/// proxy completes. Session-level `inspect.traffic` is NOT updated here — call
+/// `inspect.record_c2s/s2c` with the final [`net::ProxyStats`] totals after
+/// the proxy finishes.
 pub(crate) async fn pump_proxy_progress(
     inspect: Arc<crate::router::inspect::SessionInspectState>,
     progress: Arc<ProxyProgress>,
@@ -53,45 +83,29 @@ pub(crate) async fn pump_proxy_progress(
         tokio::select! {
             _ = interval.tick() => {
                 let snap = progress.snapshot();
-                let dc2s_bytes = snap.c2s_bytes.saturating_sub(last.c2s_bytes);
-                let ds2c_bytes = snap.s2c_bytes.saturating_sub(last.s2c_bytes);
-                let dc2s_chunks = snap.c2s_chunks.saturating_sub(last.c2s_chunks);
-                let ds2c_chunks = snap.s2c_chunks.saturating_sub(last.s2c_chunks);
-                if dc2s_bytes > 0 || ds2c_bytes > 0 {
-                    volume_record.add(dc2s_bytes, core::slice::from_ref(&c2st));
-                    volume_record.add(ds2c_bytes, core::slice::from_ref(&s2ct));
-                    packet_record.add(dc2s_chunks, core::slice::from_ref(&c2st));
-                    packet_record.add(ds2c_chunks, core::slice::from_ref(&s2ct));
-                    inspect.route.record_c2s(dc2s_bytes, dc2s_chunks);
-                    inspect.route.record_s2c(ds2c_bytes, ds2c_chunks);
-                    inspect.tenant.record_c2s(dc2s_bytes, dc2s_chunks);
-                    inspect.tenant.record_s2c(ds2c_bytes, ds2c_chunks);
-                    inspect.instance.record_c2s(dc2s_bytes, dc2s_chunks);
-                    inspect.instance.record_s2c(ds2c_bytes, ds2c_chunks);
-                }
-                last = snap;
+                record_proxy_progress_delta(
+                    inspect.as_ref(),
+                    &volume_record,
+                    &packet_record,
+                    &c2st,
+                    &s2ct,
+                    &mut last,
+                    snap,
+                );
             }
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    // Take final snapshot and record remaining metrics
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
                     let snap = progress.snapshot();
-                    let dc2s_bytes = snap.c2s_bytes.saturating_sub(last.c2s_bytes);
-                    let ds2c_bytes = snap.s2c_bytes.saturating_sub(last.s2c_bytes);
-                    let dc2s_chunks = snap.c2s_chunks.saturating_sub(last.c2s_chunks);
-                    let ds2c_chunks = snap.s2c_chunks.saturating_sub(last.s2c_chunks);
-                    if dc2s_bytes > 0 || ds2c_bytes > 0 {
-                        volume_record.add(dc2s_bytes, core::slice::from_ref(&c2st));
-                        volume_record.add(ds2c_bytes, core::slice::from_ref(&s2ct));
-                        packet_record.add(dc2s_chunks, core::slice::from_ref(&c2st));
-                        packet_record.add(ds2c_chunks, core::slice::from_ref(&s2ct));
-                        inspect.route.record_c2s(dc2s_bytes, dc2s_chunks);
-                        inspect.route.record_s2c(ds2c_bytes, ds2c_chunks);
-                        inspect.tenant.record_c2s(dc2s_bytes, dc2s_chunks);
-                        inspect.tenant.record_s2c(ds2c_bytes, ds2c_chunks);
-                        inspect.instance.record_c2s(dc2s_bytes, dc2s_chunks);
-                        inspect.instance.record_s2c(ds2c_bytes, ds2c_chunks);
-                    }
-                    break;
+                    record_proxy_progress_delta(
+                        inspect.as_ref(),
+                        &volume_record,
+                        &packet_record,
+                        &c2st,
+                        &s2ct,
+                        &mut last,
+                        snap,
+                    );
+                    return;
                 }
             }
         }

@@ -22,6 +22,7 @@ pub enum TunnelError {
 
 pub const MAGIC: [u8; 4] = *b"LTUN";
 pub const VERSION: u8 = 3;
+const MAX_SOCKET_ADDR_PAYLOAD_LEN: usize = 19;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -374,7 +375,7 @@ pub fn compute_agent_hmac(
     }
     if let Some(request) = request {
         mac.update(&[ttl]);
-        let mut buf = Vec::with_capacity(19);
+        let mut buf = Vec::with_capacity(MAX_SOCKET_ADDR_PAYLOAD_LEN * 2);
         encode_socket_addr_payload(request.from, &mut buf);
         encode_socket_addr_payload(request.to, &mut buf);
         mac.update(&buf);

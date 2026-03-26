@@ -36,6 +36,12 @@ impl RouteAttr {
     pub const fn contains(&self, flag: RouteFlags) -> bool {
         self.0 & (1 << flag as RouteAttrBitframe) != 0
     }
+
+    #[inline]
+    #[must_use]
+    pub const fn bits(&self) -> RouteAttrBitframe {
+        self.0
+    }
 }
 
 impl From<RouteFlags> for RouteAttr {
