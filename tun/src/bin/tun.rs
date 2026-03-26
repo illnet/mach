@@ -882,81 +882,115 @@ fn run_update(args: UpdateArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+const SENTRY_DSN: &str =
+    "https://d8cb23f37184d406d4b129c0dc0b24d4@o1192891.ingest.us.sentry.io/4511109122293760";
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let sentry = init_sentry("minitun");
 
+    if let Err(err) = try_main() {
+        sentry::capture_message(&err.to_string(), sentry::Level::Error);
+        error!("{err}");
+        drop(sentry);
+        std::process::exit(1);
+    }
+}
+
+fn try_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    sentry::configure_scope(|scope| {
+        scope.set_tag("command", command_name(&cli.command));
+    });
+
     match cli.command {
         Command::Systemd(args) => {
-            let result = match args.command {
+            match args.command {
                 SystemdCommand::Install(install) => run_systemd_install(install),
                 SystemdCommand::Uninstall(uninstall) => run_systemd_uninstall(uninstall),
-            };
-            if let Err(err) = result {
-                error!("{err}");
-                std::process::exit(1);
-            }
+            }?;
         }
         Command::Sign(args) => {
-            if let Err(err) = run_sign(args) {
-                error!("{err}");
-                std::process::exit(1);
-            }
+            run_sign(args)?;
         }
         Command::Update(args) => {
-            if let Err(err) = run_update(args) {
-                error!("{err}");
-                std::process::exit(1);
-            }
+            run_update(args)?;
         }
         Command::Agent(args) => {
-            let proxy_raw = match resolve_agent_endpoint(args.proxy) {
-                Ok(proxy) => proxy,
-                Err(err) => {
-                    eprintln!("error: {err}");
-                    std::process::exit(1);
-                }
-            };
+            let proxy_raw = resolve_agent_endpoint(args.proxy)?;
 
             let proxy: SocketAddr = match resolve_endpoint(&proxy_raw) {
                 Ok(addr) => addr,
                 Err(err) => {
-                    eprintln!("error: invalid proxy endpoint {}: {err}", proxy_raw);
-                    eprintln!("expected: <ip:port> or <host:port>");
-                    std::process::exit(1);
+                    anyhow::bail!(
+                        "invalid proxy endpoint {}: {err}\nexpected: <ip:port> or <host:port>",
+                        proxy_raw
+                    );
                 }
             };
             info!("proxy endpoint resolved: {} -> {}", proxy_raw, proxy);
 
-            let configs = match collect_agent_configs(&args.tokens) {
-                Ok(cfgs) => cfgs,
-                Err(err) => {
-                    eprintln!("error: invalid token config: {err}");
-                    std::process::exit(1);
-                }
-            };
+            let configs = collect_agent_configs(&args.tokens)
+                .map_err(|err| anyhow::anyhow!("invalid token config: {err}"))?;
 
-            match net::sock::backend_kind() {
+            let backend = net::sock::backend_kind();
+            sentry::configure_scope(|scope| {
+                scope.set_tag("socket_backend", backend_kind_name(backend));
+            });
+
+            match backend {
                 net::sock::BackendKind::Tokio | net::sock::BackendKind::Epoll => {
                     let rt = tokio::runtime::Builder::new_multi_thread()
                         .enable_all()
                         .build()
                         .expect("failed to build tokio runtime");
                     let local = tokio::task::LocalSet::new();
-                    if let Err(err) = rt.block_on(local.run_until(run_many(proxy, configs))) {
-                        eprintln!("minitun failed: {err}");
-                        std::process::exit(1);
-                    }
+                    rt.block_on(local.run_until(run_many(proxy, configs)))?;
                 }
                 net::sock::BackendKind::Uring => {
-                    let result =
-                        net::sock::uring::start(async move { run_many(proxy, configs).await });
-                    if let Err(err) = result {
-                        eprintln!("minitun failed: {err}");
-                        std::process::exit(1);
-                    }
+                    net::sock::uring::start(async move { run_many(proxy, configs).await })?;
                 }
             }
         }
+    }
+
+    Ok(())
+}
+
+fn init_sentry(service: &'static str) -> Option<sentry::ClientInitGuard> {
+    if std::env::var_os("NOSENTRY").is_some() {
+        return None;
+    }
+
+    let guard = sentry::init((
+        SENTRY_DSN,
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            send_default_pii: false,
+            server_name: None,
+            ..Default::default()
+        },
+    ));
+    sentry::configure_scope(|scope| {
+        scope.set_tag("service", service);
+        scope.set_tag("binary", "minitun");
+    });
+    Some(guard)
+}
+
+fn backend_kind_name(kind: net::sock::BackendKind) -> &'static str {
+    match kind {
+        net::sock::BackendKind::Tokio => "tokio",
+        net::sock::BackendKind::Epoll => "epoll",
+        net::sock::BackendKind::Uring => "uring",
+    }
+}
+
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Agent(_) => "agent",
+        Command::Sign(_) => "sign",
+        Command::Systemd(_) => "systemd",
+        Command::Update(_) => "update",
     }
 }
