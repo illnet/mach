@@ -43,19 +43,18 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            Lure/target-releasepack/
-          key: ${{ runner.os }}-releasepack-${{ hashFiles('Lure/Cargo.lock', 'Lure/Cargo.toml', 'Lure/net/Cargo.toml', 'Lure/tun/Cargo.toml', 'Lure/scripts/release_pack.sh', 'Lure/rust-toolchain.toml') }}
+            target-releasepack/
+          key: ${{ runner.os }}-releasepack-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'net/Cargo.toml', 'tun/Cargo.toml', 'scripts/release_pack.sh', 'rust-toolchain.toml') }}
 
       - name: Build packs
         run: |
-          cd Lure
           ./scripts/release_pack.sh
 
       - name: Upload flat bins (for GHA)
         uses: actions/upload-artifact@v4
         with:
           name: gha-bins
-          path: Lure/dist/gha/**
+          path: dist/gha/**
           if-no-files-found: error
           overwrite: true
 
@@ -64,9 +63,9 @@ jobs:
         with:
           name: archives
           path: |
-            Lure/dist/*.tar.gz
-            Lure/dist/*.zip
-            Lure/dist/SHA256SUMS
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
           if-no-files-found: error
           overwrite: true
 
@@ -76,6 +75,6 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            Lure/dist/*.tar.gz
-            Lure/dist/*.zip
-            Lure/dist/SHA256SUMS
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
