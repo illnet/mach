@@ -80,6 +80,10 @@ pub struct LureConfig {
     #[serde(default = "default_bind")]
     pub bind: String,
 
+    /// Optional externally reachable address for tunnel agents to reconnect to.
+    #[serde(default)]
+    pub advertised_addr: Option<String>,
+
     /// Enable or disable proxy protocol support.
     #[serde(default, rename = "proxy_procol")]
     pub proxy_protocol: bool,
@@ -220,6 +224,7 @@ impl Default for LureConfig {
         Self {
             inst: default_inst(),
             bind: default_bind(),
+            advertised_addr: None,
             proxy_protocol: false,
             proxy_signing_key: None,
             max_conn: default_max_conn(),

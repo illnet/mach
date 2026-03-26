@@ -1000,6 +1000,7 @@ mod tests {
     fn test_compute_agent_hmac_forward_changes_with_edge() {
         let secret = [0x42u8; 32];
         let key_id = [0x01u8; 8];
+        let session = [0x24u8; 32];
         let timestamp = 1234567890u64;
         let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 10)), 25565);
 
@@ -1008,7 +1009,7 @@ mod tests {
             &key_id,
             timestamp,
             Intent::Forward,
-            None,
+            Some(&session),
             Some(&TunnelAgentRequest {
                 from: target,
                 to: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 25566),
@@ -1020,7 +1021,7 @@ mod tests {
             &key_id,
             timestamp,
             Intent::Forward,
-            None,
+            Some(&session),
             Some(&TunnelAgentRequest {
                 from: target,
                 to: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 25566),

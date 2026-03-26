@@ -78,7 +78,7 @@ pub(crate) async fn pump_proxy_progress(
     let (volume_record, packet_record) = transport_counters();
     let s2ct = KeyValue::new("intent", "s2c");
     let c2st = KeyValue::new("intent", "c2s");
-    let mut last = progress.snapshot();
+    let mut last = ProxyStats::default();
     loop {
         tokio::select! {
             _ = interval.tick() => {

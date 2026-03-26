@@ -127,11 +127,11 @@ After receiving a tunnel hello, the server can send:
 1) A slave Lure instance accepts a client on a tunnel-enabled route.
 2) The slave resolves the backend locally, creates a pending tunnel session, and opens a tunnel `forward` hello to `tunnel.master_url`.
 3) The forward payload contains:
-   - the tunnel `key_id`
    - the session token
+   - `ttl`: a loop guard for forwarded offers
    - `from`: the slave edge socket that the agent must connect back to
    - `to`: the resolved backend socket address
-   - `ttl`: a loop guard for forwarded offers
+   - The tunnel `key_id` stays in the fixed hello header and is still covered by the HMAC.
 4) The master validates the HMAC and forwards the raw request to the active listening agent for that tunnel, then replies with `ForwardAck`.
 5) The agent connects back to the slave edge at `from` using the normal `connect` flow.
 6) The slave validates the session and replies with `TargetAddr(to)`.

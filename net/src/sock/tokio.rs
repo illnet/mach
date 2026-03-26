@@ -162,28 +162,61 @@ impl Connection {
         let future: Pin<
             Box<dyn Future<Output = io::Result<crate::sock::ProxyStats>> + Send + 'static>,
         > = Box::pin(async move {
-            let c2s_task = tokio::spawn(async move {
+            let mut c2s_task = tokio::spawn(async move {
                 copy_tracked(a_read, b_write, &prog_c2s.c2s_bytes, &prog_c2s.c2s_chunks).await
             });
-            let s2c_task = tokio::spawn(async move {
+            let mut s2c_task = tokio::spawn(async move {
                 copy_tracked(b_read, a_write, &prog_s2c.s2c_bytes, &prog_s2c.s2c_chunks).await
             });
-            let (cr, sr) = tokio::join!(c2s_task, s2c_task);
-            // Propagate first error; ignore the other direction's error.
-            let _ = match cr {
-                Ok(result) => result,
-                Err(err) => {
-                    log::error!("c2s task join failed: {err:?}");
-                    return Err(io::Error::other(err.to_string()));
+
+            let mut c2s_done = false;
+            let mut s2c_done = false;
+
+            while !c2s_done || !s2c_done {
+                tokio::select! {
+                    result = &mut c2s_task, if !c2s_done => {
+                        match result {
+                            Ok(Ok(())) => c2s_done = true,
+                            Ok(Err(err)) => {
+                                if !s2c_done {
+                                    s2c_task.abort();
+                                    let _ = (&mut s2c_task).await;
+                                }
+                                return Err(io::Error::other(err));
+                            }
+                            Err(err) => {
+                                log::error!("c2s task join failed: {err:?}");
+                                if !s2c_done {
+                                    s2c_task.abort();
+                                    let _ = (&mut s2c_task).await;
+                                }
+                                return Err(io::Error::other(err.to_string()));
+                            }
+                        }
+                    }
+                    result = &mut s2c_task, if !s2c_done => {
+                        match result {
+                            Ok(Ok(())) => s2c_done = true,
+                            Ok(Err(err)) => {
+                                if !c2s_done {
+                                    c2s_task.abort();
+                                    let _ = (&mut c2s_task).await;
+                                }
+                                return Err(io::Error::other(err));
+                            }
+                            Err(err) => {
+                                log::error!("s2c task join failed: {err:?}");
+                                if !c2s_done {
+                                    c2s_task.abort();
+                                    let _ = (&mut c2s_task).await;
+                                }
+                                return Err(io::Error::other(err.to_string()));
+                            }
+                        }
+                    }
                 }
-            }?;
-            let _ = match sr {
-                Ok(result) => result,
-                Err(err) => {
-                    log::error!("s2c task join failed: {err:?}");
-                    return Err(io::Error::other(err.to_string()));
-                }
-            }?;
+            }
+
             Ok(prog_final.snapshot())
         });
 

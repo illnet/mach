@@ -49,6 +49,27 @@ fn is_local_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+fn is_routable_forward_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !v4.is_unspecified()
+                && !v4.is_loopback()
+                && !v4.is_private()
+                && !v4.is_link_local()
+                && !v4.is_broadcast()
+                && !v4.is_documentation()
+                && !v4.is_multicast()
+        }
+        IpAddr::V6(v6) => {
+            !v6.is_unspecified()
+                && !v6.is_loopback()
+                && !v6.is_unique_local()
+                && !v6.is_unicast_link_local()
+                && !v6.is_multicast()
+        }
+    }
+}
+
 fn enforce_local_ip_block() -> bool {
     static ENFORCE: OnceLock<bool> = OnceLock::new();
 
@@ -785,8 +806,16 @@ impl Lure {
             return Ok(());
         };
 
-        // Block local IP clients unless route explicitly permits or route uses tunnel.
-        if enforce_local_ip_block() && !resolved.route.allows_local() && !resolved.route.tunnel() {
+        let tunnel = resolved.tunnel;
+        let requested_tunnel = match tunnel {
+            crate::router::TunnelOpt::KeyId(_) => true,
+            crate::router::TunnelOpt::ZoneDefault => true,
+            crate::router::TunnelOpt::None => resolved.route.tunnel(),
+        };
+
+        // Block local IP clients unless route explicitly permits or the effective route uses a
+        // tunnel-backed target.
+        if enforce_local_ip_block() && !resolved.route.allows_local() && !requested_tunnel {
             let ip = address.ip();
             if is_local_ip(ip) {
                 self.disconnect_login(&mut client, address, |config| {
@@ -825,16 +854,8 @@ impl Lure {
         };
 
         let server_address = session.destination_addr;
-        let tunnel = resolved.tunnel;
-
         // Tenant tunnel key is optional. We only hard-require it when an endpoint explicitly opts
         // into tunnel mode with @tunnel-key or @<key_id>.
-        let requested_tunnel = match tunnel {
-            crate::router::TunnelOpt::KeyId(_) => true,
-            crate::router::TunnelOpt::ZoneDefault => true,
-            crate::router::TunnelOpt::None => route.tunnel(),
-        };
-
         let resolved_key_id: Option<TokenKeyId> = match tunnel {
             crate::router::TunnelOpt::KeyId(id) => Some(TokenKeyId(id)),
             crate::router::TunnelOpt::ZoneDefault => {
@@ -1047,8 +1068,28 @@ impl Lure {
     }
 
     async fn tunnel_forward_addr(&self) -> anyhow::Result<SocketAddr> {
-        let bind = self.config.read().await.bind.clone();
-        resolve_socket_addr(&bind)
+        let (selected, source) = {
+            let config = self.config.read().await;
+            if let Some(advertised_addr) = config
+                .advertised_addr
+                .as_ref()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            {
+                (advertised_addr.to_string(), "advertised_addr")
+            } else {
+                (config.bind.clone(), "bind")
+            }
+        };
+
+        let addr = resolve_socket_addr(&selected)?;
+        if !is_routable_forward_ip(addr.ip()) {
+            anyhow::bail!(
+                "tunnel forward address {addr} from {source} is not remotely routable; \
+                 configure advertised_addr with a public host:port"
+            );
+        }
+        Ok(addr)
     }
 
     async fn read_ingress_hello(

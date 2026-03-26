@@ -199,10 +199,16 @@ impl TunConfig {
 }
 
 fn env_trimmed(keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| std::env::var(key).ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    for key in keys {
+        let Some(value) = std::env::var(key).ok() else {
+            continue;
+        };
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 fn parse_token_list(raw: &str) -> Vec<String> {
@@ -300,6 +306,21 @@ fn service_filename(service_name: &str) -> String {
     }
 }
 
+fn normalize_service_name(raw: &str) -> String {
+    let basename = raw
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("minitun")
+        .trim();
+    let normalized = basename.strip_suffix(".service").unwrap_or(basename);
+    if normalized.is_empty() {
+        "minitun".to_string()
+    } else {
+        normalized.to_string()
+    }
+}
+
 fn systemctl(scope_user: bool, args: &[&str]) -> anyhow::Result<()> {
     let mut cmd = ProcessCommand::new("systemctl");
     if scope_user {
@@ -320,16 +341,25 @@ fn write_service_env_file(
     rust_log: &str,
 ) -> anyhow::Result<()> {
     use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
     writeln!(f, "MINITUN_ENDPOINT={endpoint}")?;
     writeln!(f, "MINITUN_TOKENS={}", tokens.join(","))?;
     writeln!(f, "RUST_LOG={rust_log}")?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
     Ok(())
 }
 
@@ -392,8 +422,12 @@ fn run_systemd_install(args: SystemdInstallArgs) -> anyhow::Result<()> {
 
     let endpoint = resolve_agent_endpoint(args.endpoint)?;
     let configs = collect_agent_configs(&args.tokens)?;
-    let service_base = args.name.unwrap_or_else(|| "minitun".to_string());
-    let service_file = service_filename(&service_base);
+    let normalized_service = args
+        .name
+        .as_deref()
+        .map(normalize_service_name)
+        .unwrap_or_else(|| "minitun".to_string());
+    let service_file = service_filename(&normalized_service);
 
     let exe = std::env::current_exe()?;
 
@@ -442,7 +476,7 @@ fn run_systemd_install(args: SystemdInstallArgs) -> anyhow::Result<()> {
     ensure_dir(&unit_dir)?;
     ensure_dir(&env_dir)?;
 
-    let env_file = env_dir.join(format!("{service_base}.env"));
+    let env_file = env_dir.join(format!("{normalized_service}.env"));
     let tokens: Vec<String> = configs
         .iter()
         .map(|config| format!("{}:{}", config.label, hex::encode(config.secret)))
@@ -500,8 +534,12 @@ fn run_systemd_uninstall(args: SystemdUninstallArgs) -> anyhow::Result<()> {
         anyhow::bail!("choose one: --user or --system");
     }
 
-    let service_name = args.name.unwrap_or_else(|| "minitun".to_string());
-    let service_file = service_filename(&service_name);
+    let normalized_service = args
+        .name
+        .as_deref()
+        .map(normalize_service_name)
+        .unwrap_or_else(|| "minitun".to_string());
+    let service_file = service_filename(&normalized_service);
     let cfg_home = if scope_user {
         Some(
             xdg_config_home()
@@ -525,9 +563,9 @@ fn run_systemd_uninstall(args: SystemdUninstallArgs) -> anyhow::Result<()> {
             .as_ref()
             .expect("cfg_home must exist for scope_user")
             .join("minitun")
-            .join(format!("{service_name}.env"))
+            .join(format!("{normalized_service}.env"))
     } else {
-        PathBuf::from("/etc/minitun").join(format!("{service_name}.env"))
+        PathBuf::from("/etc/minitun").join(format!("{normalized_service}.env"))
     };
 
     // Best-effort stop/disable.
@@ -586,11 +624,21 @@ fn tune_socket(conn: &net::sock::LureConnection) {
 }
 
 async fn handle_session(
+    session_slots: Arc<tokio::sync::Semaphore>,
     ingress: SocketAddr,
     config: TunConfig,
     session: [u8; 32],
 ) -> anyhow::Result<()> {
     let session_prefix = format!("{:02x}", session[0]);
+    let _permit = match session_slots.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            warn!(
+                "dropping session offer: session={session_prefix} active_session_limit={MAX_CONCURRENT_TUNNEL_SESSIONS}"
+            );
+            return Ok(());
+        }
+    };
     info!(
         "session forwarded: key_id={} session={session_prefix} (connecting back to edge)",
         config.label
@@ -668,9 +716,13 @@ async fn handle_session(
     Ok(())
 }
 
-async fn listen_once(ingress: SocketAddr, config: TunConfig) -> anyhow::Result<()> {
-    const MAX_CONCURRENT_TUNNEL_SESSIONS: usize = 1000;
+const MAX_CONCURRENT_TUNNEL_SESSIONS: usize = 1000;
 
+async fn listen_once(
+    ingress: SocketAddr,
+    config: TunConfig,
+    session_slots: Arc<tokio::sync::Semaphore>,
+) -> anyhow::Result<()> {
     let mut listener = tun::connect_agent(ingress).await?;
     tune_socket(&listener);
     debug!(
@@ -678,8 +730,6 @@ async fn listen_once(ingress: SocketAddr, config: TunConfig) -> anyhow::Result<(
         listener.local_addr().ok(),
         listener.peer_addr().ok()
     );
-    let session_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TUNNEL_SESSIONS));
-
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
@@ -720,34 +770,28 @@ async fn listen_once(ingress: SocketAddr, config: TunConfig) -> anyhow::Result<(
                 "session forwarded: session={session_prefix} from={} to={}",
                 forward.request.from, forward.request.to
             );
-            let permit = match Arc::clone(&session_slots).try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    warn!(
-                        "dropping session offer: session={session_prefix} active_session_limit={MAX_CONCURRENT_TUNNEL_SESSIONS}"
-                    );
-                    continue;
-                }
-            };
             let config = TunConfig {
                 key_id: config.key_id,
                 secret: config.secret,
                 label: config.label.clone(),
             };
             let from = forward.request.from;
+            let session_slots = Arc::clone(&session_slots);
             match net::sock::backend_kind() {
                 net::sock::BackendKind::Tokio | net::sock::BackendKind::Epoll => {
                     tokio::task::spawn_local(async move {
-                        let _permit = permit;
-                        if let Err(e) = handle_session(from, config, forward.session).await {
+                        if let Err(e) =
+                            handle_session(session_slots, from, config, forward.session).await
+                        {
                             error!("minitun handle_session failed: {e}");
                         }
                     });
                 }
                 net::sock::BackendKind::Uring => {
                     net::sock::uring::spawn(async move {
-                        let _permit = permit;
-                        if let Err(e) = handle_session(from, config, forward.session).await {
+                        if let Err(e) =
+                            handle_session(session_slots, from, config, forward.session).await
+                        {
                             error!("minitun handle_session failed: {e}");
                         }
                     });
@@ -760,6 +804,7 @@ async fn listen_once(ingress: SocketAddr, config: TunConfig) -> anyhow::Result<(
 async fn run(ingress: SocketAddr, config: TunConfig) -> anyhow::Result<()> {
     let mut delay = std::time::Duration::from_millis(250);
     let max_delay = std::time::Duration::from_secs(5);
+    let session_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TUNNEL_SESSIONS));
 
     loop {
         match listen_once(
@@ -769,6 +814,7 @@ async fn run(ingress: SocketAddr, config: TunConfig) -> anyhow::Result<()> {
                 secret: config.secret,
                 label: config.label.clone(),
             },
+            Arc::clone(&session_slots),
         )
         .await
         {

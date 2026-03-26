@@ -226,21 +226,18 @@ impl TunnelAgentController {
         auth_mode: &AuthMode,
         dispatch: TunnelAgentDispatch,
     ) -> anyhow::Result<oneshot::Receiver<LureConnection>> {
+        let tunnel_id = request.tunnel_id;
+        let session = request.session;
         let receiver = self
             .registry
-            .prepare_local_session(request.tunnel_id, request.session, target, auth_mode)
+            .prepare_local_session(tunnel_id, session, target, auth_mode)
             .await?;
 
-        match dispatch {
+        let dispatch_result = match dispatch {
             TunnelAgentDispatch::LocalAgent => {
                 self.registry
-                    .forward_request_to_agent(
-                        request.tunnel_id,
-                        request.session,
-                        request.tunnel_agent_request,
-                        0,
-                    )
-                    .await?;
+                    .forward_request_to_agent(tunnel_id, session, request.tunnel_agent_request, 0)
+                    .await
             }
             TunnelAgentDispatch::Master(master_addr) => {
                 self.forward_request_to_master(
@@ -250,8 +247,15 @@ impl TunnelAgentController {
                     },
                     master_addr,
                 )
-                .await?;
+                .await
             }
+        };
+
+        if let Err(err) = dispatch_result {
+            self.registry
+                .rollback_local_session(tunnel_id, session)
+                .await;
+            return Err(err);
         }
 
         Ok(receiver)
@@ -651,6 +655,16 @@ impl TunnelRegistry {
 
         LureLogger::tunnel_session_offered(&key_id_prefix(&key_id.0), &target);
         Ok(rx)
+    }
+
+    pub async fn rollback_local_session(&self, key_id: TokenKeyId, session: SessionToken) {
+        let mut pending = self.pending.write().await;
+        if pending
+            .get(&session)
+            .is_some_and(|record| record.key_id == key_id)
+        {
+            pending.remove(&session);
+        }
     }
 
     pub async fn forward_request_to_agent(
