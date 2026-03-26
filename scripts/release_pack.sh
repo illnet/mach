@@ -72,9 +72,21 @@ dist_dir="dist"
 stage_root="${dist_dir}/.stage/${pack_base}"
 flat_dir="${dist_dir}/gha/${pack_base}"
 target_dir="target-releasepack"
+settings_source="settings.toml"
 
 rm -rf "${stage_root}"
 mkdir -p "${stage_root}" "${dist_dir}" "${flat_dir}"
+
+if [[ ! -f "${settings_source}" ]]; then
+    settings_source="${stage_root}/settings.toml"
+    cat > "${settings_source}" <<'EOF'
+inst = "main"
+bind = "0.0.0.0:25577"
+max_conn = 65535
+cooldown = 3
+rate_limit_by_ip = 10
+EOF
+fi
 
 build_one() {
     local label="$1"
@@ -110,7 +122,7 @@ build_one() {
 
     install -m 0755 "${target_dir}/${target}/release/lure${exe_suffix}" "${out}/lure${exe_suffix}"
     install -m 0755 "${target_dir}/${target}/release/minitun${exe_suffix}" "${out}/minitun${exe_suffix}"
-    install -m 0644 "settings.toml" "${out}/settings.toml"
+    install -m 0644 "${settings_source}" "${out}/settings.toml"
     install -m 0644 "README.md" "${out}/README.md"
     install -m 0644 "LICENSE" "${out}/LICENSE"
 
