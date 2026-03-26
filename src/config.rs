@@ -162,6 +162,9 @@ pub struct TunnelConfig {
     pub token: Vec<TokenEntry>,
     #[serde(default)]
     pub bootstrap_url: Option<String>,
+    /// Optional master Lure endpoint for slave forwarded-request flow.
+    #[serde(default)]
+    pub master_url: Option<String>,
     #[serde(default)]
     pub endpoints: Vec<EndpointInfo>,
 }

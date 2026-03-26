@@ -514,13 +514,13 @@ use std::{
 /// Must match `LureEpollDone` in epoll.h exactly (48 bytes, no padding gaps).
 #[repr(C)]
 struct LureEpollDoneC {
-    conn_id:    u64,
-    c2s_bytes:  u64,
-    s2c_bytes:  u64,
+    conn_id: u64,
+    c2s_bytes: u64,
+    s2c_bytes: u64,
     c2s_chunks: u64,
     s2c_chunks: u64,
-    result:     i32,
-    _pad:       u32,
+    result: i32,
+    _pad: u32,
 }
 
 const _: () = assert!(
@@ -579,12 +579,12 @@ impl std::os::fd::AsRawFd for FdRef {
 /// shared done-pipe; a single Tokio drain task forwards completions to the
 /// per-connection oneshot channels stored in `pending`.
 pub struct EpollManager {
-    workers:       Vec<WorkerHandle>,
-    done_read_fd:  RawFd,
+    workers: Vec<WorkerHandle>,
+    done_read_fd: RawFd,
     done_write_fd: RawFd,
     pending: Mutex<HashMap<u64, tokio::sync::oneshot::Sender<EpollDone>>>,
     next_worker: AtomicUsize,
-    next_id:     AtomicU64,
+    next_id: AtomicU64,
 }
 
 unsafe impl Send for EpollManager {}
@@ -609,16 +609,11 @@ impl EpollManager {
 
         let mut pipe_fds = [0i32; 2];
         // SAFETY: pipe2 is a simple syscall with a valid array pointer.
-        let rc = unsafe {
-            libc::pipe2(
-                pipe_fds.as_mut_ptr(),
-                libc::O_CLOEXEC | libc::O_NONBLOCK,
-            )
-        };
+        let rc = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
-        let done_read_fd  = pipe_fds[0];
+        let done_read_fd = pipe_fds[0];
         let done_write_fd = pipe_fds[1];
 
         let mut workers = Vec::with_capacity(n_workers);
@@ -639,9 +634,9 @@ impl EpollManager {
             workers,
             done_read_fd,
             done_write_fd,
-            pending:     Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
             next_worker: AtomicUsize::new(0),
-            next_id:     AtomicU64::new(1),
+            next_id: AtomicU64::new(1),
         })
     }
 
@@ -657,7 +652,7 @@ impl EpollManager {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
 
-        let n   = self.workers.len();
+        let n = self.workers.len();
         let idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % n;
         // SAFETY: ptr is valid; fd_a/fd_b ownership transferred to C.
         let rc = unsafe { lure_epoll_worker_submit(self.workers[idx].ptr, fd_a, fd_b, id) };
@@ -672,10 +667,10 @@ impl EpollManager {
 
     fn deliver(&self, frame: LureEpollDoneC) {
         let done = EpollDone {
-            id:    frame.conn_id,
+            id: frame.conn_id,
             stats: EpollStats {
-                c2s_bytes:  frame.c2s_bytes,
-                s2c_bytes:  frame.s2c_bytes,
+                c2s_bytes: frame.c2s_bytes,
+                s2c_bytes: frame.s2c_bytes,
                 c2s_chunks: frame.c2s_chunks,
                 s2c_chunks: frame.s2c_chunks,
             },
@@ -715,13 +710,8 @@ async fn drain_completions(done_read_fd: RawFd, mgr: Weak<EpollManager>) {
             let want = (FRAME - leftover.len()).max(FRAME);
             let mut buf = vec![0u8; want];
             // SAFETY: buf is valid for `want` bytes.
-            let n = unsafe {
-                libc::read(
-                    done_read_fd,
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    want,
-                )
-            };
+            let n =
+                unsafe { libc::read(done_read_fd, buf.as_mut_ptr() as *mut libc::c_void, want) };
             if n <= 0 {
                 if n < 0 {
                     let e = io::Error::last_os_error();
@@ -736,9 +726,8 @@ async fn drain_completions(done_read_fd: RawFd, mgr: Weak<EpollManager>) {
             while leftover.len() >= FRAME {
                 // SAFETY: leftover is at least FRAME bytes; read_unaligned
                 // handles any alignment.
-                let frame: LureEpollDoneC = unsafe {
-                    std::ptr::read_unaligned(leftover.as_ptr() as *const LureEpollDoneC)
-                };
+                let frame: LureEpollDoneC =
+                    unsafe { std::ptr::read_unaligned(leftover.as_ptr() as *const LureEpollDoneC) };
                 leftover.drain(..FRAME);
                 mgr.deliver(frame);
             }
@@ -754,9 +743,9 @@ pub fn get_epoll_manager() -> io::Result<Arc<EpollManager>> {
     GLOBAL_EPOLL_MANAGER
         .get_or_init(|| {
             EpollManager::build().map(|mgr| {
-                let arc      = Arc::new(mgr);
-                let weak     = Arc::downgrade(&arc);
-                let read_fd  = arc.done_read_fd;
+                let arc = Arc::new(mgr);
+                let weak = Arc::downgrade(&arc);
+                let read_fd = arc.done_read_fd;
                 tokio::spawn(drain_completions(read_fd, weak));
                 arc
             })
@@ -799,7 +788,7 @@ impl Connection {
         let rx = mgr.submit(fd_a, fd_b)?;
 
         let progress = Arc::new(crate::sock::ProxyProgress::default());
-        let prog2    = Arc::clone(&progress);
+        let prog2 = Arc::clone(&progress);
 
         let future: Pin<
             Box<dyn Future<Output = io::Result<crate::sock::ProxyStats>> + Send + 'static>,
@@ -813,14 +802,14 @@ impl Connection {
             }
 
             let stats = crate::sock::ProxyStats {
-                c2s_bytes:  done.stats.c2s_bytes,
-                s2c_bytes:  done.stats.s2c_bytes,
+                c2s_bytes: done.stats.c2s_bytes,
+                s2c_bytes: done.stats.s2c_bytes,
                 c2s_chunks: done.stats.c2s_chunks,
                 s2c_chunks: done.stats.s2c_chunks,
             };
             // Update progress with final stats so callers see the complete picture.
-            prog2.c2s_bytes.store(stats.c2s_bytes,   Ordering::Relaxed);
-            prog2.s2c_bytes.store(stats.s2c_bytes,   Ordering::Relaxed);
+            prog2.c2s_bytes.store(stats.c2s_bytes, Ordering::Relaxed);
+            prog2.s2c_bytes.store(stats.s2c_bytes, Ordering::Relaxed);
             prog2.c2s_chunks.store(stats.c2s_chunks, Ordering::Relaxed);
             prog2.s2c_chunks.store(stats.s2c_chunks, Ordering::Relaxed);
             Ok(stats)

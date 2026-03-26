@@ -148,16 +148,30 @@ tunnel_token = "8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f00112233445566778899aabb
 tunnel = true
 ```
 
-Then run the agents (sign the secret to get token that contains public so it authenticates):
+Then run `minitun` with one or more tunnel keys:
 
 ```sh
-tunure agent endpoint:25565 -t a1b2c3d4e5f6:8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f00112233445566778899aabb
+./minitun agent endpoint:25565 \
+  --token a1b2c3d4e5f6a7b8:8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f00112233445566778899aabb \
+  --token b1c2d3e4f5a60718:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+```
+
+Or use env for the singleton service layout:
+
+```sh
+MINITUN_ENDPOINT="endpoint:25565" \
+MINITUN_TOKENS="a1b2c3d4e5f6a7b8:8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f00112233445566778899aabb,b1c2d3e4f5a60718:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff" \
+./minitun agent
 ```
 
 ## Env Vars
 
 - `LURE_RPC`: RPC backend URL (optional)
 - `LURE_PROXY_SIGNING_KEY`: base64 Ed25519 private key for signing proxy headers (optional)
+- `LURE_TUN_MASTER_URL`: override `tunnel.master_url` for slave forwarded-request mode
+- `MINITUN_ENDPOINT`: endpoint for `minitun agent`
+- `MINITUN_TOKENS`: comma/newline-separated `key_id:secret` list for singleton `minitun`
+- `MINITUN_TOKEN`: single-token shorthand for `minitun`
 - `OTEL_EXPORTER_OTLP_ENDPOINT`: enable OTEL export when set
 - `LURE_ENABLE_TOKIO_CONSOLE=1`: enable Tokio console tracing subscriber
 - `LURE_IO_EPOLL=1`: enable epoll backend (beta)

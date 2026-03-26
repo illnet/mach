@@ -1,7 +1,10 @@
-use std::collections::HashMap;
-use std::fmt;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
 use tokio::sync::Mutex;
 
 /// Cached Status response entry

@@ -132,6 +132,30 @@ pub struct TokenInfo {
     pub last_used: RwLock<Instant>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunnelAgentMode {
+    Master,
+    Slave,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunnelAgentDispatch {
+    LocalAgent,
+    Master(SocketAddr),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MasterForwardTunnelRequest {
+    pub tunnel_id: TokenKeyId,
+    pub session: SessionToken,
+    pub ttl: u8,
+    pub tunnel_agent_request: tun::TunnelAgentRequest,
+}
+
+pub struct TunnelAgentController {
+    registry: Arc<TunnelRegistry>,
+}
+
 pub struct TunnelRegistry {
     /// Token registry by `key_id`
     tokens: RwLock<HashMap<TokenKeyId, Arc<TokenInfo>>>,
@@ -160,12 +184,16 @@ struct AgentRecord {
 struct PendingSession {
     key_id: TokenKeyId,
     target: SocketAddr,
-    respond: oneshot::Sender<LureConnection>,
+    respond: Option<oneshot::Sender<LureConnection>>,
     created_at: Instant,
 }
 
 enum TunnelCommand {
-    OfferSession { session: SessionToken },
+    ForwardRequest {
+        session: SessionToken,
+        ttl: u8,
+        request: tun::TunnelAgentRequest,
+    },
 }
 
 impl Default for TunnelRegistry {
@@ -178,6 +206,157 @@ impl Default for TunnelRegistry {
             expired_sessions: std::sync::atomic::AtomicU64::new(0),
             agent_gen: std::sync::atomic::AtomicU64::new(1),
             endpoint_cache: tokio::sync::RwLock::new(Vec::new()),
+        }
+    }
+}
+
+impl TunnelAgentController {
+    #[must_use]
+    pub fn new(registry: Arc<TunnelRegistry>) -> Self {
+        Self { registry }
+    }
+
+    pub async fn dispatch_router_request(
+        &self,
+        request: MasterForwardTunnelRequest,
+        target: SocketAddr,
+        auth_mode: &AuthMode,
+        dispatch: TunnelAgentDispatch,
+    ) -> anyhow::Result<oneshot::Receiver<LureConnection>> {
+        let receiver = self
+            .registry
+            .prepare_local_session(request.tunnel_id, request.session, target, auth_mode)
+            .await?;
+
+        match dispatch {
+            TunnelAgentDispatch::LocalAgent => {
+                self.registry
+                    .forward_request_to_agent(
+                        request.tunnel_id,
+                        request.session,
+                        request.tunnel_agent_request,
+                        0,
+                    )
+                    .await?;
+            }
+            TunnelAgentDispatch::Master(master_addr) => {
+                self.forward_request_to_master(
+                    MasterForwardTunnelRequest {
+                        ttl: request.ttl.max(1),
+                        ..request
+                    },
+                    master_addr,
+                )
+                .await?;
+            }
+        }
+
+        Ok(receiver)
+    }
+
+    pub async fn dispatch_external_request(
+        &self,
+        request: MasterForwardTunnelRequest,
+        timestamp: u64,
+        hmac: [u8; 32],
+        mode: TunnelAgentMode,
+    ) -> anyhow::Result<()> {
+        if mode == TunnelAgentMode::Slave {
+            anyhow::bail!("slave mode must not accept forwarded tunnel requests");
+        }
+        if request.ttl == 0 {
+            anyhow::bail!("forwarded tunnel request ttl exhausted");
+        }
+
+        self.registry
+            .validate_hmac(
+                &request.tunnel_id,
+                timestamp,
+                tun::Intent::Forward,
+                Some(&request.session.0),
+                Some(&request.tunnel_agent_request),
+                request.ttl,
+                &hmac,
+            )
+            .await?;
+
+        LureLogger::tunnel_forward_request_received(
+            &key_id_prefix(&request.tunnel_id.0),
+            &request.tunnel_agent_request.from,
+            &request.tunnel_agent_request.to,
+        );
+
+        self.registry
+            .forward_request_to_agent(
+                request.tunnel_id,
+                request.session,
+                request.tunnel_agent_request,
+                request.ttl.saturating_sub(1),
+            )
+            .await
+    }
+
+    async fn forward_request_to_master(
+        &self,
+        request: MasterForwardTunnelRequest,
+        master_addr: SocketAddr,
+    ) -> anyhow::Result<()> {
+        let secret = self
+            .registry
+            .secret_for_key(&request.tunnel_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no tunnel secret loaded for key_id"))?;
+
+        let mut connection = tun::connect_agent(master_addr).await?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let hmac = tun::compute_agent_hmac(
+            &secret,
+            &request.tunnel_id.0,
+            timestamp,
+            tun::Intent::Forward,
+            Some(&request.session.0),
+            Some(&request.tunnel_agent_request),
+            request.ttl,
+        );
+
+        let hello = tun::AgentHello {
+            version: tun::VERSION,
+            intent: tun::Intent::Forward,
+            key_id: request.tunnel_id.0,
+            timestamp,
+            hmac,
+            session: None,
+            forward: Some(tun::ForwardHello {
+                session: request.session.0,
+                ttl: request.ttl,
+                request: request.tunnel_agent_request,
+            }),
+        };
+        let mut buf = Vec::new();
+        tun::encode_agent_hello(&hello, &mut buf)?;
+        connection.write_all(buf).await?;
+
+        let mut buf = Vec::new();
+        let mut read_buf = vec![0u8; 1024];
+        loop {
+            if let Some((msg, consumed)) = tun::decode_server_msg(&buf)? {
+                buf.drain(..consumed);
+                if let tun::ServerMsg::ForwardAck(session) = msg {
+                    if session == request.session.0 {
+                        return Ok(());
+                    }
+                    anyhow::bail!("master acknowledged unexpected session");
+                }
+            }
+
+            let (n, next) = connection.read_chunk(read_buf).await?;
+            read_buf = next;
+            if n == 0 {
+                anyhow::bail!("master closed forwarded request connection");
+            }
+            buf.extend_from_slice(&read_buf[..n]);
         }
     }
 }
@@ -269,6 +448,10 @@ impl TunnelRegistry {
         self.zones.read().await.get(&zone).copied()
     }
 
+    pub async fn secret_for_key(&self, key_id: &TokenKeyId) -> Option<[u8; 32]> {
+        self.tokens.read().await.get(key_id).map(|info| info.secret)
+    }
+
     /// Validate HMAC authentication
     async fn validate_hmac(
         &self,
@@ -276,6 +459,8 @@ impl TunnelRegistry {
         timestamp: u64,
         intent: tun::Intent,
         session: Option<&[u8; 32]>,
+        request: Option<&tun::TunnelAgentRequest>,
+        ttl: u8,
         provided_hmac: &[u8; 32],
     ) -> anyhow::Result<Arc<TokenInfo>> {
         // Check timestamp is within a small window for replay protection.
@@ -300,8 +485,15 @@ impl TunnelRegistry {
             .ok_or_else(|| anyhow::anyhow!("invalid key_id"))?;
 
         // Compute expected HMAC
-        let expected_hmac =
-            tun::compute_agent_hmac(&token_info.secret, &key_id.0, timestamp, intent, session);
+        let expected_hmac = tun::compute_agent_hmac(
+            &token_info.secret,
+            &key_id.0,
+            timestamp,
+            intent,
+            session,
+            request,
+            ttl,
+        );
 
         // Constant-time comparison to prevent timing attacks
         let choice: subtle::Choice = provided_hmac.ct_eq(&expected_hmac);
@@ -323,7 +515,15 @@ impl TunnelRegistry {
     ) -> anyhow::Result<()> {
         // Validate HMAC
         let _token_info = self
-            .validate_hmac(&key_id, timestamp, tun::Intent::Listen, None, &hmac)
+            .validate_hmac(
+                &key_id,
+                timestamp,
+                tun::Intent::Listen,
+                None,
+                None,
+                0,
+                &hmac,
+            )
             .await?;
 
         let (tx, mut rx) = mpsc::channel(8);
@@ -340,8 +540,19 @@ impl TunnelRegistry {
             while let Some(cmd) = rx.recv().await {
                 let mut buf = Vec::new();
                 match cmd {
-                    TunnelCommand::OfferSession { session } => {
-                        tun::encode_server_msg(&tun::ServerMsg::SessionOffer(session.0), &mut buf);
+                    TunnelCommand::ForwardRequest {
+                        session,
+                        ttl,
+                        request,
+                    } => {
+                        tun::encode_server_msg(
+                            &tun::ServerMsg::ForwardRequest(tun::ForwardRequestMsg {
+                                session: session.0,
+                                ttl,
+                                request,
+                            }),
+                            &mut buf,
+                        );
                     }
                 }
                 if connection.write_all(buf).await.is_err() {
@@ -379,7 +590,7 @@ impl TunnelRegistry {
         Ok(())
     }
 
-    pub async fn offer_session(
+    pub async fn prepare_local_session(
         &self,
         key_id: TokenKeyId,
         session: SessionToken,
@@ -420,15 +631,30 @@ impl TunnelRegistry {
                 PendingSession {
                     key_id,
                     target,
-                    respond: tx,
+                    respond: Some(tx),
                     created_at: Instant::now(),
                 },
             );
         }
 
         LureLogger::tunnel_session_offered(&key_id_prefix(&key_id.0), &target);
+        Ok(rx)
+    }
 
-        // Best-effort stats: track offers sent per agent.
+    pub async fn forward_request_to_agent(
+        &self,
+        key_id: TokenKeyId,
+        session: SessionToken,
+        request: tun::TunnelAgentRequest,
+        ttl: u8,
+    ) -> anyhow::Result<()> {
+        {
+            let tokens = self.tokens.read().await;
+            if !tokens.contains_key(&key_id) {
+                anyhow::bail!("tunnel token not registered for key_id");
+            }
+        }
+
         {
             let mut agents = self.agents.write().await;
             if let Some(agent) = agents.get_mut(&key_id) {
@@ -438,8 +664,6 @@ impl TunnelRegistry {
 
         let agent_tx = { self.agents.read().await.get(&key_id).map(|a| a.tx.clone()) };
         let Some(agent_tx) = agent_tx else {
-            let mut pending = self.pending.write().await;
-            pending.remove(&session);
             LureLogger::tunnel_agent_missing(
                 &key_id_prefix(&key_id.0),
                 &format!("{:02x}", session.0[0]),
@@ -447,14 +671,17 @@ impl TunnelRegistry {
             anyhow::bail!("no active tunnel agent registered for key_id");
         };
 
-        if matches!(
-            agent_tx.send(TunnelCommand::OfferSession { session }).await,
+        if agent_tx
+            .send(TunnelCommand::ForwardRequest {
+                session,
+                ttl,
+                request,
+            })
+            .await
+            .is_ok()
+        {
             Ok(())
-        ) {
-            Ok(rx)
         } else {
-            let mut pending = self.pending.write().await;
-            pending.remove(&session);
             LureLogger::tunnel_agent_missing(
                 &key_id_prefix(&key_id.0),
                 &format!("{:02x}", session.0[0]),
@@ -477,6 +704,8 @@ impl TunnelRegistry {
             timestamp,
             tun::Intent::Connect,
             Some(&session.0),
+            None,
+            0,
             &hmac,
         )
         .await?;
@@ -499,6 +728,10 @@ impl TunnelRegistry {
             anyhow::bail!("key_id mismatch: unauthorized accept attempt");
         }
 
+        let Some(respond) = pending.respond else {
+            anyhow::bail!("session was recorded without a local responder");
+        };
+
         LureLogger::tunnel_session_accepted(&key_id_prefix(&key_id.0), &pending.target);
 
         let mut buf = Vec::new();
@@ -508,8 +741,7 @@ impl TunnelRegistry {
             .await
             .context("failed to send tunnel target")?;
 
-        pending
-            .respond
+        respond
             .send(connection)
             .map_err(|_| anyhow::anyhow!("pending tunnel session closed"))?;
 
@@ -609,10 +841,7 @@ impl TunnelRegistry {
         }
     }
 
-    pub async fn start_bootstrap_poller(
-        self: &Arc<Self>,
-        bootstrap_url: String,
-    ) {
+    pub async fn start_bootstrap_poller(self: &Arc<Self>, bootstrap_url: String) {
         let registry = Arc::clone(self);
         let spawn_result = crate::utils::spawn_named("tunnel-bootstrap", async move {
             let client = match reqwest::Client::builder()
@@ -636,12 +865,18 @@ impl TunnelRegistry {
                             Ok(nodes) => {
                                 let count = nodes.len();
                                 *registry.endpoint_cache.write().await = nodes;
-                                log::info!("[tunnel-bootstrap] refreshed {} endpoints from {}", count, url);
+                                log::info!(
+                                    "[tunnel-bootstrap] refreshed {} endpoints from {}",
+                                    count,
+                                    url
+                                );
                             }
                             Err(e) => log::warn!("[tunnel-bootstrap] JSON parse error: {e}"),
                         }
                     }
-                    Ok(resp) => log::warn!("[tunnel-bootstrap] HTTP {} from {}", resp.status(), url),
+                    Ok(resp) => {
+                        log::warn!("[tunnel-bootstrap] HTTP {} from {}", resp.status(), url)
+                    }
                     Err(e) => log::warn!("[tunnel-bootstrap] fetch failed: {e}"),
                 }
             }
@@ -735,5 +970,31 @@ mod tests {
 
         registry.clear_runtime().await;
         assert!(registry.key_id_for_zone(42).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn local_pending_session_is_recorded_in_snapshot() {
+        let registry = TunnelRegistry::default();
+        let entry = TokenEntry {
+            key_id: "0011223344556677".to_string(),
+            secret: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            name: Some("edge-a".to_string()),
+            zone: None,
+        };
+
+        registry.upsert_token(&entry).await.unwrap();
+
+        let key_id = TokenKeyId(parse_key_id(&entry.key_id).unwrap());
+        let session = SessionToken([0xAA; 32]);
+        let target: SocketAddr = "127.0.0.1:25565".parse().unwrap();
+
+        let _receiver = registry
+            .prepare_local_session(key_id, session, target, &crate::router::AuthMode::Protected)
+            .await
+            .unwrap();
+
+        let snapshot = registry.inspect_snapshot().await;
+        assert_eq!(snapshot.pending_total, 1);
+        assert!(snapshot.pending[0].target.contains("127.0.0.1:25565"));
     }
 }

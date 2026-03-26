@@ -45,7 +45,9 @@ pub async fn send_status_response(
 ) -> anyhow::Result<()> {
     // Convert bytes to string for sending (StatusResponseS2c expects &str)
     let json_str = std::str::from_utf8(json_bytes)?;
-    client.send(&net::StatusResponseS2c { json: json_str }).await?;
+    client
+        .send(&net::StatusResponseS2c { json: json_str })
+        .await?;
     Ok(())
 }
 
@@ -74,6 +76,10 @@ pub async fn handle_ping_pong_local(
     };
 
     // Echo the ping payload back in the pong response
-    client.send(&StatusPongS2c { payload: ping.payload }).await?;
+    client
+        .send(&StatusPongS2c {
+            payload: ping.payload,
+        })
+        .await?;
     Ok(())
 }

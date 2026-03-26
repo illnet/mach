@@ -12,6 +12,7 @@ use opentelemetry::{
     KeyValue,
     metrics::{Counter, Histogram, Meter},
 };
+
 use crate::{sock::LureConnection, telemetry::get_meter};
 
 /// An in-flight connection with packet encode/decode state.
@@ -98,11 +99,7 @@ impl EncodedConnection {
         }
     }
 
-    pub fn with_buffered(
-        stream: LureConnection,
-        intent: SocketIntent,
-        buffered: Vec<u8>,
-    ) -> Self {
+    pub fn with_buffered(stream: LureConnection, intent: SocketIntent, buffered: Vec<u8>) -> Self {
         let mut conn = Self::new(stream, intent);
         if !buffered.is_empty() {
             conn.dec.queue_slice(&buffered);

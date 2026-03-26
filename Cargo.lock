@@ -3042,6 +3042,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "clap",
+ "dotenvy",
  "env_logger",
  "hex",
  "hmac",

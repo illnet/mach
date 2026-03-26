@@ -92,6 +92,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Err(LureConfigLoadError::Parse(parse_error)) => return Err(parse_error.into()),
     };
     apply_proxy_signing_key(&mut config);
+    apply_tunnel_master_url(&mut config);
     if should_save {
         config.save(&config_file)?;
     }
@@ -203,6 +204,21 @@ fn apply_proxy_signing_key(config: &mut LureConfig) {
     }
     config.proxy_signing_key = Some(ProxySigningKey::from_bytes(seed.to_vec()));
     log::info!("generated ephemeral proxy signing key");
+}
+
+fn apply_tunnel_master_url(config: &mut LureConfig) {
+    let Ok(value) = env::var("LURE_TUN_MASTER_URL") else {
+        return;
+    };
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        config.tunnel.master_url = None;
+        return;
+    }
+
+    config.tunnel.master_url = Some(trimmed.to_string());
+    log::info!("tunnel master url loaded from env");
 }
 
 fn env_flag_enabled(name: &str) -> bool {

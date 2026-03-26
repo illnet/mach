@@ -1,8 +1,8 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use opentelemetry::{KeyValue, metrics::Counter};
 use net::ProxyProgress;
+use opentelemetry::{KeyValue, metrics::Counter};
 
 use crate::{
     router::{RouterInstance, inspect::SessionInspectState},

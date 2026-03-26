@@ -1,8 +1,8 @@
 use std::{
+    future::Future,
     io,
     net::SocketAddr,
     pin::Pin,
-    future::Future,
     sync::{Arc, atomic::Ordering},
 };
 
@@ -157,20 +157,21 @@ impl Connection {
         let (a_read, a_write) = self.stream.into_split();
         let (b_read, b_write) = peer_stream.into_split();
 
-        let future: Pin<Box<dyn Future<Output = io::Result<crate::sock::ProxyStats>> + Send + 'static>> =
-            Box::pin(async move {
-                let c2s_task = tokio::spawn(async move {
-                    copy_tracked(a_read, b_write, &prog_c2s.c2s_bytes, &prog_c2s.c2s_chunks).await
-                });
-                let s2c_task = tokio::spawn(async move {
-                    copy_tracked(b_read, a_write, &prog_s2c.s2c_bytes, &prog_s2c.s2c_chunks).await
-                });
-                let (cr, sr) = tokio::join!(c2s_task, s2c_task);
-                // Propagate first error; ignore the other direction's error.
-                let _ = cr.map_err(|e| io::Error::other(e.to_string()))?;
-                let _ = sr.map_err(|e| io::Error::other(e.to_string()))?;
-                Ok(prog_final.snapshot())
+        let future: Pin<
+            Box<dyn Future<Output = io::Result<crate::sock::ProxyStats>> + Send + 'static>,
+        > = Box::pin(async move {
+            let c2s_task = tokio::spawn(async move {
+                copy_tracked(a_read, b_write, &prog_c2s.c2s_bytes, &prog_c2s.c2s_chunks).await
             });
+            let s2c_task = tokio::spawn(async move {
+                copy_tracked(b_read, a_write, &prog_s2c.s2c_bytes, &prog_s2c.s2c_chunks).await
+            });
+            let (cr, sr) = tokio::join!(c2s_task, s2c_task);
+            // Propagate first error; ignore the other direction's error.
+            let _ = cr.map_err(|e| io::Error::other(e.to_string()))?;
+            let _ = sr.map_err(|e| io::Error::other(e.to_string()))?;
+            Ok(prog_final.snapshot())
+        });
 
         Ok(crate::sock::ProxyHandle { future, progress })
     }
@@ -243,7 +244,10 @@ impl crate::sock::Sock for Connection {
         Box::pin(async move { Connection::shutdown(self).await })
     }
 
-    fn into_proxy(self: Box<Self>, peer: Box<dyn crate::sock::Sock>) -> io::Result<crate::sock::ProxyHandle> {
+    fn into_proxy(
+        self: Box<Self>,
+        peer: Box<dyn crate::sock::Sock>,
+    ) -> io::Result<crate::sock::ProxyHandle> {
         (*self).into_proxy(peer)
     }
 }

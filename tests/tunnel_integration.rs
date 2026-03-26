@@ -33,6 +33,7 @@ fn tunnel_protocol_agent_hello_roundtrip() {
         timestamp: 1234567890,
         hmac: [25u8; 32],
         session: Some([21u8; 32]),
+        forward: None,
     };
 
     let mut buf = Vec::new();
@@ -64,6 +65,7 @@ fn tunnel_protocol_agent_hello_roundtrip() {
         timestamp: 9876543210,
         hmac: [23u8; 32],
         session: None,
+        forward: None,
     };
 
     let mut buf2 = Vec::new();
@@ -196,12 +198,20 @@ fn tunnel_hmac_computation() {
     let session = [0x99u8; 32];
 
     // Listen intent (no session)
-    let hmac_listen = compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None);
+    let hmac_listen =
+        compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None, None, 0);
     assert_eq!(hmac_listen.len(), 32, "HMAC should be 32 bytes");
 
     // Connect intent (with session)
-    let hmac_connect =
-        compute_agent_hmac(&secret, &key_id, timestamp, Intent::Connect, Some(&session));
+    let hmac_connect = compute_agent_hmac(
+        &secret,
+        &key_id,
+        timestamp,
+        Intent::Connect,
+        Some(&session),
+        None,
+        0,
+    );
     assert_eq!(hmac_connect.len(), 32, "HMAC should be 32 bytes");
 
     // Different intents should produce different HMACs
@@ -211,12 +221,14 @@ fn tunnel_hmac_computation() {
     );
 
     // Same inputs should be deterministic
-    let hmac_listen2 = compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None);
+    let hmac_listen2 =
+        compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None, None, 0);
     assert_eq!(hmac_listen, hmac_listen2, "HMAC should be deterministic");
 
     // Different key_id should change HMAC
     let key_id2 = [0x02u8; 8];
-    let hmac_different_key = compute_agent_hmac(&secret, &key_id2, timestamp, Intent::Listen, None);
+    let hmac_different_key =
+        compute_agent_hmac(&secret, &key_id2, timestamp, Intent::Listen, None, None, 0);
     assert_ne!(
         hmac_listen, hmac_different_key,
         "Different key_id should produce different HMAC"

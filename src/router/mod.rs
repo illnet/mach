@@ -38,14 +38,14 @@ pub use query::QueryCache;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Copy)]
 pub enum RouteFlags {
-    Disabled,
-    CacheQuery,
-    OverrideQuery,
-    ProxyProtocol,
-    PreserveHost,
-    Tunnel,
-    Redirection,  // ordinal 6 → bitmask 64
-    AllowsLocal,  // ordinal 7 → bitmask 128
+    Disabled = 0,
+    CacheQuery = 1,
+    OverrideQuery = 2,
+    ProxyProtocol = 3,
+    PreserveHost = 4,
+    Tunnel = 5,
+    Redirection = 6, // bitmask 64
+    AllowsLocal = 7, // bitmask 128
 }
 
 /// Authorization mode for tunnel routes

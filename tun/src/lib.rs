@@ -12,6 +12,8 @@ pub enum TunnelError {
     UnsupportedVersion(u8),
     #[error("invalid intent {0}")]
     InvalidIntent(u8),
+    #[error("invalid edge id")]
+    InvalidEdgeId,
     #[error("invalid message kind {0}")]
     InvalidMsgKind(u8),
     #[error("invalid address family {0}")]
@@ -19,13 +21,14 @@ pub enum TunnelError {
 }
 
 pub const MAGIC: [u8; 4] = *b"LTUN";
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Intent {
     Listen = 1,
     Connect = 2,
+    Forward = 3,
 }
 
 impl Intent {
@@ -33,12 +36,19 @@ impl Intent {
         match value {
             1 => Ok(Self::Listen),
             2 => Ok(Self::Connect),
+            3 => Ok(Self::Forward),
             other => Err(TunnelError::InvalidIntent(other)),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunnelAgentRequest {
+    pub from: SocketAddr,
+    pub to: SocketAddr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentHello {
     pub version: u8,
     pub intent: Intent,
@@ -46,6 +56,21 @@ pub struct AgentHello {
     pub timestamp: u64,
     pub hmac: [u8; 32],
     pub session: Option<[u8; 32]>,
+    pub forward: Option<ForwardHello>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForwardHello {
+    pub session: [u8; 32],
+    pub ttl: u8,
+    pub request: TunnelAgentRequest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForwardRequestMsg {
+    pub session: [u8; 32],
+    pub ttl: u8,
+    pub request: TunnelAgentRequest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,20 +78,24 @@ pub struct AgentHello {
 pub enum ServerMsgKind {
     SessionOffer = 1,
     TargetAddr = 2,
+    ForwardAck = 3,
+    ForwardRequest = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerMsg {
     SessionOffer([u8; 32]),
     TargetAddr(SocketAddr),
+    ForwardAck([u8; 32]),
+    ForwardRequest(ForwardRequestMsg),
 }
 
-pub async fn connect_agent(addr: SocketAddr) -> std::io::Result<sock::Connection> {
-    sock::Connection::connect(addr).await
+pub async fn connect_agent(addr: SocketAddr) -> std::io::Result<sock::LureConnection> {
+    sock::LureConnection::connect(addr).await
 }
 
-pub async fn listen_agent(addr: SocketAddr) -> std::io::Result<sock::Listener> {
-    sock::Listener::bind(addr).await
+pub async fn listen_agent(addr: SocketAddr) -> std::io::Result<sock::LureListener> {
+    sock::LureListener::bind(addr).await
 }
 
 pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, TunnelError> {
@@ -105,16 +134,43 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
     hmac.copy_from_slice(&buf[22..54]);
 
     let mut consumed = 54;
-    let session = if intent == Intent::Connect {
-        if buf.len() < consumed + 32 {
-            return Ok(None);
+    let (session, forward) = match intent {
+        Intent::Listen => (None, None),
+        Intent::Connect => {
+            if buf.len() < consumed + 32 {
+                return Ok(None);
+            }
+            let mut session = [0u8; 32];
+            session.copy_from_slice(&buf[consumed..consumed + 32]);
+            consumed += 32;
+            (Some(session), None)
         }
-        let mut session = [0u8; 32];
-        session.copy_from_slice(&buf[consumed..consumed + 32]);
-        consumed += 32;
-        Some(session)
-    } else {
-        None
+        Intent::Forward => {
+            if buf.len() < consumed + 33 {
+                return Ok(None);
+            }
+            let mut session = [0u8; 32];
+            session.copy_from_slice(&buf[consumed..consumed + 32]);
+            consumed += 32;
+            let ttl = buf[consumed];
+            consumed += 1;
+            let Some((from, consumed_from)) = decode_socket_addr_payload(&buf[consumed..])? else {
+                return Ok(None);
+            };
+            consumed += consumed_from;
+            let Some((to, consumed_to)) = decode_socket_addr_payload(&buf[consumed..])? else {
+                return Ok(None);
+            };
+            consumed += consumed_to;
+            (
+                None,
+                Some(ForwardHello {
+                    session,
+                    ttl,
+                    request: TunnelAgentRequest { from, to },
+                }),
+            )
+        }
     };
 
     Ok(Some((
@@ -125,6 +181,7 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
             timestamp,
             hmac,
             session,
+            forward,
         },
         consumed,
     )))
@@ -134,14 +191,17 @@ pub fn encode_agent_hello(hello: &AgentHello, out: &mut Vec<u8>) -> Result<(), T
     // Validate intent/session invariant: only Connect may have a session, others must not
     match hello.intent {
         Intent::Connect => {
-            // Connect must have a session
-            if hello.session.is_none() {
+            if hello.session.is_none() || hello.forward.is_some() {
                 return Err(TunnelError::InvalidIntent(hello.intent as u8));
             }
         }
         Intent::Listen => {
-            // Listen must not have a session
-            if hello.session.is_some() {
+            if hello.session.is_some() || hello.forward.is_some() {
+                return Err(TunnelError::InvalidIntent(hello.intent as u8));
+            }
+        }
+        Intent::Forward => {
+            if hello.session.is_some() || hello.forward.is_none() {
                 return Err(TunnelError::InvalidIntent(hello.intent as u8));
             }
         }
@@ -153,8 +213,18 @@ pub fn encode_agent_hello(hello: &AgentHello, out: &mut Vec<u8>) -> Result<(), T
     out.extend_from_slice(&hello.key_id);
     out.extend_from_slice(&hello.timestamp.to_be_bytes());
     out.extend_from_slice(&hello.hmac);
-    if let Some(session) = hello.session {
-        out.extend_from_slice(&session);
+    match hello.intent {
+        Intent::Listen => {}
+        Intent::Connect => {
+            out.extend_from_slice(&hello.session.expect("validated above"));
+        }
+        Intent::Forward => {
+            let forward = hello.forward.as_ref().expect("validated above");
+            out.extend_from_slice(&forward.session);
+            out.push(forward.ttl);
+            encode_socket_addr_payload(forward.request.from, out);
+            encode_socket_addr_payload(forward.request.to, out);
+        }
     }
     Ok(())
 }
@@ -167,18 +237,18 @@ pub fn encode_server_msg(msg: &ServerMsg, out: &mut Vec<u8>) {
         }
         ServerMsg::TargetAddr(addr) => {
             out.push(ServerMsgKind::TargetAddr as u8);
-            match addr.ip() {
-                IpAddr::V4(ip) => {
-                    out.push(4);
-                    out.extend_from_slice(&addr.port().to_be_bytes());
-                    out.extend_from_slice(&ip.octets());
-                }
-                IpAddr::V6(ip) => {
-                    out.push(6);
-                    out.extend_from_slice(&addr.port().to_be_bytes());
-                    out.extend_from_slice(&ip.octets());
-                }
-            }
+            encode_socket_addr_payload(*addr, out);
+        }
+        ServerMsg::ForwardAck(session) => {
+            out.push(ServerMsgKind::ForwardAck as u8);
+            out.extend_from_slice(session);
+        }
+        ServerMsg::ForwardRequest(request) => {
+            out.push(ServerMsgKind::ForwardRequest as u8);
+            out.extend_from_slice(&request.session);
+            out.push(request.ttl);
+            encode_socket_addr_payload(request.request.from, out);
+            encode_socket_addr_payload(request.request.to, out);
         }
     }
 }
@@ -197,38 +267,85 @@ pub fn decode_server_msg(buf: &[u8]) -> Result<Option<(ServerMsg, usize)>, Tunne
             Ok(Some((ServerMsg::SessionOffer(token), 33)))
         }
         x if x == ServerMsgKind::TargetAddr as u8 => {
-            if buf.len() < 1 + 1 + 2 {
+            let Some((addr, consumed)) = decode_socket_addr_payload(&buf[1..])? else {
+                return Ok(None);
+            };
+            Ok(Some((ServerMsg::TargetAddr(addr), 1 + consumed)))
+        }
+        x if x == ServerMsgKind::ForwardAck as u8 => {
+            if buf.len() < 1 + 32 {
                 return Ok(None);
             }
-            let family = buf[1];
-            let port = u16::from_be_bytes([buf[2], buf[3]]);
-            match family {
-                4 => {
-                    if buf.len() < 1 + 1 + 2 + 4 {
-                        return Ok(None);
-                    }
-                    let ip = std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
-                    Ok(Some((
-                        ServerMsg::TargetAddr(SocketAddr::new(IpAddr::V4(ip), port)),
-                        8,
-                    )))
-                }
-                6 => {
-                    if buf.len() < 1 + 1 + 2 + 16 {
-                        return Ok(None);
-                    }
-                    let mut octets = [0u8; 16];
-                    octets.copy_from_slice(&buf[4..20]);
-                    let ip = std::net::Ipv6Addr::from(octets);
-                    Ok(Some((
-                        ServerMsg::TargetAddr(SocketAddr::new(IpAddr::V6(ip), port)),
-                        20,
-                    )))
-                }
-                other => Err(TunnelError::InvalidAddrFamily(other)),
+            let mut token = [0u8; 32];
+            token.copy_from_slice(&buf[1..33]);
+            Ok(Some((ServerMsg::ForwardAck(token), 33)))
+        }
+        x if x == ServerMsgKind::ForwardRequest as u8 => {
+            if buf.len() < 1 + 32 + 1 {
+                return Ok(None);
             }
+            let mut session = [0u8; 32];
+            session.copy_from_slice(&buf[1..33]);
+            let ttl = buf[33];
+            let Some((from, consumed_from)) = decode_socket_addr_payload(&buf[34..])? else {
+                return Ok(None);
+            };
+            let offset = 34 + consumed_from;
+            let Some((to, consumed_to)) = decode_socket_addr_payload(&buf[offset..])? else {
+                return Ok(None);
+            };
+            Ok(Some((
+                ServerMsg::ForwardRequest(ForwardRequestMsg {
+                    session,
+                    ttl,
+                    request: TunnelAgentRequest { from, to },
+                }),
+                offset + consumed_to,
+            )))
         }
         other => Err(TunnelError::InvalidMsgKind(other)),
+    }
+}
+
+fn encode_socket_addr_payload(addr: SocketAddr, out: &mut Vec<u8>) {
+    match addr.ip() {
+        IpAddr::V4(ip) => {
+            out.push(4);
+            out.extend_from_slice(&addr.port().to_be_bytes());
+            out.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            out.push(6);
+            out.extend_from_slice(&addr.port().to_be_bytes());
+            out.extend_from_slice(&ip.octets());
+        }
+    }
+}
+
+fn decode_socket_addr_payload(buf: &[u8]) -> Result<Option<(SocketAddr, usize)>, TunnelError> {
+    if buf.len() < 1 + 2 {
+        return Ok(None);
+    }
+    let family = buf[0];
+    let port = u16::from_be_bytes([buf[1], buf[2]]);
+    match family {
+        4 => {
+            if buf.len() < 1 + 2 + 4 {
+                return Ok(None);
+            }
+            let ip = std::net::Ipv4Addr::new(buf[3], buf[4], buf[5], buf[6]);
+            Ok(Some((SocketAddr::new(IpAddr::V4(ip), port), 7)))
+        }
+        6 => {
+            if buf.len() < 1 + 2 + 16 {
+                return Ok(None);
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&buf[3..19]);
+            let ip = std::net::Ipv6Addr::from(octets);
+            Ok(Some((SocketAddr::new(IpAddr::V6(ip), port), 19)))
+        }
+        other => Err(TunnelError::InvalidAddrFamily(other)),
     }
 }
 
@@ -240,6 +357,8 @@ pub fn compute_agent_hmac(
     timestamp: u64,
     intent: Intent,
     session: Option<&[u8; 32]>,
+    request: Option<&TunnelAgentRequest>,
+    ttl: u8,
 ) -> [u8; 32] {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -252,6 +371,13 @@ pub fn compute_agent_hmac(
     mac.update(&[intent as u8]);
     if let Some(session) = session {
         mac.update(session);
+    }
+    if let Some(request) = request {
+        mac.update(&[ttl]);
+        let mut buf = Vec::with_capacity(19);
+        encode_socket_addr_payload(request.from, &mut buf);
+        encode_socket_addr_payload(request.to, &mut buf);
+        mac.update(&buf);
     }
 
     let result = mac.finalize();
@@ -279,6 +405,7 @@ mod tests {
             timestamp: 1234567890,
             hmac: [42u8; 32],
             session: None,
+            forward: None,
         };
         let mut buf = Vec::new();
         assert!(encode_agent_hello(&hello, &mut buf).is_ok());
@@ -300,6 +427,7 @@ mod tests {
             timestamp: 9876543210,
             hmac: [43u8; 32],
             session: Some([44u8; 32]),
+            forward: None,
         };
         let mut buf = Vec::new();
         assert!(encode_agent_hello(&hello, &mut buf).is_ok());
@@ -322,6 +450,7 @@ mod tests {
             timestamp: 9876543210,
             hmac: [43u8; 32],
             session: None,
+            forward: None,
         };
         let mut buf = Vec::new();
         assert!(encode_agent_hello(&hello, &mut buf).is_err());
@@ -336,6 +465,7 @@ mod tests {
             timestamp: 1234567890,
             hmac: [42u8; 32],
             session: Some([44u8; 32]),
+            forward: None,
         };
         let mut buf = Vec::new();
         assert!(encode_agent_hello(&hello, &mut buf).is_err());
@@ -354,6 +484,7 @@ mod tests {
             timestamp: 1234567890,
             hmac: [42u8; 32],
             session: None,
+            forward: None,
         };
         let mut buf = Vec::new();
         encode_agent_hello(&hello, &mut buf).unwrap();
@@ -377,6 +508,7 @@ mod tests {
             timestamp: 9876543210,
             hmac: [43u8; 32],
             session: Some([44u8; 32]),
+            forward: None,
         };
         let mut buf = Vec::new();
         encode_agent_hello(&hello, &mut buf).unwrap();
@@ -389,6 +521,38 @@ mod tests {
         assert_eq!(decoded.hmac, hello.hmac);
         assert_eq!(decoded.session, hello.session);
         assert_eq!(consumed, 86);
+    }
+
+    #[test]
+    fn test_decode_agent_hello_forward_roundtrip() {
+        let request = TunnelAgentRequest {
+            from: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), 25565),
+            to: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 2, 3, 4)), 25566),
+        };
+        let hello = AgentHello {
+            version: VERSION,
+            intent: Intent::Forward,
+            key_id: [9u8; 8],
+            timestamp: 111222333,
+            hmac: [7u8; 32],
+            session: None,
+            forward: Some(ForwardHello {
+                session: [8u8; 32],
+                ttl: 1,
+                request,
+            }),
+        };
+        let mut buf = Vec::new();
+        encode_agent_hello(&hello, &mut buf).unwrap();
+
+        let (decoded, consumed) = decode_agent_hello(&buf).unwrap().unwrap();
+        assert_eq!(decoded.intent, Intent::Forward);
+        assert_eq!(decoded.session, None);
+        let forward = decoded.forward.expect("forward payload");
+        assert_eq!(forward.session, [8u8; 32]);
+        assert_eq!(forward.ttl, 1);
+        assert_eq!(forward.request, request);
+        assert_eq!(consumed, buf.len());
     }
 
     #[test]
@@ -577,6 +741,17 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_server_msg_forward_ack_roundtrip() {
+        let msg = ServerMsg::ForwardAck([0xAB; 32]);
+        let mut buf = Vec::new();
+        encode_server_msg(&msg, &mut buf);
+
+        let (decoded, consumed) = decode_server_msg(&buf).unwrap().unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(consumed, 33);
+    }
+
+    #[test]
     fn test_decode_server_msg_session_offer_buffer_too_short() {
         let buf = vec![ServerMsgKind::SessionOffer as u8, 1, 2, 3];
         assert!(decode_server_msg(&buf).unwrap().is_none());
@@ -694,7 +869,7 @@ mod tests {
         let key_id = [0x01u8; 8];
         let timestamp = 1234567890u64;
 
-        let hmac = compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None);
+        let hmac = compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None, None, 0);
         // HMAC should be 32 bytes
         assert_eq!(hmac.len(), 32);
     }
@@ -706,7 +881,15 @@ mod tests {
         let timestamp = 1234567890u64;
         let session = [0x99u8; 32];
 
-        let hmac = compute_agent_hmac(&secret, &key_id, timestamp, Intent::Connect, Some(&session));
+        let hmac = compute_agent_hmac(
+            &secret,
+            &key_id,
+            timestamp,
+            Intent::Connect,
+            Some(&session),
+            None,
+            0,
+        );
         // HMAC should be 32 bytes
         assert_eq!(hmac.len(), 32);
     }
@@ -718,9 +901,17 @@ mod tests {
         let timestamp = 1234567890u64;
         let session = [0x99u8; 32];
 
-        let hmac_listen = compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None);
-        let hmac_connect =
-            compute_agent_hmac(&secret, &key_id, timestamp, Intent::Connect, Some(&session));
+        let hmac_listen =
+            compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None, None, 0);
+        let hmac_connect = compute_agent_hmac(
+            &secret,
+            &key_id,
+            timestamp,
+            Intent::Connect,
+            Some(&session),
+            None,
+            0,
+        );
 
         // Different intents should produce different HMACs
         assert_ne!(hmac_listen, hmac_connect);
@@ -734,9 +925,16 @@ mod tests {
         let session = [0x99u8; 32];
 
         let hmac_without_session =
-            compute_agent_hmac(&secret, &key_id, timestamp, Intent::Connect, None);
-        let hmac_with_session =
-            compute_agent_hmac(&secret, &key_id, timestamp, Intent::Connect, Some(&session));
+            compute_agent_hmac(&secret, &key_id, timestamp, Intent::Connect, None, None, 0);
+        let hmac_with_session = compute_agent_hmac(
+            &secret,
+            &key_id,
+            timestamp,
+            Intent::Connect,
+            Some(&session),
+            None,
+            0,
+        );
 
         // Session should change the HMAC
         assert_ne!(hmac_without_session, hmac_with_session);
@@ -748,8 +946,8 @@ mod tests {
         let key_id = [0x01u8; 8];
         let timestamp = 1234567890u64;
 
-        let hmac1 = compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None);
-        let hmac2 = compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None);
+        let hmac1 = compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None, None, 0);
+        let hmac2 = compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None, None, 0);
 
         // Same inputs should produce same HMAC
         assert_eq!(hmac1, hmac2);
@@ -762,8 +960,8 @@ mod tests {
         let key_id2 = [0x02u8; 8];
         let timestamp = 1234567890u64;
 
-        let hmac1 = compute_agent_hmac(&secret, &key_id1, timestamp, Intent::Listen, None);
-        let hmac2 = compute_agent_hmac(&secret, &key_id2, timestamp, Intent::Listen, None);
+        let hmac1 = compute_agent_hmac(&secret, &key_id1, timestamp, Intent::Listen, None, None, 0);
+        let hmac2 = compute_agent_hmac(&secret, &key_id2, timestamp, Intent::Listen, None, None, 0);
 
         // Different key_ids should produce different HMACs
         assert_ne!(hmac1, hmac2);
@@ -776,8 +974,8 @@ mod tests {
         let timestamp1 = 1234567890u64;
         let timestamp2 = 1234567891u64;
 
-        let hmac1 = compute_agent_hmac(&secret, &key_id, timestamp1, Intent::Listen, None);
-        let hmac2 = compute_agent_hmac(&secret, &key_id, timestamp2, Intent::Listen, None);
+        let hmac1 = compute_agent_hmac(&secret, &key_id, timestamp1, Intent::Listen, None, None, 0);
+        let hmac2 = compute_agent_hmac(&secret, &key_id, timestamp2, Intent::Listen, None, None, 0);
 
         // Different timestamps should produce different HMACs
         assert_ne!(hmac1, hmac2);
@@ -790,10 +988,45 @@ mod tests {
         let key_id = [0x01u8; 8];
         let timestamp = 1234567890u64;
 
-        let hmac1 = compute_agent_hmac(&secret1, &key_id, timestamp, Intent::Listen, None);
-        let hmac2 = compute_agent_hmac(&secret2, &key_id, timestamp, Intent::Listen, None);
+        let hmac1 = compute_agent_hmac(&secret1, &key_id, timestamp, Intent::Listen, None, None, 0);
+        let hmac2 = compute_agent_hmac(&secret2, &key_id, timestamp, Intent::Listen, None, None, 0);
 
         // Different secrets should produce different HMACs
+        assert_ne!(hmac1, hmac2);
+    }
+
+    #[test]
+    fn test_compute_agent_hmac_forward_changes_with_edge() {
+        let secret = [0x42u8; 32];
+        let key_id = [0x01u8; 8];
+        let timestamp = 1234567890u64;
+        let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 10)), 25565);
+
+        let hmac1 = compute_agent_hmac(
+            &secret,
+            &key_id,
+            timestamp,
+            Intent::Forward,
+            None,
+            Some(&TunnelAgentRequest {
+                from: target,
+                to: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 25566),
+            }),
+            1,
+        );
+        let hmac2 = compute_agent_hmac(
+            &secret,
+            &key_id,
+            timestamp,
+            Intent::Forward,
+            None,
+            Some(&TunnelAgentRequest {
+                from: target,
+                to: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 25566),
+            }),
+            2,
+        );
+
         assert_ne!(hmac1, hmac2);
     }
 

@@ -3,10 +3,9 @@ pub mod ebpf;
 pub mod tokio;
 #[cfg(not(all(target_os = "linux", feature = "ebpf")))]
 pub mod ebpf {
-    use std::{io, sync::Arc};
-
     #[cfg(unix)]
     use std::os::fd::RawFd;
+    use std::{io, sync::Arc};
     #[cfg(not(unix))]
     type RawFd = i32;
 
@@ -685,7 +684,9 @@ impl Sock for Connection {
             // Linux: real epoll::Connection has its own into_proxy via Sock impl.
             // Non-Linux shim: into_proxy_inner delegates to the inner tokio::Connection.
             #[cfg(target_os = "linux")]
-            Connection::Epoll(conn) => <epoll::Connection as Sock>::into_proxy(Box::new(conn), peer),
+            Connection::Epoll(conn) => {
+                <epoll::Connection as Sock>::into_proxy(Box::new(conn), peer)
+            }
             #[cfg(not(target_os = "linux"))]
             Connection::Epoll(conn) => conn.into_proxy_inner(peer),
             Connection::Uring(conn) => conn.into_proxy_inner(peer),
@@ -726,7 +727,10 @@ impl LureNet {
     pub fn global() -> &'static Self {
         LURE_NET.get_or_init(|| {
             let backend = backend_kind();
-            log::debug!("LureNet: backend={backend:?} ({})", backend_selection().reason);
+            log::debug!(
+                "LureNet: backend={backend:?} ({})",
+                backend_selection().reason
+            );
             Self { backend }
         })
     }
@@ -785,14 +789,20 @@ pub struct LureConnection {
 
 impl LureConnection {
     fn from_conn(conn: Connection, addr: SocketAddr) -> Self {
-        Self { inner: Box::new(conn), addr }
+        Self {
+            inner: Box::new(conn),
+            addr,
+        }
     }
 
     /// Connect to `addr` using the global backend.
     pub async fn connect(addr: SocketAddr) -> io::Result<Self> {
         let conn = Connection::connect(addr).await?;
         let actual_addr = conn.peer_addr().unwrap_or(addr);
-        Ok(Self { inner: Box::new(conn), addr: actual_addr })
+        Ok(Self {
+            inner: Box::new(conn),
+            addr: actual_addr,
+        })
     }
 
     pub fn backend_kind(&self) -> BackendKind {
