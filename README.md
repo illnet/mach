@@ -164,6 +164,24 @@ MINITUN_TOKENS="<KEY_ID_HEX_A>:<SECRET_HEX_A>,<KEY_ID_HEX_B>:<SECRET_HEX_B>" \
 ./minitun agent
 ```
 
+Install the latest `minitun` release on Linux x86_64 and migrate old `tunure`
+systemd services in one shot:
+
+```sh
+curl -fsSL -o /tmp/install_minitun.sh \
+  https://raw.githubusercontent.com/hUwUtao/Lure/main/scripts/install_minitun.sh
+chmod +x /tmp/install_minitun.sh
+ENDPOINT="endpoint:25565" \
+TOKENS_TEXT="<KEY_ID_HEX_A>:<SECRET_HEX_A>,<KEY_ID_HEX_B>:<SECRET_HEX_B>" \
+bash /tmp/install_minitun.sh
+```
+
+If old `tunure` units are present, the installer will discover them first and
+rewrite them into one or more `minitun` services based on endpoint grouping.
+
+You can also edit the small variable block at the top of the script instead of
+exporting overrides inline.
+
 ## Env Vars
 
 - `LURE_RPC`: RPC backend URL (optional)
