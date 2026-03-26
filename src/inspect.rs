@@ -35,13 +35,14 @@ pub(crate) fn transport_counters() -> (Counter<u64>, Counter<u64>) {
 /// Poll [`ProxyProgress`] every 100 ms and push byte/chunk deltas to OTEL
 /// counters and persistent route/tenant/instance stats.
 ///
-/// Run this concurrently with a proxy future; abort (or drop) the task when
-/// the proxy completes. Session-level `inspect.traffic` is NOT updated here —
-/// call `inspect.record_c2s/s2c` with the final [`net::ProxyStats`] totals
-/// after the proxy finishes.
+/// Run this concurrently with a proxy future; signal shutdown via the
+/// `shutdown` receiver when the proxy completes. Session-level `inspect.traffic`
+/// is NOT updated here — call `inspect.record_c2s/s2c` with the final
+/// [`net::ProxyStats`] totals after the proxy finishes.
 pub(crate) async fn pump_proxy_progress(
     inspect: Arc<crate::router::inspect::SessionInspectState>,
     progress: Arc<ProxyProgress>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(100));
     let (volume_record, packet_record) = transport_counters();
@@ -49,25 +50,51 @@ pub(crate) async fn pump_proxy_progress(
     let c2st = KeyValue::new("intent", "c2s");
     let mut last = progress.snapshot();
     loop {
-        interval.tick().await;
-        let snap = progress.snapshot();
-        let dc2s_bytes = snap.c2s_bytes.saturating_sub(last.c2s_bytes);
-        let ds2c_bytes = snap.s2c_bytes.saturating_sub(last.s2c_bytes);
-        let dc2s_chunks = snap.c2s_chunks.saturating_sub(last.c2s_chunks);
-        let ds2c_chunks = snap.s2c_chunks.saturating_sub(last.s2c_chunks);
-        if dc2s_bytes > 0 || ds2c_bytes > 0 {
-            volume_record.add(dc2s_bytes, core::slice::from_ref(&c2st));
-            volume_record.add(ds2c_bytes, core::slice::from_ref(&s2ct));
-            packet_record.add(dc2s_chunks, core::slice::from_ref(&c2st));
-            packet_record.add(ds2c_chunks, core::slice::from_ref(&s2ct));
-            inspect.route.record_c2s(dc2s_bytes, dc2s_chunks);
-            inspect.route.record_s2c(ds2c_bytes, ds2c_chunks);
-            inspect.tenant.record_c2s(dc2s_bytes, dc2s_chunks);
-            inspect.tenant.record_s2c(ds2c_bytes, ds2c_chunks);
-            inspect.instance.record_c2s(dc2s_bytes, dc2s_chunks);
-            inspect.instance.record_s2c(ds2c_bytes, ds2c_chunks);
+        tokio::select! {
+            _ = interval.tick() => {
+                let snap = progress.snapshot();
+                let dc2s_bytes = snap.c2s_bytes.saturating_sub(last.c2s_bytes);
+                let ds2c_bytes = snap.s2c_bytes.saturating_sub(last.s2c_bytes);
+                let dc2s_chunks = snap.c2s_chunks.saturating_sub(last.c2s_chunks);
+                let ds2c_chunks = snap.s2c_chunks.saturating_sub(last.s2c_chunks);
+                if dc2s_bytes > 0 || ds2c_bytes > 0 {
+                    volume_record.add(dc2s_bytes, core::slice::from_ref(&c2st));
+                    volume_record.add(ds2c_bytes, core::slice::from_ref(&s2ct));
+                    packet_record.add(dc2s_chunks, core::slice::from_ref(&c2st));
+                    packet_record.add(ds2c_chunks, core::slice::from_ref(&s2ct));
+                    inspect.route.record_c2s(dc2s_bytes, dc2s_chunks);
+                    inspect.route.record_s2c(ds2c_bytes, ds2c_chunks);
+                    inspect.tenant.record_c2s(dc2s_bytes, dc2s_chunks);
+                    inspect.tenant.record_s2c(ds2c_bytes, ds2c_chunks);
+                    inspect.instance.record_c2s(dc2s_bytes, dc2s_chunks);
+                    inspect.instance.record_s2c(ds2c_bytes, ds2c_chunks);
+                }
+                last = snap;
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    // Take final snapshot and record remaining metrics
+                    let snap = progress.snapshot();
+                    let dc2s_bytes = snap.c2s_bytes.saturating_sub(last.c2s_bytes);
+                    let ds2c_bytes = snap.s2c_bytes.saturating_sub(last.s2c_bytes);
+                    let dc2s_chunks = snap.c2s_chunks.saturating_sub(last.c2s_chunks);
+                    let ds2c_chunks = snap.s2c_chunks.saturating_sub(last.s2c_chunks);
+                    if dc2s_bytes > 0 || ds2c_bytes > 0 {
+                        volume_record.add(dc2s_bytes, core::slice::from_ref(&c2st));
+                        volume_record.add(ds2c_bytes, core::slice::from_ref(&s2ct));
+                        packet_record.add(dc2s_chunks, core::slice::from_ref(&c2st));
+                        packet_record.add(ds2c_chunks, core::slice::from_ref(&s2ct));
+                        inspect.route.record_c2s(dc2s_bytes, dc2s_chunks);
+                        inspect.route.record_s2c(ds2c_bytes, ds2c_chunks);
+                        inspect.tenant.record_c2s(dc2s_bytes, dc2s_chunks);
+                        inspect.tenant.record_s2c(ds2c_bytes, ds2c_chunks);
+                        inspect.instance.record_c2s(dc2s_bytes, dc2s_chunks);
+                        inspect.instance.record_s2c(ds2c_bytes, ds2c_chunks);
+                    }
+                    break;
+                }
+            }
         }
-        last = snap;
     }
 }
 

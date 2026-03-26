@@ -7,7 +7,7 @@ use log::debug;
 use subtle::ConstantTimeEq;
 use tokio::{
     sync::{RwLock, mpsc, mpsc::UnboundedSender, oneshot},
-    time::Duration,
+    time::{Duration, timeout},
 };
 
 use crate::{
@@ -18,6 +18,9 @@ use crate::{
     telemetry::{EventEnvelope, EventServiceInstance},
     utils::spawn_named,
 };
+
+/// Timeout duration for waiting for ForwardAck from master
+const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub enum TunnelInspectMsg {
@@ -340,23 +343,32 @@ impl TunnelAgentController {
 
         let mut buf = Vec::new();
         let mut read_buf = vec![0u8; 1024];
-        loop {
-            if let Some((msg, consumed)) = tun::decode_server_msg(&buf)? {
-                buf.drain(..consumed);
-                if let tun::ServerMsg::ForwardAck(session) = msg {
-                    if session == request.session.0 {
-                        return Ok(());
+        let ack_result = timeout(ACK_TIMEOUT, async {
+            loop {
+                if let Some((msg, consumed)) = tun::decode_server_msg(&buf)? {
+                    buf.drain(..consumed);
+                    if let tun::ServerMsg::ForwardAck(session) = msg {
+                        if session == request.session.0 {
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                        anyhow::bail!("master acknowledged unexpected session");
                     }
-                    anyhow::bail!("master acknowledged unexpected session");
                 }
-            }
 
-            let (n, next) = connection.read_chunk(read_buf).await?;
-            read_buf = next;
-            if n == 0 {
-                anyhow::bail!("master closed forwarded request connection");
+                let (n, next) = connection.read_chunk(read_buf).await?;
+                read_buf = next;
+                if n == 0 {
+                    anyhow::bail!("master closed forwarded request connection");
+                }
+                buf.extend_from_slice(&read_buf[..n]);
             }
-            buf.extend_from_slice(&read_buf[..n]);
+        })
+        .await;
+
+        match ack_result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => anyhow::bail!("timed out waiting for master acknowledgment"),
         }
     }
 }

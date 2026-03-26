@@ -17,10 +17,12 @@ pub(crate) async fn passthrough_now(
 ) -> anyhow::Result<()> {
     let handle = client.into_proxy(server)?;
     let inspect = session.inspect.clone();
-    let metrics_task =
-        tokio::spawn(async move { pump_proxy_progress(inspect, handle.progress).await });
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let metrics_task = tokio::spawn(async move {
+        pump_proxy_progress(inspect, handle.progress, shutdown_rx).await
+    });
     let stats = handle.future.await?;
-    metrics_task.abort();
+    let _ = shutdown_tx.send(true);
     let _ = metrics_task.await;
     // Record final delta from stats (any remaining bytes not yet reported).
     session.inspect.record_c2s(stats.c2s_bytes);
