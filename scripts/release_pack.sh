@@ -6,7 +6,6 @@ set -euo pipefail
 # Outputs archives into ./dist/:
 # - lure_<version>+<gitsha>_linux-amd64.tar.gz
 # - lure_<version>+<gitsha>_linux-aarch64.tar.gz
-# - lure_<version>+<gitsha>_linux-armv4.tar.gz
 # - lure_<version>+<gitsha>_windows-amd64.zip
 #
 # Contents (per-archive):
@@ -175,15 +174,14 @@ make_zip() {
 }
 
 # Targets requested by user.
-# Note: "linux-armv4" maps to Rust's most compatible 32-bit ARM musl target.
+# Note: ARM support floor is 64-bit ARMv8-class hardware, so aarch64 is the
+# only ARM Linux pack we publish.
 build_one "linux-amd64" "x86_64-unknown-linux-musl" ""
 build_one "linux-aarch64" "aarch64-unknown-linux-musl" ""
-build_one "linux-armv4" "arm-unknown-linux-musleabi" ""
 build_one "windows-amd64" "x86_64-pc-windows-gnu" ".exe"
 
 make_targz "linux-amd64"
 make_targz "linux-aarch64"
-make_targz "linux-armv4"
 make_zip "windows-amd64"
 
 (
