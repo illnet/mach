@@ -32,7 +32,7 @@ jobs:
 
       - name: Setup Rust (pinned)
         run: |
-          rustup toolchain install nightly-2026-02-06 --profile minimal --component clippy rustfmt
+          rustup toolchain install nightly-2026-02-06 --profile minimal --component clippy --component rustfmt
           rustup default nightly-2026-02-06
 
       - name: Cache cargo + build artifacts
