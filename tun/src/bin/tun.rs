@@ -729,10 +729,10 @@ async fn listen_once(ingress: SocketAddr, config: TunConfig) -> anyhow::Result<(
                     continue;
                 }
             };
-            let ingress = ingress;
             let config = TunConfig {
                 key_id: config.key_id,
                 secret: config.secret,
+                label: config.label.clone(),
             };
             let from = forward.request.from;
             match net::sock::backend_kind() {
@@ -817,7 +817,7 @@ async fn run_many(ingress: SocketAddr, configs: Vec<TunConfig>) -> anyhow::Resul
         }
     }
 
-    std::future::pending::<()>().await
+    std::future::pending::<anyhow::Result<()>>().await
 }
 
 fn run_sign(args: SignArgs) -> anyhow::Result<()> {
