@@ -110,6 +110,17 @@ impl LureLogger {
         debug!("Tunnel session accepted: token={token_prefix} target={target}");
     }
 
+    pub fn tunnel_forward_request_received(
+        token_prefix: &str,
+        from: &SocketAddr,
+        target: &SocketAddr,
+    ) {
+        debug!(
+            "Tunnel forward request received: token={token_prefix} \
+             from={from} target={target}"
+        );
+    }
+
     pub fn tunnel_session_timeout(session_prefix: &str) {
         debug!("Tunnel session expired: session={session_prefix}");
     }

@@ -5,7 +5,7 @@ use std::{
     ptr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
 };
@@ -499,4 +499,395 @@ pub fn passthrough(_fd_a: RawFd, _fd_b: RawFd) -> io::Result<EpollStats> {
 
 pub fn close_fd(fd: RawFd) {
     let _ = unsafe { close(fd) };
+}
+
+// ── EpollManager (N-worker pool) ──────────────────────────────────────────────
+
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::{Mutex, OnceLock, Weak},
+};
+
+/// Layout of the completion frame written by C workers to the shared done-pipe.
+/// Must match `LureEpollDone` in epoll.h exactly (48 bytes, no padding gaps).
+#[repr(C)]
+struct LureEpollDoneC {
+    conn_id: u64,
+    c2s_bytes: u64,
+    s2c_bytes: u64,
+    c2s_chunks: u64,
+    s2c_chunks: u64,
+    result: i32,
+    _pad: u32,
+}
+
+const _: () = assert!(
+    std::mem::size_of::<LureEpollDoneC>() == 48,
+    "LureEpollDone C/Rust size mismatch"
+);
+
+#[repr(C)]
+struct LureEpollWorkerC {
+    _private: [u8; 0],
+}
+
+unsafe impl Send for LureEpollWorkerC {}
+unsafe impl Sync for LureEpollWorkerC {}
+
+unsafe extern "C" {
+    fn lure_epoll_worker_new(done_pipe_write_fd: c_int) -> *mut LureEpollWorkerC;
+    fn lure_epoll_worker_submit(
+        w: *mut LureEpollWorkerC,
+        fd_a: c_int,
+        fd_b: c_int,
+        conn_id: u64,
+    ) -> c_int;
+    fn lure_epoll_worker_abort(w: *mut LureEpollWorkerC, conn_id: u64);
+    fn lure_epoll_worker_shutdown(w: *mut LureEpollWorkerC);
+    fn lure_epoll_worker_free(w: *mut LureEpollWorkerC);
+}
+
+struct WorkerHandle {
+    ptr: *mut LureEpollWorkerC,
+}
+
+unsafe impl Send for WorkerHandle {}
+unsafe impl Sync for WorkerHandle {}
+
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        unsafe {
+            lure_epoll_worker_shutdown(self.ptr);
+            lure_epoll_worker_free(self.ptr);
+        }
+    }
+}
+
+/// A non-owning file-descriptor reference that implements `AsRawFd` so that
+/// `AsyncFd` can wrap it without closing the underlying fd on drop.
+struct FdRef(RawFd);
+impl std::os::fd::AsRawFd for FdRef {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+/// N-worker pool.  Each `LureEpollWorker` C thread monitors its share of
+/// connections via a private epoll_fd.  All workers write completions to one
+/// shared done-pipe; a single Tokio drain task forwards completions to the
+/// per-connection oneshot channels stored in `pending`.
+pub struct EpollManager {
+    workers: Vec<WorkerHandle>,
+    done_read_fd: RawFd,
+    done_write_fd: RawFd,
+    pending: Mutex<HashMap<u64, tokio::sync::oneshot::Sender<EpollDone>>>,
+    next_worker: AtomicUsize,
+    next_id: AtomicU64,
+}
+
+unsafe impl Send for EpollManager {}
+unsafe impl Sync for EpollManager {}
+
+impl Drop for EpollManager {
+    fn drop(&mut self) {
+        // Workers are dropped first (their Drop shuts them down), then the pipe.
+        // WorkerHandle::drop() calls lure_epoll_worker_shutdown which joins the
+        // thread before lure_epoll_worker_free — so the pipe write end is still
+        // valid during shutdown.
+        close_fd(self.done_write_fd);
+        close_fd(self.done_read_fd);
+    }
+}
+
+impl EpollManager {
+    fn build() -> io::Result<Self> {
+        let n_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
+        let mut pipe_fds = [0i32; 2];
+        // SAFETY: pipe2 is a simple syscall with a valid array pointer.
+        let rc = unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let done_read_fd = pipe_fds[0];
+        let done_write_fd = pipe_fds[1];
+
+        let mut workers = Vec::with_capacity(n_workers);
+        for _ in 0..n_workers {
+            // SAFETY: done_write_fd is valid; C worker does NOT close it.
+            let w = unsafe { lure_epoll_worker_new(done_write_fd) };
+            if w.is_null() {
+                // Workers already built are dropped here via Vec::drop →
+                // WorkerHandle::drop, which shuts them down cleanly.
+                close_fd(done_write_fd);
+                close_fd(done_read_fd);
+                return Err(io::Error::other("failed to create epoll worker thread"));
+            }
+            workers.push(WorkerHandle { ptr: w });
+        }
+
+        Ok(Self {
+            workers,
+            done_read_fd,
+            done_write_fd,
+            pending: Mutex::new(HashMap::new()),
+            next_worker: AtomicUsize::new(0),
+            next_id: AtomicU64::new(1),
+        })
+    }
+
+    /// Submit a connection pair.  C takes ownership of both fds (closes them
+    /// on completion or error).  Returns a receiver that resolves with the
+    /// final [`EpollDone`].
+    pub fn submit(
+        &self,
+        fd_a: RawFd,
+        fd_b: RawFd,
+    ) -> io::Result<tokio::sync::oneshot::Receiver<EpollDone>> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending.lock().unwrap().insert(id, tx);
+
+        let n = self.workers.len();
+        let idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % n;
+        // SAFETY: ptr is valid; fd_a/fd_b ownership transferred to C.
+        let rc = unsafe { lure_epoll_worker_submit(self.workers[idx].ptr, fd_a, fd_b, id) };
+        if rc < 0 {
+            // C closed fd_a/fd_b already; just clean up the pending entry.
+            self.pending.lock().unwrap().remove(&id);
+            return Err(io::Error::from_raw_os_error(-rc));
+        }
+
+        Ok(rx)
+    }
+
+    fn deliver(&self, frame: LureEpollDoneC) {
+        let done = EpollDone {
+            id: frame.conn_id,
+            stats: EpollStats {
+                c2s_bytes: frame.c2s_bytes,
+                s2c_bytes: frame.s2c_bytes,
+                c2s_chunks: frame.c2s_chunks,
+                s2c_chunks: frame.s2c_chunks,
+            },
+            result: frame.result,
+        };
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(tx) = pending.remove(&frame.conn_id) {
+            let _ = tx.send(done);
+        }
+    }
+}
+
+/// Tokio task: continuously read 48-byte completion frames from `done_read_fd`
+/// and deliver them to the waiting oneshot channels in `mgr`.
+async fn drain_completions(done_read_fd: RawFd, mgr: Weak<EpollManager>) {
+    use tokio::io::unix::AsyncFd;
+    const FRAME: usize = std::mem::size_of::<LureEpollDoneC>();
+
+    let afd = match AsyncFd::new(FdRef(done_read_fd)) {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+
+    let mut leftover: Vec<u8> = Vec::new();
+
+    loop {
+        let Some(mgr) = mgr.upgrade() else { break };
+
+        let mut guard = match afd.readable().await {
+            Ok(g) => g,
+            Err(_) => break,
+        };
+        guard.clear_ready();
+
+        // Tight read loop until EAGAIN.
+        loop {
+            let want = (FRAME - leftover.len()).max(FRAME);
+            let mut buf = vec![0u8; want];
+            // SAFETY: buf is valid for `want` bytes.
+            let n =
+                unsafe { libc::read(done_read_fd, buf.as_mut_ptr() as *mut libc::c_void, want) };
+            if n <= 0 {
+                if n < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        break; // no more data right now
+                    }
+                }
+                return; // pipe closed or unrecoverable error
+            }
+            leftover.extend_from_slice(&buf[..n as usize]);
+
+            while leftover.len() >= FRAME {
+                // SAFETY: leftover is at least FRAME bytes; read_unaligned
+                // handles any alignment.
+                let frame: LureEpollDoneC =
+                    unsafe { std::ptr::read_unaligned(leftover.as_ptr() as *const LureEpollDoneC) };
+                leftover.drain(..FRAME);
+                mgr.deliver(frame);
+            }
+        }
+    }
+}
+
+static GLOBAL_EPOLL_MANAGER: OnceLock<io::Result<Arc<EpollManager>>> = OnceLock::new();
+
+/// Returns the global [`EpollManager`], initialising it on first call.
+/// Must be called from within a Tokio runtime context (spawns the drain task).
+pub fn get_epoll_manager() -> io::Result<Arc<EpollManager>> {
+    GLOBAL_EPOLL_MANAGER
+        .get_or_init(|| {
+            EpollManager::build().map(|mgr| {
+                let arc = Arc::new(mgr);
+                let weak = Arc::downgrade(&arc);
+                let read_fd = arc.done_read_fd;
+                tokio::spawn(drain_completions(read_fd, weak));
+                arc
+            })
+        })
+        .as_ref()
+        .map(Arc::clone)
+        .map_err(|e| io::Error::other(e.to_string()))
+}
+
+// ── Sock trait implementation ─────────────────────────────────────────────────
+
+impl Connection {
+    /// Start bidirectional proxy via the global [`EpollManager`] N-worker pool.
+    ///
+    /// Both fds are duplicated, then the original `TcpStream` handles are
+    /// dropped to deregister them from Tokio's reactor before handing the duped
+    /// fds to a C worker thread.
+    pub(crate) fn into_proxy(
+        self,
+        peer: Box<dyn crate::sock::Sock>,
+    ) -> io::Result<crate::sock::ProxyHandle> {
+        let self_fd = self.as_ref().as_raw_fd();
+        let peer_fd = peer
+            .raw_fd()
+            .ok_or_else(|| io::Error::other("epoll proxy: peer has no raw fd"))?;
+
+        let fd_a = duplicate_fd(self_fd)?;
+        let fd_b = duplicate_fd(peer_fd).inspect_err(|_| close_fd(fd_a))?;
+
+        // Drop originals to deregister from Tokio's reactor before C takes over.
+        drop(self);
+        drop(peer);
+
+        let mgr = get_epoll_manager().inspect_err(|_| {
+            close_fd(fd_a);
+            close_fd(fd_b);
+        })?;
+
+        // After submit, C owns fd_a/fd_b — do not close on error here.
+        let rx = mgr.submit(fd_a, fd_b)?;
+
+        let progress = Arc::new(crate::sock::ProxyProgress::default());
+        let prog2 = Arc::clone(&progress);
+
+        let future: Pin<
+            Box<dyn Future<Output = io::Result<crate::sock::ProxyStats>> + Send + 'static>,
+        > = Box::pin(async move {
+            let done = rx
+                .await
+                .map_err(|_| io::Error::other("epoll done channel closed"))?;
+
+            if done.result < 0 {
+                return Err(io::Error::from_raw_os_error(-done.result));
+            }
+
+            let stats = crate::sock::ProxyStats {
+                c2s_bytes: done.stats.c2s_bytes,
+                s2c_bytes: done.stats.s2c_bytes,
+                c2s_chunks: done.stats.c2s_chunks,
+                s2c_chunks: done.stats.s2c_chunks,
+            };
+            // Update progress with final stats so callers see the complete picture.
+            prog2.c2s_bytes.store(stats.c2s_bytes, Ordering::Relaxed);
+            prog2.s2c_bytes.store(stats.s2c_bytes, Ordering::Relaxed);
+            prog2.c2s_chunks.store(stats.c2s_chunks, Ordering::Relaxed);
+            prog2.s2c_chunks.store(stats.s2c_chunks, Ordering::Relaxed);
+            Ok(stats)
+        });
+
+        Ok(crate::sock::ProxyHandle { future, progress })
+    }
+}
+
+// ── Legacy Global EpollBackend singleton (kept for passthrough_basic tests) ───
+
+static GLOBAL_EPOLL: OnceLock<io::Result<Arc<EpollBackend>>> = OnceLock::new();
+
+/// Returns the global [`EpollBackend`], used only by [`passthrough_basic`].
+pub fn get_global_backend() -> io::Result<Arc<EpollBackend>> {
+    GLOBAL_EPOLL
+        .get_or_init(|| {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            EpollBackend::new(workers, 1024, 8192).map(Arc::new)
+        })
+        .as_ref()
+        .map(Arc::clone)
+        .map_err(|e| io::Error::other(e.to_string()))
+}
+
+impl crate::sock::Sock for Connection {
+    fn backend_kind(&self) -> crate::sock::BackendKind {
+        crate::sock::BackendKind::Epoll
+    }
+
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        Connection::peer_addr(self)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Connection::local_addr(self)
+    }
+
+    fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        Connection::set_nodelay(self, nodelay)
+    }
+
+    fn raw_fd(&self) -> Option<i32> {
+        Some(self.as_ref().as_raw_fd())
+    }
+
+    fn try_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        Connection::try_read(self, buf)
+    }
+
+    fn read_chunk<'a>(
+        &'a mut self,
+        buf: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = io::Result<(usize, Vec<u8>)>> + Send + 'a>> {
+        Box::pin(async move { Connection::read_chunk(self, buf).await })
+    }
+
+    fn write_all<'a>(
+        &'a mut self,
+        buf: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send + 'a>> {
+        Box::pin(async move { Connection::write_all(self, buf).await })
+    }
+
+    fn flush<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
+        Box::pin(async move { Connection::flush(self).await })
+    }
+
+    fn shutdown<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>> {
+        Box::pin(async move { Connection::shutdown(self).await })
+    }
+
+    fn into_proxy(
+        self: Box<Self>,
+        peer: Box<dyn crate::sock::Sock>,
+    ) -> io::Result<crate::sock::ProxyHandle> {
+        (*self).into_proxy(peer)
+    }
 }

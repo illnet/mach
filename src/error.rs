@@ -26,7 +26,7 @@ impl ErrorResponder {
 
     pub async fn disconnect_with_log<S, L, F>(
         &self,
-        client: &mut EncodedConnection<'_>,
+        client: &mut EncodedConnection,
         addr: SocketAddr,
         make_reason: F,
     ) -> Result<()>
@@ -42,7 +42,7 @@ impl ErrorResponder {
 
     pub async fn disconnect_with_error(
         &self,
-        client: &mut EncodedConnection<'_>,
+        client: &mut EncodedConnection,
         addr: SocketAddr,
         err: &ReportableError,
         context: impl Into<String>,

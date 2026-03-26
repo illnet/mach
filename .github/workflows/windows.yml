@@ -24,25 +24,21 @@ jobs:
       - name: Build (release)
         run: |
           cargo +${{ env.TOOLCHAIN }} build -p lure --bin lure --release --verbose
-          cargo +${{ env.TOOLCHAIN }} build -p tun --bin tunure --release --verbose
+          cargo +${{ env.TOOLCHAIN }} build -p tun --bin minitun --release --verbose
 
       - name: Prepare artifact
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path release-windows | Out-Null
-          Copy-Item -Force target/release/lure.exe release-windows/lure.exe
-          Copy-Item -Force target/release/tunure.exe release-windows/tunure.exe
-          (Get-FileHash -Algorithm SHA256 release-windows/lure.exe).Hash + "  lure.exe" | Out-File -Encoding ascii release-windows/lure.exe.sha256
-          (Get-FileHash -Algorithm SHA256 release-windows/tunure.exe).Hash + "  tunure.exe" | Out-File -Encoding ascii release-windows/tunure.exe.sha256
+          New-Item -ItemType Directory -Force -Path artifacts/windows/default | Out-Null
+          Copy-Item -Force target/release/lure.exe artifacts/windows/default/lure.exe
+          Copy-Item -Force target/release/minitun.exe artifacts/windows/default/minitun.exe
+          (Get-FileHash -Algorithm SHA256 artifacts/windows/default/lure.exe).Hash + "  lure.exe" | Out-File -Encoding ascii artifacts/windows/default/lure.exe.sha256
+          (Get-FileHash -Algorithm SHA256 artifacts/windows/default/minitun.exe).Hash + "  minitun.exe" | Out-File -Encoding ascii artifacts/windows/default/minitun.exe.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: release-windows
-          path: |
-            release-windows/lure.exe
-            release-windows/lure.exe.sha256
-            release-windows/tunure.exe
-            release-windows/tunure.exe.sha256
+          name: windows-release
+          path: artifacts/windows/default
           if-no-files-found: error
           overwrite: true

@@ -1,6 +1,6 @@
 use std::{
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
+    net::{IpAddr, SocketAddr, ToSocketAddrs},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -31,11 +31,64 @@ use crate::{
     threat::{
         ClientFail, ClientIntent, IntentTag, ThreatControlService, ratelimit::RateLimiterController,
     },
-    tunnel::{SessionToken, TokenKeyId, TunnelRegistry},
+    tunnel::{
+        MasterForwardTunnelRequest, SessionToken, TokenKeyId, TunnelAgentController,
+        TunnelAgentDispatch, TunnelAgentMode, TunnelRegistry,
+    },
     utils::{OwnedStatic, leak, spawn_named},
 };
 mod backend;
 mod query;
+
+fn is_local_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
+        }
+    }
+}
+
+fn is_routable_forward_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !v4.is_unspecified()
+                && !v4.is_loopback()
+                && !v4.is_private()
+                && !v4.is_link_local()
+                && !v4.is_broadcast()
+                && !v4.is_documentation()
+                && !v4.is_multicast()
+        }
+        IpAddr::V6(v6) => {
+            !v6.is_unspecified()
+                && !v6.is_loopback()
+                && !v6.is_unique_local()
+                && !v6.is_unicast_link_local()
+                && !v6.is_multicast()
+        }
+    }
+}
+
+fn enforce_local_ip_block() -> bool {
+    static ENFORCE: OnceLock<bool> = OnceLock::new();
+
+    *ENFORCE.get_or_init(|| {
+        std::env::var("LURE_ENFORCE_LOCAL_BLOCK")
+            .ok()
+            .as_deref()
+            .map(|value| matches!(value, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+            .unwrap_or(false)
+    })
+}
+
+fn normalize_optional_url(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 pub struct Lure {
     config: RwLock<LureConfig>,
     router: &'static RouterInstance,
@@ -43,6 +96,8 @@ pub struct Lure {
     metrics: HandshakeMetrics,
     errors: ErrorResponder,
     tunnels: Arc<TunnelRegistry>,
+    tunnel_agents: Arc<TunnelAgentController>,
+    bootstrap_poller: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -80,6 +135,8 @@ impl Lure {
         // Not Send/Sync (connection types), but used on a LocalSet. Arc is fine for shared ownership.
         #[allow(clippy::arc_with_non_send_sync)]
         let tunnels = Arc::new(TunnelRegistry::default());
+        #[allow(clippy::arc_with_non_send_sync)]
+        let tunnel_agents = Arc::new(TunnelAgentController::new(Arc::clone(&tunnels)));
 
         // Load token registry from config
         let tunnel_config = config.tunnel.clone();
@@ -92,6 +149,9 @@ impl Lure {
             }
         })
         .ok();
+
+        let bootstrap_poller = normalize_optional_url(config.tunnel.bootstrap_url.as_deref())
+            .and_then(|url| Self::spawn_bootstrap_poller(&tunnels, url));
 
         // Spawn cleanup task for tunnel registry
         let tunnels_clone = Arc::clone(&tunnels);
@@ -111,7 +171,36 @@ impl Lure {
             metrics: HandshakeMetrics::new(&get_meter()),
             errors: ErrorResponder::new(),
             tunnels,
+            tunnel_agents,
+            bootstrap_poller: Mutex::new(bootstrap_poller),
         }
+    }
+
+    fn spawn_bootstrap_poller(
+        tunnels: &Arc<TunnelRegistry>,
+        url: String,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let tunnels_clone = Arc::clone(tunnels);
+        match spawn_named("tunnel-bootstrap-start", async move {
+            tunnels_clone.start_bootstrap_poller(url).await;
+        }) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                error!("failed to spawn tunnel bootstrap poller: {err}");
+                None
+            }
+        }
+    }
+
+    fn replace_bootstrap_poller(&self, bootstrap_url: Option<String>) {
+        let mut poller = self
+            .bootstrap_poller
+            .lock()
+            .expect("bootstrap poller mutex poisoned");
+        if let Some(handle) = poller.take() {
+            handle.abort();
+        }
+        *poller = bootstrap_url.and_then(|url| Self::spawn_bootstrap_poller(&self.tunnels, url));
     }
 
     async fn config_snapshot(&self) -> LureConfig {
@@ -133,12 +222,20 @@ impl Lure {
     }
 
     pub async fn reload_config(&'static self, config: LureConfig) -> anyhow::Result<()> {
+        let old_bootstrap_url = {
+            let snapshot = self.config.read().await;
+            normalize_optional_url(snapshot.tunnel.bootstrap_url.as_deref())
+        };
+        let new_bootstrap_url = normalize_optional_url(config.tunnel.bootstrap_url.as_deref());
         let routes = config.default_routes()?;
         self.install_routes(routes).await;
         // Keep the tunnel registry in sync with runtime config reloads.
         self.tunnels.load_tokens(&config.tunnel).await?;
         {
             *self.config.write().await = config;
+        }
+        if old_bootstrap_url != new_bootstrap_url {
+            self.replace_bootstrap_poller(new_bootstrap_url);
         }
         Ok(())
     }
@@ -369,9 +466,9 @@ impl Lure {
                 && let crate::threat::ratelimit::RateLimitResult::Disallowed { retry_after: _ra } =
                     rate_limiter.check(&ip)
             {
-                    LureLogger::rate_limited(&ip);
-                    drop(client);
-                    continue;
+                LureLogger::rate_limited(&ip);
+                drop(client);
+                continue;
             }
 
             // Try to acquire semaphore (non-blocking)
@@ -463,7 +560,7 @@ impl Lure {
         };
 
         let handler =
-            EncodedConnection::with_buffered(&mut connection, SocketIntent::GreetToProxy, buffered);
+            EncodedConnection::with_buffered(connection, SocketIntent::GreetToProxy, buffered);
         let state_attr = match hs.next_state {
             HandshakeNextState::Status => "status",
             HandshakeNextState::Login => "login",
@@ -501,7 +598,7 @@ impl Lure {
 
     async fn handle_status(
         &self,
-        mut client: EncodedConnection<'_>,
+        mut client: EncodedConnection,
         handshake: &OwnedHandshake,
         resolved: Option<ResolvedRoute>,
     ) -> anyhow::Result<()> {
@@ -521,7 +618,10 @@ impl Lure {
 
         // Check OverrideQuery flag: serve placeholder without contacting backend
         if route.override_query() {
-            debug!("OverrideQuery set for route {}, serving placeholder", route_id);
+            debug!(
+                "OverrideQuery set for route {}, serving placeholder",
+                route_id
+            );
             query::send_status_failure(&mut client, &config, "OVERRIDE_QUERY").await?;
             query::handle_ping_pong_local(&mut client, self.threat).await?;
             return Ok(());
@@ -538,14 +638,28 @@ impl Lure {
                 query::handle_ping_pong_local(&mut client, self.threat).await?;
                 return Ok(());
             }
-            debug!("CacheQuery cache miss for route {}, querying backend", route_id);
+            debug!(
+                "CacheQuery cache miss for route {}, querying backend",
+                route_id
+            );
+
+            // Tunnel backends are unreachable via direct TCP; on cache miss serve placeholder.
+            if route.tunnel() {
+                debug!(
+                    "CacheQuery cache miss for tunnel route {}, serving placeholder",
+                    route_id
+                );
+                query::send_status_failure(&mut client, &config, "OVERRIDE_QUERY").await?;
+                query::handle_ping_pong_local(&mut client, self.threat).await?;
+                return Ok(());
+            }
         }
 
         // Live backend query path (used when cache_query is false, or on cache miss)
         let backend_addr = resolved.endpoint;
         let backend_label = backend_addr.to_string();
 
-        let mut backend = match backend::connect(
+        let backend = match backend::connect(
             backend_addr,
             handshake,
             Some(resolved.endpoint_host.as_str()),
@@ -593,7 +707,7 @@ impl Lure {
             }
         };
 
-        let mut server = EncodedConnection::new(&mut backend, SocketIntent::GreetToBackend);
+        let mut server = EncodedConnection::new(backend, SocketIntent::GreetToBackend);
 
         let req = match self
             .threat
@@ -634,10 +748,7 @@ impl Lure {
         // If CacheQuery is set, intercept and cache the response JSON before sending to client
         if route.cache_query() {
             let json_bytes = response.json.as_bytes().to_vec();
-            self.router
-                .query_cache()
-                .set(route_id, json_bytes)
-                .await;
+            self.router.query_cache().set(route_id, json_bytes).await;
             debug!("CacheQuery cached response for route {}", route_id);
         }
 
@@ -658,7 +769,9 @@ impl Lure {
                     return Err(err);
                 }
                 Err(err) => {
-                    if let Some(ClientFail::Timeout { intent, .. }) = err.downcast_ref::<ClientFail>() {
+                    if let Some(ClientFail::Timeout { intent, .. }) =
+                        err.downcast_ref::<ClientFail>()
+                    {
                         LureLogger::deadline_missed(
                             "client status ping",
                             intent.duration,
@@ -688,9 +801,9 @@ impl Lure {
         Ok(())
     }
 
-    async fn handle_proxy<'a>(
+    async fn handle_proxy(
         &self,
-        mut client: EncodedConnection<'a>,
+        mut client: EncodedConnection,
         handshake: &OwnedHandshake,
         resolved: Option<ResolvedRoute>,
         handshake_raw: Vec<u8>,
@@ -730,6 +843,42 @@ impl Lure {
             return Ok(());
         };
 
+        let tunnel = resolved.tunnel;
+        let requested_tunnel = match tunnel {
+            crate::router::TunnelOpt::KeyId(_) => true,
+            crate::router::TunnelOpt::ZoneDefault => true,
+            crate::router::TunnelOpt::None => resolved.route.tunnel(),
+        };
+
+        // Block local IP clients unless route explicitly permits or the effective route uses a
+        // tunnel-backed target.
+        if enforce_local_ip_block() && !resolved.route.allows_local() && !requested_tunnel {
+            let ip = address.ip();
+            if is_local_ip(ip) {
+                self.disconnect_login(&mut client, address, |config| {
+                    (
+                        config.string_value("LOCAL_NOT_ALLOWED"),
+                        format!(
+                            "LOCAL_NOT_ALLOWED: local address {ip} not permitted on this route"
+                        ),
+                    )
+                })
+                .await;
+                return Ok(());
+            }
+        }
+
+        // Transfer packets are Configuration-state only. This login-stage path must not emit them
+        // until the proxy has explicit configuration-state support, so fall through for now.
+        const TRANSFER_MIN_PROTOCOL: i32 = 766; // MC 1.20.5+
+        if resolved.route.redirection() && handshake.protocol_version >= TRANSFER_MIN_PROTOCOL {
+            debug!(
+                "route redirection requested for host={}, but configuration-state transfer \
+                 is not implemented yet; using normal proxy flow",
+                hostname
+            );
+        }
+
         let Some((session, route)) = self
             .create_proxy_session(&mut client, address, hostname, &resolved, profile)
             .await
@@ -738,16 +887,8 @@ impl Lure {
         };
 
         let server_address = session.destination_addr;
-        let tunnel = resolved.tunnel;
-
         // Tenant tunnel key is optional. We only hard-require it when an endpoint explicitly opts
         // into tunnel mode with @tunnel-key or @<key_id>.
-        let requested_tunnel = match tunnel {
-            crate::router::TunnelOpt::KeyId(_) => true,
-            crate::router::TunnelOpt::ZoneDefault => true,
-            crate::router::TunnelOpt::None => route.tunnel(),
-        };
-
         let resolved_key_id: Option<TokenKeyId> = match tunnel {
             crate::router::TunnelOpt::KeyId(id) => Some(TokenKeyId(id)),
             crate::router::TunnelOpt::ZoneDefault => {
@@ -828,7 +969,7 @@ impl Lure {
 
     async fn handle_tunnel_session(
         &self,
-        mut client: EncodedConnection<'_>,
+        mut client: EncodedConnection,
         handshake_raw: Vec<u8>,
         login_raw: &[u8],
         route: &Route,
@@ -842,22 +983,40 @@ impl Lure {
         let session_token = SessionToken(session_bytes);
 
         let receiver = self
-            .tunnels
-            .offer_session(
-                key_id,
-                session_token,
+            .tunnel_agents
+            .dispatch_router_request(
+                MasterForwardTunnelRequest {
+                    tunnel_id: key_id,
+                    session: session_token,
+                    ttl: 1,
+                    tunnel_agent_request: tun::TunnelAgentRequest {
+                        from: self.tunnel_forward_addr().await?,
+                        to: session.destination_addr,
+                    },
+                },
                 session.destination_addr,
                 &route.auth_mode,
+                self.tunnel_agent_dispatch().await?,
             )
             .await?;
 
-        let mut agent_connection = match timeout(Duration::from_secs(10), receiver).await {
+        let agent_connection = match timeout(Duration::from_secs(10), receiver).await {
             Ok(Ok(conn)) => conn,
-            Ok(Err(_)) => anyhow::bail!("tunnel agent dropped session"),
-            Err(_) => anyhow::bail!("tunnel agent connect timeout"),
+            Ok(Err(_)) => {
+                self.tunnels
+                    .rollback_local_session(key_id, session_token)
+                    .await;
+                anyhow::bail!("tunnel agent dropped session");
+            }
+            Err(_) => {
+                self.tunnels
+                    .rollback_local_session(key_id, session_token)
+                    .await;
+                anyhow::bail!("tunnel agent connect timeout");
+            }
         };
 
-        let mut agent = EncodedConnection::new(&mut agent_connection, SocketIntent::GreetToBackend);
+        let mut agent = EncodedConnection::new(agent_connection, SocketIntent::GreetToBackend);
         agent.send_raw(&handshake_raw).await?;
         agent.send_raw(login_raw).await?;
 
@@ -866,7 +1025,7 @@ impl Lure {
             agent.send_raw(&pending).await?;
         }
 
-        passthrough_now(&mut client, &mut agent, session).await?;
+        passthrough_now(client.into_inner(), agent.into_inner(), session).await?;
         Ok(())
     }
 
@@ -896,8 +1055,84 @@ impl Lure {
                     )
                     .await?;
             }
+            tun::Intent::Forward => {
+                let Some(forward) = hello.forward else {
+                    anyhow::bail!("forwarded tunnel hello missing payload");
+                };
+                self.tunnel_agents
+                    .dispatch_external_request(
+                        // dispatch_external_request only consumes the
+                        // MasterForwardTunnelRequest, so connection remains
+                        // available for the ForwardAck write below.
+                        MasterForwardTunnelRequest {
+                            tunnel_id: key_id,
+                            session: SessionToken(forward.session),
+                            ttl: forward.ttl,
+                            tunnel_agent_request: forward.request,
+                        },
+                        hello.timestamp,
+                        hello.hmac,
+                        self.tunnel_agent_mode().await,
+                    )
+                    .await?;
+                let mut buf = Vec::new();
+                tun::encode_server_msg(&tun::ServerMsg::ForwardAck(forward.session), &mut buf);
+                let mut connection = connection;
+                connection.write_all(buf).await?;
+            }
         }
         Ok(())
+    }
+
+    async fn tunnel_agent_mode(&self) -> TunnelAgentMode {
+        if self
+            .config
+            .read()
+            .await
+            .tunnel
+            .master_url
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            TunnelAgentMode::Slave
+        } else {
+            TunnelAgentMode::Master
+        }
+    }
+
+    async fn tunnel_agent_dispatch(&self) -> anyhow::Result<TunnelAgentDispatch> {
+        let master_url = self.config.read().await.tunnel.master_url.clone();
+        let Some(master_url) = master_url.filter(|value| !value.trim().is_empty()) else {
+            return Ok(TunnelAgentDispatch::LocalAgent);
+        };
+        Ok(TunnelAgentDispatch::Master(resolve_socket_addr(
+            &master_url,
+        )?))
+    }
+
+    async fn tunnel_forward_addr(&self) -> anyhow::Result<SocketAddr> {
+        let (selected, source) = {
+            let config = self.config.read().await;
+            if let Some(advertised_addr) = config
+                .advertised_addr
+                .as_ref()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+            {
+                (advertised_addr.to_string(), "advertised_addr")
+            } else {
+                (config.bind.clone(), "bind")
+            }
+        };
+
+        let addr = resolve_socket_addr(&selected)?;
+        if !is_routable_forward_ip(addr.ip()) {
+            anyhow::bail!(
+                "tunnel forward address {addr} from {source} is not remotely routable; \
+                 configure advertised_addr with a public host:port"
+            );
+        }
+        Ok(addr)
     }
 
     async fn read_ingress_hello(
@@ -969,7 +1204,7 @@ impl Lure {
 
     async fn handle_proxy_session(
         &self,
-        mut client: EncodedConnection<'_>,
+        mut client: EncodedConnection,
         handshake: &OwnedHandshake,
         route: &Route,
         session: &Session,
@@ -980,7 +1215,7 @@ impl Lure {
         let client_addr = session.client_addr;
         let hostname = handshake.server_address.as_ref();
 
-        let mut owned_stream = match backend::connect(
+        let owned_stream = match backend::connect(
             server_address,
             handshake,
             Some(session.endpoint_host.as_str()),
@@ -1020,7 +1255,7 @@ impl Lure {
                 return Err(err.into());
             }
         };
-        let mut server = EncodedConnection::new(&mut owned_stream, SocketIntent::GreetToBackend);
+        let mut server = EncodedConnection::new(owned_stream, SocketIntent::GreetToBackend);
         server.send_raw(login_raw).await?;
 
         let pending = client.take_pending_inbound();
@@ -1028,13 +1263,13 @@ impl Lure {
             server.send_raw(&pending).await?;
         }
 
-        passthrough_now(&mut client, &mut server, session).await?;
+        passthrough_now(client.into_inner(), server.into_inner(), session).await?;
         Ok(())
     }
 
     async fn status_error(
         &self,
-        client: &mut EncodedConnection<'_>,
+        client: &mut EncodedConnection,
         config: &LureConfig,
     ) -> anyhow::Result<()> {
         self.metrics.record_failure("status");
@@ -1043,7 +1278,7 @@ impl Lure {
 
     async fn disconnect_login<F, S, L>(
         &self,
-        client: &mut EncodedConnection<'_>,
+        client: &mut EncodedConnection,
         address: SocketAddr,
         make_reason: F,
     ) where
@@ -1065,7 +1300,7 @@ impl Lure {
 
     async fn create_proxy_session(
         &self,
-        client: &mut EncodedConnection<'_>,
+        client: &mut EncodedConnection,
         address: SocketAddr,
         hostname: &str,
         resolved: &ResolvedRoute,
@@ -1113,7 +1348,7 @@ impl Lure {
 
     async fn disconnect_backend_error(
         &self,
-        client: &mut EncodedConnection<'_>,
+        client: &mut EncodedConnection,
         client_addr: SocketAddr,
         server_address: SocketAddr,
         hostname: &str,
@@ -1135,6 +1370,17 @@ impl Lure {
             .await?;
         Ok(err)
     }
+}
+
+fn resolve_socket_addr(value: &str) -> anyhow::Result<SocketAddr> {
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+
+    let mut addrs = value.to_socket_addrs()?;
+    addrs
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no addresses resolved for {value}"))
 }
 
 fn decode_handshake_frame(frame: &net::PacketFrame) -> anyhow::Result<HandshakeC2s<'_>> {

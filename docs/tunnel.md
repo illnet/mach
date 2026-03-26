@@ -1,12 +1,13 @@
 # TCP Tunnel (Beta)
 
-This document describes the pure-TCP tunnel agent flow and how Lure integrates with it.
+This document describes the pure-TCP tunnel agent flow and the slave-to-master forwarded-request extension for distributed Lure deployments.
 
 ## Purpose
 
 - NAT passthrough for routes marked as tunnel-enabled.
 - No encryption or auth beyond a shared 32-byte token.
-- Tunnel agent connects to Lure ingress and reverse-proxies to the target.
+- `minitun` connects to Lure ingress and reverse-proxies to the target.
+- Optional slave forwarding mode relays tunnel session requests through a master Lure instance while keeping the client data plane local to the slave.
 
 ## Status
 
@@ -32,7 +33,9 @@ tunnel = true
 # tunnel_token = "s3Iu3RkV..."
 ```
 
-### Token Generation
+### minitun
+
+`minitun` is the singleton tunnel client. One process can register multiple tunnel keys against the same Lure endpoint.
 
 Generate a cryptographically secure 32-byte token. Examples:
 
@@ -46,15 +49,48 @@ python3 -c "import secrets; print(secrets.token_hex(32))"
 
 Store tokens securely in your configuration. Each tunnel route should have a unique token.
 
+Example:
+
+```bash
+./minitun agent proxy.example.com:25577 \
+  --token 0011223344556677:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --token 8899aabbccddeeff:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+```
+
+Or via env for the singleton service:
+
+```bash
+MINITUN_ENDPOINT=proxy.example.com:25577 \
+MINITUN_TOKENS=$'0011223344556677:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n8899aabbccddeeff:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
+./minitun agent
+```
+
+### Slave Forwarding Configuration
+
+Slave forwarding is instance-driven. Any node with `tunnel.master_url` set will send per-session tunnel offers to that master.
+
+```toml
+inst = "sgp-edge-1"
+
+[tunnel]
+master_url = "master.example.com:25577"
+```
+
+- `LURE_TUN_MASTER_URL` overrides `tunnel.master_url`.
+- The value is a TCP endpoint (`host:port`), even though the config field keeps the historical `*_url` naming.
+
 ## Tunnel Wire Protocol
 
 All tunnel connections begin with a fixed hello frame:
 
 - Magic: `LTUN` (4 bytes)
-- Version: `1` (1 byte)
-- Intent: `1` = listen, `2` = connect (1 byte)
-- Token: 32 bytes
+- Version: `3` (1 byte)
+- Intent: `1` = listen, `2` = connect, `3` = forward (1 byte)
+- Key ID: 8 bytes
+- Timestamp: 8 bytes
+- HMAC: 32 bytes
 - Session: 32 bytes (only for intent=connect)
+- Forward payload: session + ttl + `from` socket address + `to` socket address (only for intent=forward)
 
 ### Server Messages
 
@@ -64,6 +100,13 @@ After receiving a tunnel hello, the server can send:
 - TargetAddr: `0x02` + addr family + port + IP
   - family `4`: 1 byte, port 2 bytes (be), IPv4 4 bytes
   - family `6`: 1 byte, port 2 bytes (be), IPv6 16 bytes
+- ForwardAck: `0x03` + 32-byte correlation/session id
+- ForwardRequest: `0x04` + 32-byte correlation/session id + 1-byte ttl +
+  `from` socket address + `to` socket address
+  - `from`/`to` use the same addr family + port + IP payload layout as
+    `TargetAddr`
+  - this is the master-to-agent request that pairs with `ForwardAck` in the
+    forwarded-session flow
 
 ## End-to-End Flow
 
@@ -78,6 +121,21 @@ After receiving a tunnel hello, the server can send:
    - raw handshake
    - raw login start
    - any pending buffered bytes
+
+### Distributed Slave Forward Flow
+
+1) A slave Lure instance accepts a client on a tunnel-enabled route.
+2) The slave resolves the backend locally, creates a pending tunnel session, and opens a tunnel `forward` hello to `tunnel.master_url`.
+3) The forward payload contains:
+   - the session token
+   - `ttl`: a loop guard for forwarded offers
+   - `from`: the slave edge socket that the agent must connect back to
+   - `to`: the resolved backend socket address
+   - The tunnel `key_id` stays in the fixed hello header and is still covered by the HMAC.
+4) The master validates the HMAC and forwards the raw request to the active listening agent for that tunnel, then replies with `ForwardAck`.
+5) The agent connects back to the slave edge at `from` using the normal `connect` flow.
+6) The slave validates the session and replies with `TargetAddr(to)`.
+7) The data plane remains direct between slave edge and agent; the master is only a control-plane relay.
 
 ## Security Considerations
 
@@ -109,7 +167,7 @@ After receiving a tunnel hello, the server can send:
 ### Keep-Alive
 - **Not currently supported** - If the agent connection is idle, it may be closed by network infrastructure.
 - **Workaround**: Design agents to reconnect periodically or on any connection error.
-- **Future**: Keep-alive will be added in protocol v2.
+- **Future**: Keep-alive will be added in a future wire-protocol revision.
 
 ### Maximum Pending Sessions
 - **Default limit**: 10,000 pending sessions per Lure instance.
@@ -131,13 +189,14 @@ Tunnel events are logged using the standard Lure logger:
 [WARN] Tunnel agent not found: token=8f session=3c
 [WARN] Tunnel session not found: session=3c
 [WARN] Tunnel token mismatch (unauthorized accept attempt): agent=8f session=3c
+[DEBUG] Tunnel forward request received: token=8f from=198.51.100.10:25577 target=10.0.0.12:25565
 [ERROR] Tunnel session error during session handling (target 10.0.0.12:25565): ...
 ```
 
 Enable debug logging to see session lifecycle events:
 
 ```bash
-RUST_LOG=debug lure start
+RUST_LOG=debug ./minitun agent proxy.example.com:25577 --token 0011223344556677:...
 ```
 
 ### Metrics
@@ -211,7 +270,7 @@ The following metrics are exposed:
 
 ```
 [Internal Network]
-  Tunnel Agent (token: 8f1f2a3b...)
+  minitun (token: 8f1f2a3b...)
        |
        | (TLS/WireGuard recommended)
        |
@@ -222,12 +281,10 @@ The following metrics are exposed:
    Minecraft Clients
 ```
 
-**Agent startup**:
+**minitun startup**:
 ```bash
-lure-agent \
-  --server proxy.example.com:25567 \
-  --token 8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b \
-  --listen 0.0.0.0:25565
+./minitun agent proxy.example.com:25567 \
+  --token 0011223344556677:8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f00112233445566778899aabb
 ```
 
 **Route configuration**:
@@ -239,19 +296,19 @@ priority = 0
 
 [route.flags]
 tunnel = true
-tunnel_token = "8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b"
+tunnel_token = "8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f00112233445566778899aabb"
 ```
 
 ### Multi-agent for redundancy
 
-Deploy multiple tunnel agents, each with the same token. Lure will send session offers to all registered agents; the first to connect wins.
+Deploy multiple `minitun` instances with the same token if you want redundancy. Lure will keep one active listener per key, so restarts and failover are handled by reconnecting instances.
 
 ```bash
-# Agent 1
-lure-agent --server proxy.example.com:25567 --token ABC123... --listen 0.0.0.0:25565
+# Instance 1
+./minitun agent proxy.example.com:25567 --token 0011223344556677:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
-# Agent 2
-lure-agent --server proxy.example.com:25567 --token ABC123... --listen 0.0.0.0:25565
+# Instance 2
+./minitun agent proxy.example.com:25567 --token 0011223344556677:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 ```
 
 ## Notes

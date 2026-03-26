@@ -13,33 +13,50 @@ env:
   TOOLCHAIN: nightly-2026-02-06
 
 jobs:
-  determine_stable:
+  meta:
     runs-on: ubuntu-latest
     outputs:
       stable: ${{ steps.flag.outputs.stable }}
+      docker_needed: ${{ steps.flag.outputs.docker_needed }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-      - name: Determine stable flag
+          fetch-depth: 0
+      - name: Compute workflow metadata
         id: flag
         run: |
           if [ "${{ github.event_name }}" != "push" ]; then
             echo "stable=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          MSG="$(git log -1 --pretty=%B)"
-          if printf '%s' "$MSG" | grep -Fq '[stable]'; then
-            echo "stable=true" >> $GITHUB_OUTPUT
           else
-            echo "stable=false" >> $GITHUB_OUTPUT
+            MSG="$(git log -1 --pretty=%B)"
+            if printf '%s' "$MSG" | grep -Fq '[stable]'; then
+              echo "stable=true" >> $GITHUB_OUTPUT
+            else
+              echo "stable=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            BASE_SHA="${{ github.event.before }}"
+            HEAD_SHA="${{ github.sha }}"
+          else
+            BASE_SHA="${{ github.sha }}^"
+            HEAD_SHA="${{ github.sha }}"
+          fi
+
+          CHANGED_FILES="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" || git show --pretty='' --name-only "${{ github.sha }}" || true)"
+          if echo "$CHANGED_FILES" | grep -qE '^(src/|net/|Cargo\.toml|Cargo\.lock|\.github/workflows/|Dockerfile\.copy)'; then
+            echo "docker_needed=true" >> $GITHUB_OUTPUT
+          else
+            echo "docker_needed=false" >> $GITHUB_OUTPUT
           fi
 
   build:
     runs-on: ubuntu-latest
-    #needs: determine_stable
-    outputs:
-      docker_needed: ${{ steps.check.outputs.docker_needed }}
+    needs: meta
     env:
       CARGO_TERM_COLOR: always
       CARGO_TARGET_DIR: target-default
@@ -78,46 +95,32 @@ jobs:
         run: cargo +${{ env.TOOLCHAIN }} build --release --target ${{ env.TARGET }} --verbose
 
       - name: Build tun agent (default)
-        run: cargo +${{ env.TOOLCHAIN }} build -p tun --bin tunure --release --target ${{ env.TARGET }} --verbose
+        run: cargo +${{ env.TOOLCHAIN }} build -p tun --bin minitun --release --target ${{ env.TARGET }} --verbose
 
       - name: Test
         run: cargo +${{ env.TOOLCHAIN }} test --release --target ${{ env.TARGET }} --verbose
 
       - name: Prepare default artifact
         run: |
-          mkdir -p release
-          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/lure release/lure
-          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/tunure release/tunure
-          chmod +x release/lure release/tunure
-          sha256sum release/lure | tee release/lure.sha256
-          sha256sum release/tunure | tee release/tunure.sha256
+          mkdir -p artifacts/linux/default
+          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/lure artifacts/linux/default/lure
+          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/minitun artifacts/linux/default/minitun
+          chmod +x artifacts/linux/default/lure artifacts/linux/default/minitun
+          sha256sum artifacts/linux/default/lure | tee artifacts/linux/default/lure.sha256
+          sha256sum artifacts/linux/default/minitun | tee artifacts/linux/default/minitun.sha256
 
       - name: Upload default artifact
         uses: actions/upload-artifact@v4
         with:
-          name: release
-          path: |
-            release/lure
-            release/lure.sha256
-            release/tunure
-            release/tunure.sha256
+          name: linux-release
+          path: artifacts/linux/default
           if-no-files-found: error
           overwrite: true
 
-      - name: Docker needed
-        id: check
-        run: |
-          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD || true)
-          if echo "$CHANGED_FILES" | grep -qE '^(src/|net/|Cargo\.toml|Cargo\.lock|\.github/workflows/|Dockerfile\.copy)'; then
-            echo "docker_needed=true" >> $GITHUB_OUTPUT
-          else
-            echo "docker_needed=false" >> $GITHUB_OUTPUT
-          fi
-
   stable_build:
     runs-on: ubuntu-latest
-    needs: determine_stable
-    if: needs.determine_stable.outputs.stable == 'true'
+    needs: meta
+    if: needs.meta.outputs.stable == 'true'
     env:
       CARGO_TERM_COLOR: always
       CARGO_TARGET_DIR: target-stable
@@ -156,42 +159,40 @@ jobs:
       - name: Build [stable] variant
         run: |
           cargo +${{ env.TOOLCHAIN }} build --release --target ${{ env.TARGET }} --verbose
-          cargo +${{ env.TOOLCHAIN }} build -p tun --bin tunure --release --target ${{ env.TARGET }} --verbose
-          mkdir -p release-stable
-          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/lure release-stable/lure
-          chmod +x release-stable/lure
-          sha256sum release-stable/lure | tee release-stable/lure.sha256
-          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/tunure release-stable/tunure
-          chmod +x release-stable/tunure
-          sha256sum release-stable/tunure | tee release-stable/tunure.sha256
+          cargo +${{ env.TOOLCHAIN }} build -p tun --bin minitun --release --target ${{ env.TARGET }} --verbose
+          mkdir -p artifacts/linux/stable
+          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/lure artifacts/linux/stable/lure
+          chmod +x artifacts/linux/stable/lure
+          sha256sum artifacts/linux/stable/lure | tee artifacts/linux/stable/lure.sha256
+          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/minitun artifacts/linux/stable/minitun
+          chmod +x artifacts/linux/stable/minitun
+          sha256sum artifacts/linux/stable/minitun | tee artifacts/linux/stable/minitun.sha256
 
       - name: Upload [stable] artifact
         uses: actions/upload-artifact@v4
         with:
-          name: release-stable
-          path: |
-            release-stable/lure
-            release-stable/lure.sha256
-            release-stable/tunure
-            release-stable/tunure.sha256
+          name: linux-release-stable
+          path: artifacts/linux/stable
           if-no-files-found: error
           overwrite: true
           
   docker_release:
     runs-on: ubuntu-latest
-    needs: build
-    if: github.ref == 'refs/heads/main' && needs.build.outputs.docker_needed == 'true'
+    needs: [meta, build]
+    if: github.ref == 'refs/heads/main' && needs.meta.outputs.docker_needed == 'true'
     permissions:
       contents: read
       packages: write
       id-token: write
     steps:
       - uses: actions/checkout@v4
-      - name: Download release artifact (to repo root)
+      - name: Download release artifact
         uses: actions/download-artifact@v4
         with:
-          name: release
-          path: .
+          name: linux-release
+          path: artifacts/linux/default
+      - name: Stage Docker payload
+        run: cp artifacts/linux/default/lure ./lure
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
         with:
@@ -221,7 +222,7 @@ jobs:
 
   docker_release_stable:
     runs-on: ubuntu-latest
-    needs: stable_build
+    needs: [meta, stable_build]
     if: github.ref == 'refs/heads/main' && needs.stable_build.result == 'success'
     permissions:
       contents: read
@@ -229,11 +230,13 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-      - name: Download [stable] artifact (to repo root)
+      - name: Download [stable] artifact
         uses: actions/download-artifact@v4
         with:
-          name: release-stable
-          path: .
+          name: linux-release-stable
+          path: artifacts/linux/stable
+      - name: Stage Docker payload
+        run: cp artifacts/linux/stable/lure ./lure
           
       - name: Install cosign
         uses: sigstore/cosign-installer@v3

@@ -1,6 +1,6 @@
 [package]
 name = "lure"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 default-run = "lure"
 
@@ -30,7 +30,7 @@ toml = "0.9"
 async-trait = "0.1"
 futures = "0.3"
 # Use rustls to support fully-static musl builds (avoid system OpenSSL).
-reqwest = { version = "0.13", default-features = false, features = ["stream", "gzip", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["stream", "gzip", "rustls", "json"] }
 serde_json = "1.0"
 governor = "0.10"
 thiserror = "2.0"
@@ -47,6 +47,7 @@ tokio-metrics = "0.4"
 env_logger = "0.11"
 fake_serialize = "0.1"
 console-subscriber = "0.5"
+sentry = { version = "0.47.0", default-features = false, features = ["backtrace", "contexts", "debug-images", "panic", "reqwest", "rustls", "tokio"] }
 
 [features]
 # by default we build HTTP-only
@@ -72,7 +73,7 @@ inherits = "release"
 opt-level = 3
 debug = 2
 lto = "thin"
-codegen-unit = 4
+codegen-units = 4
 panic = "abort"
 incremental = false
 strip = "none"

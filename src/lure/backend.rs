@@ -31,27 +31,25 @@ pub async fn connect(
     config: &LureConfig,
     client_addr: SocketAddr,
 ) -> Result<LureConnection, BackendConnectError> {
-    let mut backend = open_backend_connection(address)
+    let backend = open_backend_connection(address)
         .await
         .map_err(BackendConnectError::Connect)?;
 
-    {
-        let mut server = EncodedConnection::new(&mut backend, SocketIntent::GreetToBackend);
-        init_handshake(
-            &mut server,
-            handshake,
-            endpoint_host,
-            endpoint_port,
-            preserve_host,
-            proxied,
-            config,
-            client_addr,
-        )
-        .await
-        .map_err(BackendConnectError::Handshake)?;
-    }
+    let mut server = EncodedConnection::new(backend, SocketIntent::GreetToBackend);
+    init_handshake(
+        &mut server,
+        handshake,
+        endpoint_host,
+        endpoint_port,
+        preserve_host,
+        proxied,
+        config,
+        client_addr,
+    )
+    .await
+    .map_err(BackendConnectError::Handshake)?;
 
-    Ok(backend)
+    Ok(server.into_inner())
 }
 
 fn backend_handshake_parts<'a>(
@@ -78,7 +76,7 @@ fn backend_handshake_parts<'a>(
 }
 
 async fn init_handshake(
-    server: &mut EncodedConnection<'_>,
+    server: &mut EncodedConnection,
     handshake: &OwnedHandshake,
     endpoint_host: Option<&str>,
     endpoint_port: u16,

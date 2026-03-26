@@ -8,7 +8,7 @@ name = "tun"
 path = "src/lib.rs"
 
 [[bin]]
-name = "tunure"
+name = "minitun"
 path = "src/bin/tun.rs"
 
 [dependencies]
@@ -23,3 +23,5 @@ clap = { version = "4", features = ["derive", "env"] }
 hex = "0.4"
 log = "0.4"
 env_logger = "0.11"
+dotenvy = "0.15"
+sentry = { version = "0.47.0", default-features = false, features = ["backtrace", "contexts", "debug-images", "panic", "reqwest", "rustls", "tokio"] }

@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -506,4 +507,542 @@ void lure_epoll_connection_free(LureEpollConnection* conn) {
     }
 
     free(conn);
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * N-WORKER POOL
+ *
+ * One LureEpollWorker owns a single epoll_fd that monitors all connection FDs
+ * assigned to it.  A flat slot array (WORKER_MAX_SLOTS entries, FAM) holds
+ * per-connection state.  Connections are submitted from Rust via a
+ * mutex-guarded queue and an eventfd wakeup; completions are reported by
+ * writing a 48-byte LureEpollDone frame to a shared done-pipe.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+enum {
+    WORKER_MAX_SLOTS        = 4096,
+    WORKER_EPOLL_BATCH      = 64,
+    WORKER_STALL_TICKS_MAX  = 12,   /* 12 × 5 s ≈ 60 s stall timeout */
+};
+
+/* Slot key encoding in epoll_event.data.u64:
+ *   key = ((uint64_t)slot_idx << 1) | side
+ * The eventfd uses WORKER_EVENTFD_KEY, which cannot be a valid slot key. */
+#define WORKER_EVENTFD_KEY  UINT64_MAX
+
+/* ---- per-connection slot -------------------------------------------------- */
+
+typedef struct {
+    int      fd_a, fd_b;
+    uint64_t conn_id;
+
+    int eof_a, eof_b;
+    int shut_wr_a, shut_wr_b;
+    uint32_t prev_ev_a, prev_ev_b;
+
+    int    a2b_pipe[2];     /* [0]=read [1]=write */
+    int    b2a_pipe[2];
+    size_t a2b_pipe_len;
+    size_t b2a_pipe_len;
+
+    uint64_t c2s_bytes, s2c_bytes;
+    uint64_t c2s_chunks, s2c_chunks;
+
+    uint32_t abort_flag;   /* set atomically from other threads */
+    uint32_t stall_ticks;  /* watchdog: ticks with no chunk progress */
+    uint64_t prev_chunks;  /* chunk snapshot at last watchdog pass */
+
+    int32_t next_free;     /* free-list linkage; -1 == end of list */
+    int     active;        /* 1 while slot is occupied */
+} LureEpollSlot;
+
+/* ---- pending queue nodes -------------------------------------------------- */
+
+typedef struct PendingSubmit {
+    int fd_a, fd_b;
+    uint64_t conn_id;
+    struct PendingSubmit *next;
+} PendingSubmit;
+
+typedef struct PendingAbort {
+    uint64_t conn_id;
+    struct PendingAbort *next;
+} PendingAbort;
+
+/* ---- worker --------------------------------------------------------------- */
+
+struct LureEpollWorker {
+    int epoll_fd;
+    int event_fd;           /* eventfd: written to wake the worker thread */
+    int done_pipe_write;    /* NOT owned; 48-byte completion frames written here */
+
+    pthread_t       thread;
+    pthread_mutex_t queue_lock;
+
+    PendingSubmit *submit_head;
+    PendingAbort  *abort_head;
+
+    uint32_t active_count;
+    int32_t  free_head;     /* index of first free slot; -1 == full */
+    uint32_t shutdown;      /* atomic flag */
+
+    uint32_t      n_slots;
+    LureEpollSlot slots[];  /* FAM — n_slots elements */
+};
+
+/* ---- slot-level side_events and refresh_interest -------------------------- */
+
+static uint32_t wslot_side_events(const LureEpollSlot *s, int side) {
+    uint32_t ev = EPOLLET | EPOLLERR | EPOLLHUP | EPOLLRDHUP;
+    if (side == SIDE_A) {
+        if (!s->eof_a && s->a2b_pipe_len < PIPE_CAP) ev |= EPOLLIN;
+        if (s->b2a_pipe_len > 0)                      ev |= EPOLLOUT;
+    } else {
+        if (!s->eof_b && s->b2a_pipe_len < PIPE_CAP)  ev |= EPOLLIN;
+        if (s->a2b_pipe_len > 0)                       ev |= EPOLLOUT;
+    }
+    return ev;
+}
+
+static void wslot_refresh_interest(LureEpollWorker *w, uint32_t idx) {
+    LureEpollSlot *s = &w->slots[idx];
+    uint64_t key_a = ((uint64_t)idx << 1) | SIDE_A;
+    uint64_t key_b = ((uint64_t)idx << 1) | SIDE_B;
+    uint32_t ea = wslot_side_events(s, SIDE_A);
+    uint32_t eb = wslot_side_events(s, SIDE_B);
+    if (ea != s->prev_ev_a) {
+        if (s->fd_a >= 0) epoll_mod(w->epoll_fd, s->fd_a, key_a, ea);
+        s->prev_ev_a = ea;
+    }
+    if (eb != s->prev_ev_b) {
+        if (s->fd_b >= 0) epoll_mod(w->epoll_fd, s->fd_b, key_b, eb);
+        s->prev_ev_b = eb;
+    }
+}
+
+/* ---- wslot_release: complete or error a slot and return it to free list --- */
+
+static void wslot_release(LureEpollWorker *w, uint32_t idx, int32_t result) {
+    LureEpollSlot *s = &w->slots[idx];
+
+    /* Write 48-byte completion frame atomically (fits inside PIPE_BUF). */
+    LureEpollDone done;
+    memset(&done, 0, sizeof(done));
+    done.conn_id    = s->conn_id;
+    done.c2s_bytes  = s->c2s_bytes;
+    done.s2c_bytes  = s->s2c_bytes;
+    done.c2s_chunks = s->c2s_chunks;
+    done.s2c_chunks = s->s2c_chunks;
+    done.result     = result;
+    (void)write(w->done_pipe_write, &done, sizeof(done));
+
+    /* Remove FDs from epoll and close. */
+    if (s->fd_a >= 0) {
+        epoll_ctl(w->epoll_fd, EPOLL_CTL_DEL, s->fd_a, NULL);
+        close(s->fd_a);
+        s->fd_a = -1;
+    }
+    if (s->fd_b >= 0) {
+        epoll_ctl(w->epoll_fd, EPOLL_CTL_DEL, s->fd_b, NULL);
+        close(s->fd_b);
+        s->fd_b = -1;
+    }
+    for (int i = 0; i < 2; i++) {
+        if (s->a2b_pipe[i] >= 0) { close(s->a2b_pipe[i]); s->a2b_pipe[i] = -1; }
+        if (s->b2a_pipe[i] >= 0) { close(s->b2a_pipe[i]); s->b2a_pipe[i] = -1; }
+    }
+
+    s->active    = 0;
+    s->next_free = w->free_head;
+    w->free_head = (int32_t)idx;
+    w->active_count--;
+}
+
+/* ---- wsubmit_now: allocate slot and register with epoll ------------------- */
+
+static void wsubmit_now(LureEpollWorker *w, int fd_a, int fd_b, uint64_t conn_id) {
+    /* No free slots — signal error and close fds. */
+    if (w->free_head < 0) {
+        LureEpollDone done;
+        memset(&done, 0, sizeof(done));
+        done.conn_id = conn_id;
+        done.result  = -ENOSPC;
+        (void)write(w->done_pipe_write, &done, sizeof(done));
+        close(fd_a);
+        close(fd_b);
+        return;
+    }
+
+    uint32_t idx = (uint32_t)w->free_head;
+    LureEpollSlot *s = &w->slots[idx];
+    w->free_head = s->next_free;
+    w->active_count++;  /* increment before any failure path */
+
+    memset(s, 0, sizeof(*s));
+    s->fd_a      = fd_a;
+    s->fd_b      = fd_b;
+    s->conn_id   = conn_id;
+    s->active    = 1;
+    s->next_free = -1;
+    s->a2b_pipe[0] = s->a2b_pipe[1] = -1;
+    s->b2a_pipe[0] = s->b2a_pipe[1] = -1;
+
+    int err;
+
+    if (pipe2(s->a2b_pipe, O_NONBLOCK | O_CLOEXEC) < 0) { err = errno; goto fail; }
+    if (pipe2(s->b2a_pipe, O_NONBLOCK | O_CLOEXEC) < 0) { err = errno; goto fail; }
+
+    (void)fcntl(s->a2b_pipe[1], F_SETPIPE_SZ, PIPE_CAP);
+    (void)fcntl(s->b2a_pipe[1], F_SETPIPE_SZ, PIPE_CAP);
+
+    (void)set_nonblocking(fd_a);
+    (void)set_nonblocking(fd_b);
+    set_tcp_opts(fd_a);
+    set_tcp_opts(fd_b);
+
+    {
+        uint64_t key_a   = ((uint64_t)idx << 1) | SIDE_A;
+        uint64_t key_b   = ((uint64_t)idx << 1) | SIDE_B;
+        uint32_t init_ev = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP | EPOLLET;
+        struct epoll_event ev;
+        memset(&ev, 0, sizeof(ev));
+
+        ev.events = init_ev; ev.data.u64 = key_a;
+        if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, fd_a, &ev) < 0) {
+            err = errno;
+            /* fd_a was never added, so no DEL needed */
+            goto fail;
+        }
+
+        ev.events = init_ev; ev.data.u64 = key_b;
+        if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, fd_b, &ev) < 0) {
+            err = errno;
+            epoll_ctl(w->epoll_fd, EPOLL_CTL_DEL, fd_a, NULL);
+            goto fail;
+        }
+
+        s->prev_ev_a = init_ev;
+        s->prev_ev_b = init_ev;
+    }
+    return;
+
+fail:
+    {
+        LureEpollDone done;
+        memset(&done, 0, sizeof(done));
+        done.conn_id = conn_id;
+        done.result  = -err;
+        (void)write(w->done_pipe_write, &done, sizeof(done));
+        for (int i = 0; i < 2; i++) {
+            if (s->a2b_pipe[i] >= 0) { close(s->a2b_pipe[i]); s->a2b_pipe[i] = -1; }
+            if (s->b2a_pipe[i] >= 0) { close(s->b2a_pipe[i]); s->b2a_pipe[i] = -1; }
+        }
+        if (s->fd_a >= 0) { close(s->fd_a); s->fd_a = -1; }
+        if (s->fd_b >= 0) { close(s->fd_b); s->fd_b = -1; }
+        s->active    = 0;
+        s->next_free = w->free_head;
+        w->free_head = (int32_t)idx;
+        w->active_count--;
+    }
+}
+
+/* ---- process one epoll event for a slot ---------------------------------- */
+
+static void wslot_process_event(LureEpollWorker *w, uint32_t idx,
+                                int side, uint32_t ev) {
+    LureEpollSlot *s = &w->slots[idx];
+    if (!s->active) return;
+
+    /* Check for externally requested abort. */
+    if (__atomic_load_n(&s->abort_flag, __ATOMIC_ACQUIRE)) {
+        wslot_release(w, idx, -ECANCELED);
+        return;
+    }
+
+    if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+        if (side == SIDE_A) s->eof_a = 1;
+        else                s->eof_b = 1;
+    }
+
+    if (ev & EPOLLIN) {
+        int rc;
+        if (side == SIDE_A) {
+            rc = splice_forward(s->fd_a, s->a2b_pipe[1], s->a2b_pipe[0],
+                                s->fd_b, &s->a2b_pipe_len, &s->eof_a);
+            if (rc == 0) s->c2s_chunks++;
+        } else {
+            rc = splice_forward(s->fd_b, s->b2a_pipe[1], s->b2a_pipe[0],
+                                s->fd_a, &s->b2a_pipe_len, &s->eof_b);
+            if (rc == 0) s->s2c_chunks++;
+        }
+        if (rc < 0) {
+            wslot_release(w, idx, rc);
+            return;
+        }
+    }
+
+    if (ev & EPOLLOUT) {
+        if (side == SIDE_A) {
+            /* Drain b2a pipe to A (s2c direction). */
+            while (s->b2a_pipe_len > 0) {
+                ssize_t n = splice(s->b2a_pipe[0], NULL, s->fd_a, NULL,
+                                   s->b2a_pipe_len, SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
+                if (n > 0) { s->b2a_pipe_len -= (size_t)n; s->s2c_bytes += (uint64_t)n; }
+                else break;
+            }
+        } else {
+            /* Drain a2b pipe to B (c2s direction). */
+            while (s->a2b_pipe_len > 0) {
+                ssize_t n = splice(s->a2b_pipe[0], NULL, s->fd_b, NULL,
+                                   s->a2b_pipe_len, SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
+                if (n > 0) { s->a2b_pipe_len -= (size_t)n; s->c2s_bytes += (uint64_t)n; }
+                else break;
+            }
+        }
+    }
+
+    /* Shutdown the write-side once EOF is received and its pipe is drained. */
+    if (s->eof_a && !s->shut_wr_b && s->a2b_pipe_len == 0) {
+        (void)shutdown(s->fd_b, SHUT_WR);
+        s->shut_wr_b = 1;
+    }
+    if (s->eof_b && !s->shut_wr_a && s->b2a_pipe_len == 0) {
+        (void)shutdown(s->fd_a, SHUT_WR);
+        s->shut_wr_a = 1;
+    }
+
+    if (s->eof_a && s->eof_b && s->a2b_pipe_len == 0 && s->b2a_pipe_len == 0) {
+        wslot_release(w, idx, 0);
+    } else {
+        wslot_refresh_interest(w, idx);
+    }
+}
+
+/* ---- drain pending submit / abort queues ---------------------------------- */
+
+static void process_submits(LureEpollWorker *w) {
+    PendingSubmit *head;
+    pthread_mutex_lock(&w->queue_lock);
+    head           = w->submit_head;
+    w->submit_head = NULL;
+    pthread_mutex_unlock(&w->queue_lock);
+
+    while (head) {
+        PendingSubmit *cur = head;
+        head = head->next;
+        wsubmit_now(w, cur->fd_a, cur->fd_b, cur->conn_id);
+        free(cur);
+    }
+}
+
+static void process_aborts(LureEpollWorker *w) {
+    PendingAbort *head;
+    pthread_mutex_lock(&w->queue_lock);
+    head          = w->abort_head;
+    w->abort_head = NULL;
+    pthread_mutex_unlock(&w->queue_lock);
+
+    while (head) {
+        PendingAbort *cur = head;
+        head = head->next;
+        for (uint32_t i = 0; i < w->n_slots; i++) {
+            if (w->slots[i].active && w->slots[i].conn_id == cur->conn_id) {
+                __atomic_store_n(&w->slots[i].abort_flag, 1u, __ATOMIC_RELEASE);
+                break;
+            }
+        }
+        free(cur);
+    }
+}
+
+/* ---- watchdog: abort connections stalled for ~60 s ----------------------- */
+
+static void scan_stale_slots(LureEpollWorker *w) {
+    for (uint32_t i = 0; i < w->n_slots; i++) {
+        LureEpollSlot *s = &w->slots[i];
+        if (!s->active) continue;
+
+        /* Check externally-requested abort first. */
+        if (__atomic_load_n(&s->abort_flag, __ATOMIC_ACQUIRE)) {
+            wslot_release(w, i, -ECANCELED);
+            continue;
+        }
+
+        uint64_t chunks = s->c2s_chunks + s->s2c_chunks;
+        if (chunks == s->prev_chunks) {
+            s->stall_ticks++;
+            if (s->stall_ticks >= WORKER_STALL_TICKS_MAX) {
+                wslot_release(w, i, -ETIMEDOUT);
+                continue;
+            }
+        } else {
+            s->stall_ticks = 0;
+            s->prev_chunks = chunks;
+        }
+    }
+}
+
+/* ---- worker thread main --------------------------------------------------- */
+
+static void *worker_thread_main(void *arg) {
+    LureEpollWorker *w = (LureEpollWorker *)arg;
+    struct epoll_event events[WORKER_EPOLL_BATCH];
+
+    for (;;) {
+        if (__atomic_load_n(&w->shutdown, __ATOMIC_ACQUIRE) &&
+            w->active_count == 0) {
+            break;
+        }
+
+        int n = epoll_wait(w->epoll_fd, events, WORKER_EPOLL_BATCH, 5000);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        for (int i = 0; i < n; i++) {
+            uint64_t key = events[i].data.u64;
+            uint32_t ev  = events[i].events;
+
+            if (key == WORKER_EVENTFD_KEY) {
+                /* Drain the eventfd counter, then process queued work. */
+                uint64_t val;
+                (void)read(w->event_fd, &val, sizeof(val));
+                process_submits(w);
+                process_aborts(w);
+            } else {
+                uint32_t slot_idx = (uint32_t)(key >> 1);
+                int      side     = (int)(key & 1);
+                if (slot_idx < w->n_slots) {
+                    wslot_process_event(w, slot_idx, side, ev);
+                }
+            }
+        }
+
+        /* On timeout (n==0) run the stale-connection watchdog. */
+        if (n == 0) {
+            scan_stale_slots(w);
+        }
+    }
+
+    return NULL;
+}
+
+/* ── Public API ─────────────────────────────────────────────────────────────── */
+
+LureEpollWorker *lure_epoll_worker_new(int done_pipe_write_fd) {
+    uint32_t n  = WORKER_MAX_SLOTS;
+    size_t   sz = sizeof(LureEpollWorker) + n * sizeof(LureEpollSlot);
+
+    LureEpollWorker *w = (LureEpollWorker *)calloc(1, sz);
+    if (!w) return NULL;
+
+    w->done_pipe_write = done_pipe_write_fd;
+    w->n_slots         = n;
+    w->free_head       = 0;
+
+    /* Build the free list and initialize sentinel fd values. */
+    for (uint32_t i = 0; i < n; i++) {
+        w->slots[i].next_free    = (i + 1 < n) ? (int32_t)(i + 1) : -1;
+        w->slots[i].fd_a         = -1;
+        w->slots[i].fd_b         = -1;
+        w->slots[i].a2b_pipe[0]  = w->slots[i].a2b_pipe[1] = -1;
+        w->slots[i].b2a_pipe[0]  = w->slots[i].b2a_pipe[1] = -1;
+    }
+
+    if (pthread_mutex_init(&w->queue_lock, NULL) != 0) {
+        free(w);
+        return NULL;
+    }
+
+    w->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (w->epoll_fd < 0) {
+        pthread_mutex_destroy(&w->queue_lock);
+        free(w);
+        return NULL;
+    }
+
+    w->event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (w->event_fd < 0) {
+        close(w->epoll_fd);
+        pthread_mutex_destroy(&w->queue_lock);
+        free(w);
+        return NULL;
+    }
+
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events   = EPOLLIN;
+    ev.data.u64 = WORKER_EVENTFD_KEY;
+    if (epoll_ctl(w->epoll_fd, EPOLL_CTL_ADD, w->event_fd, &ev) < 0) {
+        close(w->event_fd);
+        close(w->epoll_fd);
+        pthread_mutex_destroy(&w->queue_lock);
+        free(w);
+        return NULL;
+    }
+
+    if (pthread_create(&w->thread, NULL, worker_thread_main, w) != 0) {
+        close(w->event_fd);
+        close(w->epoll_fd);
+        pthread_mutex_destroy(&w->queue_lock);
+        free(w);
+        return NULL;
+    }
+
+    return w;
+}
+
+int lure_epoll_worker_submit(LureEpollWorker *w, int fd_a, int fd_b,
+                             uint64_t conn_id) {
+    PendingSubmit *node = (PendingSubmit *)malloc(sizeof(PendingSubmit));
+    if (!node) {
+        /* C closes the fds since caller relinquished ownership. */
+        close(fd_a);
+        close(fd_b);
+        return -ENOMEM;
+    }
+    node->fd_a    = fd_a;
+    node->fd_b    = fd_b;
+    node->conn_id = conn_id;
+    node->next    = NULL;
+
+    pthread_mutex_lock(&w->queue_lock);
+    node->next     = w->submit_head;
+    w->submit_head = node;
+    pthread_mutex_unlock(&w->queue_lock);
+
+    uint64_t val = 1;
+    (void)write(w->event_fd, &val, sizeof(val));
+    return 0;
+}
+
+void lure_epoll_worker_abort(LureEpollWorker *w, uint64_t conn_id) {
+    PendingAbort *node = (PendingAbort *)malloc(sizeof(PendingAbort));
+    if (!node) return;  /* best-effort; watchdog will catch it eventually */
+    node->conn_id = conn_id;
+    node->next    = NULL;
+
+    pthread_mutex_lock(&w->queue_lock);
+    node->next    = w->abort_head;
+    w->abort_head = node;
+    pthread_mutex_unlock(&w->queue_lock);
+
+    uint64_t val = 1;
+    (void)write(w->event_fd, &val, sizeof(val));
+}
+
+void lure_epoll_worker_shutdown(LureEpollWorker *w) {
+    __atomic_store_n(&w->shutdown, 1u, __ATOMIC_RELEASE);
+    uint64_t val = 1;
+    (void)write(w->event_fd, &val, sizeof(val));
+    pthread_join(w->thread, NULL);
+}
+
+void lure_epoll_worker_free(LureEpollWorker *w) {
+    if (!w) return;
+    close(w->event_fd);
+    close(w->epoll_fd);
+    pthread_mutex_destroy(&w->queue_lock);
+    free(w);
 }

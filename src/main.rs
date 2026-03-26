@@ -8,7 +8,20 @@ use lure::{
     utils::{leak, spawn_named},
 };
 
-fn main() -> Result<(), Box<dyn Error>> {
+const SENTRY_DSN: &str =
+    "https://d8cb23f37184d406d4b129c0dc0b24d4@o1192891.ingest.us.sentry.io/4511109122293760";
+
+fn main() {
+    let sentry = init_sentry("lure");
+    if let Err(err) = try_main() {
+        capture_sentry_error(&*err);
+        eprintln!("lure failed: {err}");
+        drop(sentry);
+        std::process::exit(1);
+    }
+}
+
+fn try_main() -> Result<(), Box<dyn Error>> {
     // Minimal CLI: used for Dockerfile smoke checks and quick inspection.
     // Keep this lightweight (no clap) to avoid changing runtime behavior.
     if let Some(arg) = env::args().nth(1) {
@@ -37,6 +50,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
 
     let backend = backend_selection();
+    sentry::configure_scope(|scope| {
+        scope.set_tag("socket_backend", backend_kind_name(backend.kind));
+    });
     match backend.kind {
         BackendKind::Uring => {
             log::info!("socket backend: tokio-uring ({})", backend.reason);
@@ -68,6 +84,39 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
+fn init_sentry(service: &'static str) -> Option<sentry::ClientInitGuard> {
+    if env::var_os("NOSENTRY").is_some() {
+        return None;
+    }
+
+    let guard = sentry::init((
+        SENTRY_DSN,
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            send_default_pii: false,
+            server_name: None,
+            ..Default::default()
+        },
+    ));
+    sentry::configure_scope(|scope| {
+        scope.set_tag("service", service);
+        scope.set_tag("binary", env!("CARGO_PKG_NAME"));
+    });
+    Some(guard)
+}
+
+fn backend_kind_name(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Tokio => "tokio",
+        BackendKind::Epoll => "epoll",
+        BackendKind::Uring => "uring",
+    }
+}
+
+fn capture_sentry_error(err: &dyn Error) {
+    sentry::capture_message(&err.to_string(), sentry::Level::Error);
+}
+
 async fn run() -> Result<(), Box<dyn Error>> {
     let providers = if dotenvy::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
         Some((init_meter(), 0u8))
@@ -92,6 +141,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Err(LureConfigLoadError::Parse(parse_error)) => return Err(parse_error.into()),
     };
     apply_proxy_signing_key(&mut config);
+    apply_tunnel_master_url(&mut config);
     if should_save {
         config.save(&config_file)?;
     }
@@ -145,6 +195,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     spawn_named("Main thread", async move {
         if let Err(e) = lure.start().await {
+            sentry::capture_message(&e.to_string(), sentry::Level::Error);
             log::error!("{e}");
         }
         if let Some(providers) = providers {
@@ -203,6 +254,21 @@ fn apply_proxy_signing_key(config: &mut LureConfig) {
     }
     config.proxy_signing_key = Some(ProxySigningKey::from_bytes(seed.to_vec()));
     log::info!("generated ephemeral proxy signing key");
+}
+
+fn apply_tunnel_master_url(config: &mut LureConfig) {
+    let Ok(value) = env::var("LURE_TUN_MASTER_URL") else {
+        return;
+    };
+
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        config.tunnel.master_url = None;
+        return;
+    }
+
+    config.tunnel.master_url = Some(trimmed.to_string());
+    log::info!("tunnel master url loaded from env");
 }
 
 fn env_flag_enabled(name: &str) -> bool {

@@ -223,6 +223,9 @@ async fn run_suite(cfg: SuiteConfig) -> anyhow::Result<()> {
                 name: Some("instance_tcp_test".to_string()),
                 zone: None,
             }],
+            bootstrap_url: None,
+            master_url: None,
+            endpoints: Vec::new(),
         };
         tunnel_config.route[0].flags = Some(RouteFlagsConfig {
             tunnel: true,
@@ -650,7 +653,15 @@ async fn run_tun_agent(
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
-    let hmac = tun::compute_agent_hmac(&secret, &key_id, timestamp, tun::Intent::Listen, None);
+    let hmac = tun::compute_agent_hmac(
+        &secret,
+        &key_id,
+        timestamp,
+        tun::Intent::Listen,
+        None,
+        None,
+        0,
+    );
     send_agent_hello(
         &mut listener,
         tun::AgentHello {
@@ -660,6 +671,7 @@ async fn run_tun_agent(
             timestamp,
             hmac,
             session: None,
+            forward: None,
         },
     )
     .await?;
@@ -682,27 +694,30 @@ async fn run_tun_agent(
                 return Err(err);
             }
         };
-        if let tun::ServerMsg::SessionOffer(session) = msg {
-            let mut stop_rx2 = stop_rx.clone();
-            match net::sock::backend_kind() {
-                net::sock::BackendKind::Uring => {
-                    net::sock::uring::spawn(async move {
-                        if let Err(e) =
-                            handle_session(ingress, key_id, secret, session, &mut stop_rx2).await
-                        {
-                            error!("tun handle_session failed: {e}");
-                        }
-                    });
-                }
-                _ => {
-                    tokio::task::spawn_local(async move {
-                        if let Err(e) =
-                            handle_session(ingress, key_id, secret, session, &mut stop_rx2).await
-                        {
-                            error!("tun handle_session failed: {e}");
-                        }
-                    });
-                }
+        let (session, ingress) = match msg {
+            tun::ServerMsg::ForwardRequest(forward) => (forward.session, forward.request.from),
+            tun::ServerMsg::SessionOffer(session) => (session, ingress),
+            _ => continue,
+        };
+        let mut stop_rx2 = stop_rx.clone();
+        match net::sock::backend_kind() {
+            net::sock::BackendKind::Uring => {
+                net::sock::uring::spawn(async move {
+                    if let Err(e) =
+                        handle_session(ingress, key_id, secret, session, &mut stop_rx2).await
+                    {
+                        error!("tun handle_session failed: {e}");
+                    }
+                });
+            }
+            _ => {
+                tokio::task::spawn_local(async move {
+                    if let Err(e) =
+                        handle_session(ingress, key_id, secret, session, &mut stop_rx2).await
+                    {
+                        error!("tun handle_session failed: {e}");
+                    }
+                });
             }
         }
     }
@@ -726,6 +741,8 @@ async fn handle_session(
         timestamp,
         tun::Intent::Connect,
         Some(&session),
+        None,
+        0,
     );
     send_agent_hello(
         &mut agent_conn,
@@ -736,6 +753,7 @@ async fn handle_session(
             timestamp,
             hmac,
             session: Some(session),
+            forward: None,
         },
     )
     .await?;
@@ -749,19 +767,20 @@ async fn handle_session(
         }
     };
 
-    let mut target_conn = net::sock::Connection::connect(target).await?;
+    let mut target_conn = net::sock::LureConnection::connect(target).await?;
     // If the server already sent some tunneled bytes after TargetAddr in the same read,
     // forward them to the target before switching to passthrough.
     if !buf.is_empty() {
         let leftover = std::mem::take(&mut buf);
         let _ = target_conn.write_all(leftover).await?;
     }
-    net::sock::passthrough_basic(&mut agent_conn, &mut target_conn).await?;
+    let handle = agent_conn.into_proxy(target_conn)?;
+    handle.future.await?;
     Ok(())
 }
 
 async fn read_server_msg(
-    conn: &mut net::sock::Connection,
+    conn: &mut net::sock::LureConnection,
     buf: &mut Vec<u8>,
     read_buf: &mut Vec<u8>,
     stop_rx: &mut watch::Receiver<bool>,
@@ -789,7 +808,7 @@ async fn read_server_msg(
 }
 
 async fn send_agent_hello(
-    conn: &mut net::sock::Connection,
+    conn: &mut net::sock::LureConnection,
     hello: tun::AgentHello,
 ) -> anyhow::Result<()> {
     let mut buf = Vec::new();
