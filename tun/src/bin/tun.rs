@@ -640,8 +640,9 @@ async fn handle_session(
         }
     };
     info!(
-        "session forwarded: key_id={} session={session_prefix} (connecting back to edge)",
-        config.label
+        "session forwarded: key_id={} session={session_prefix} (connecting back to edge, wire_version={})",
+        config.label,
+        tun::VERSION
     );
     let mut agent_conn = tun::connect_agent(ingress).await?;
     tune_socket(&agent_conn);
@@ -758,7 +759,11 @@ async fn listen_once(
     )
     .await?;
 
-    info!("sent listen hello: key_id={}", config.label);
+    info!(
+        "sent listen hello: key_id={} wire_version={}",
+        config.label,
+        tun::VERSION
+    );
 
     let mut buf = Vec::new();
     let mut read_buf = vec![0u8; 1024];
@@ -840,8 +845,9 @@ async fn run_many(ingress: SocketAddr, configs: Vec<TunConfig>) -> anyhow::Resul
     }
 
     info!(
-        "starting minitun singleton: endpoint={ingress} keys={}",
-        configs.len()
+        "starting minitun singleton: endpoint={ingress} keys={} wire_version={}",
+        configs.len(),
+        tun::VERSION
     );
     for config in configs {
         info!("registering tunnel key: key_id={}", config.label);

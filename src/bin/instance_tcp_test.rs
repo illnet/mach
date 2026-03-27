@@ -163,6 +163,7 @@ async fn run_suite(cfg: SuiteConfig) -> anyhow::Result<()> {
             priority: 0,
             flags: None,
             tunnel_token: None,
+            ..Default::default()
         }],
         ..Default::default()
     };

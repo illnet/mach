@@ -135,6 +135,16 @@ pub struct RouteConfig {
     pub priority: i32,
     /// Additional flags to apply.
     pub flags: Option<RouteFlagsConfig>,
+    /// Legacy flat route flag fields kept for backward compatibility.
+    pub proxy_protocol: Option<bool>,
+    pub cache_query: Option<bool>,
+    pub override_query: Option<bool>,
+    pub preserve_host: Option<bool>,
+    pub tunnel: Option<bool>,
+    pub redirection: Option<bool>,
+    pub allows_local: Option<bool>,
+    pub auth_mode: Option<String>,
+    pub allowed_tokens: Option<Vec<String>>,
     /// Optional tunnel token (hex or base64, 32 bytes).
     pub tunnel_token: Option<String>,
 }
@@ -320,7 +330,8 @@ impl RouteConfig {
                 None
             };
 
-        let (flags, auth_mode) = if let Some(flags_cfg) = &self.flags {
+        let effective_flags = self.effective_flags();
+        let (flags, auth_mode) = if let Some(flags_cfg) = effective_flags.as_ref() {
             let attr = flags_cfg.to_attr();
             let auth_mode = flags_cfg.parse_auth_mode(offset)?;
             (attr, auth_mode)
@@ -398,6 +409,44 @@ impl RouteFlagsConfig {
                 "route entry {route_offset} has invalid auth_mode \"{other}\", must be \"public\", \"protected\", or \"restricted\""
             ),
         }
+    }
+}
+
+impl RouteConfig {
+    fn effective_flags(&self) -> Option<RouteFlagsConfig> {
+        self.flags.clone().or_else(|| self.legacy_flags())
+    }
+
+    fn legacy_flags(&self) -> Option<RouteFlagsConfig> {
+        let has_legacy_fields = self.proxy_protocol.is_some()
+            || self.cache_query.is_some()
+            || self.override_query.is_some()
+            || self.preserve_host.is_some()
+            || self.tunnel.is_some()
+            || self.redirection.is_some()
+            || self.allows_local.is_some()
+            || self.auth_mode.is_some()
+            || self.allowed_tokens.is_some();
+
+        if !has_legacy_fields {
+            return None;
+        }
+
+        Some(RouteFlagsConfig {
+            disabled: false,
+            proxy_protocol: self.proxy_protocol.unwrap_or(false),
+            cache_query: self.cache_query.unwrap_or(false),
+            override_query: self.override_query.unwrap_or(false),
+            preserve_host: self.preserve_host.unwrap_or(false),
+            tunnel: self.tunnel.unwrap_or(false),
+            redirection: self.redirection.unwrap_or(false),
+            allows_local: self.allows_local.unwrap_or(false),
+            auth_mode: self
+                .auth_mode
+                .clone()
+                .unwrap_or_else(default_auth_mode),
+            allowed_tokens: self.allowed_tokens.clone().unwrap_or_default(),
+        })
     }
 }
 
@@ -542,5 +591,63 @@ mod tests {
         let attr = flags.to_attr();
         assert!(attr.contains(RouteFlags::Redirection));
         assert!(attr.contains(RouteFlags::AllowsLocal));
+    }
+
+    #[test]
+    fn routeconfig_supports_legacy_flat_flags() {
+        let route: RouteConfig = toml::from_str(
+            r#"
+            matcher = "legacy.example.com"
+            endpoint = "127.0.0.1:25565"
+            preserve_host = true
+            proxy_protocol = true
+            tunnel = true
+            auth_mode = "restricted"
+            allowed_tokens = ["0011223344556677"]
+            "#,
+        )
+        .expect("route config should deserialize");
+
+        let effective = route.effective_flags().expect("legacy flags should be detected");
+        assert!(effective.preserve_host);
+        assert!(effective.proxy_protocol);
+        assert!(effective.tunnel);
+        assert_eq!(effective.auth_mode, "restricted");
+        assert_eq!(effective.allowed_tokens, vec!["0011223344556677"]);
+
+        let compiled = route.to_route(0).expect("route should compile");
+        assert!(compiled.flags.contains(RouteFlags::PreserveHost));
+        assert!(compiled.flags.contains(RouteFlags::ProxyProtocol));
+        assert!(compiled.flags.contains(RouteFlags::Tunnel));
+        match compiled.auth_mode {
+            AuthMode::Restricted { allowed_tokens } => {
+                assert_eq!(allowed_tokens.len(), 1);
+                assert_eq!(
+                    allowed_tokens[0],
+                    [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]
+                );
+            }
+            other => panic!("expected restricted auth mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn routeconfig_prefers_nested_flags_over_legacy_flat_flags() {
+        let route: RouteConfig = toml::from_str(
+            r#"
+            matcher = "nested.example.com"
+            endpoint = "127.0.0.1:25565"
+            preserve_host = true
+
+            [flags]
+            preserve_host = false
+            proxy_protocol = true
+            "#,
+        )
+        .expect("route config should deserialize");
+
+        let effective = route.effective_flags().expect("nested flags should be detected");
+        assert!(!effective.preserve_host);
+        assert!(effective.proxy_protocol);
     }
 }

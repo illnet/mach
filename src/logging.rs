@@ -62,6 +62,56 @@ impl LureLogger {
         warn!("Parser failed during {stage} for client {addr}: {err}");
     }
 
+    pub fn tunnel_protocol_rejected(addr: &SocketAddr, version: u8, current: u8) {
+        warn!(
+            "Rejected tunnel protocol version {version} from {addr}; current supported version is {current}"
+        );
+        sentry::with_scope(
+            |scope| {
+                scope.set_tag("event", "tunnel_protocol_rejected");
+                scope.set_tag("peer_addr", addr.to_string());
+                scope.set_tag("tunnel_version", version.to_string());
+                scope.set_tag("tunnel_current_version", current.to_string());
+            },
+            || {
+                sentry::capture_message(
+                    &format!(
+                        "Rejected tunnel protocol version {version} from {addr}; current version {current}"
+                    ),
+                    sentry::Level::Warning,
+                );
+            },
+        );
+    }
+
+    pub fn tunnel_legacy_protocol(
+        addr: &SocketAddr,
+        version: u8,
+        current: u8,
+        intent: tun::Intent,
+    ) {
+        warn!(
+            "Accepted legacy tunnel protocol version {version} from {addr}; current version is {current} (intent={intent:?})"
+        );
+        sentry::with_scope(
+            |scope| {
+                scope.set_tag("event", "tunnel_protocol_legacy");
+                scope.set_tag("peer_addr", addr.to_string());
+                scope.set_tag("tunnel_version", version.to_string());
+                scope.set_tag("tunnel_current_version", current.to_string());
+                scope.set_tag("tunnel_intent", format!("{intent:?}"));
+            },
+            || {
+                sentry::capture_message(
+                    &format!(
+                        "Accepted legacy tunnel protocol version {version} from {addr} (current {current}, intent {intent:?})"
+                    ),
+                    sentry::Level::Warning,
+                );
+            },
+        );
+    }
+
     pub fn backend_failure(
         client: Option<&SocketAddr>,
         backend: SocketAddr,

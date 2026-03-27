@@ -22,6 +22,7 @@ pub enum TunnelError {
 
 pub const MAGIC: [u8; 4] = *b"LTUN";
 pub const VERSION: u8 = 3;
+pub const LEGACY_VERSION: u8 = 2;
 const MAX_SOCKET_ADDR_PAYLOAD_LEN: usize = 19;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +113,7 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
     }
 
     let version = buf[4];
-    if version != VERSION {
+    if version != VERSION && version != LEGACY_VERSION {
         return Err(TunnelError::UnsupportedVersion(version));
     }
 
@@ -123,6 +124,9 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
     }
 
     let intent = Intent::from_u8(buf[5])?;
+    if version < VERSION && matches!(intent, Intent::Forward) {
+        return Err(TunnelError::UnsupportedVersion(version));
+    }
 
     let mut key_id = [0u8; 8];
     key_id.copy_from_slice(&buf[6..14]);
@@ -525,6 +529,47 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_agent_hello_legacy_v2_listen_is_accepted() {
+        let hello = AgentHello {
+            version: LEGACY_VERSION,
+            intent: Intent::Listen,
+            key_id: [3u8; 8],
+            timestamp: 1234567890,
+            hmac: [55u8; 32],
+            session: None,
+            forward: None,
+        };
+        let mut buf = Vec::new();
+        encode_agent_hello(&hello, &mut buf).unwrap();
+
+        let (decoded, consumed) = decode_agent_hello(&buf).unwrap().unwrap();
+        assert_eq!(decoded.version, LEGACY_VERSION);
+        assert_eq!(decoded.intent, Intent::Listen);
+        assert_eq!(consumed, 54);
+    }
+
+    #[test]
+    fn test_decode_agent_hello_legacy_v2_connect_is_accepted() {
+        let hello = AgentHello {
+            version: LEGACY_VERSION,
+            intent: Intent::Connect,
+            key_id: [4u8; 8],
+            timestamp: 9876543210,
+            hmac: [56u8; 32],
+            session: Some([57u8; 32]),
+            forward: None,
+        };
+        let mut buf = Vec::new();
+        encode_agent_hello(&hello, &mut buf).unwrap();
+
+        let (decoded, consumed) = decode_agent_hello(&buf).unwrap().unwrap();
+        assert_eq!(decoded.version, LEGACY_VERSION);
+        assert_eq!(decoded.intent, Intent::Connect);
+        assert_eq!(decoded.session, hello.session);
+        assert_eq!(consumed, 86);
+    }
+
+    #[test]
     fn test_decode_agent_hello_forward_roundtrip() {
         let request = TunnelAgentRequest {
             from: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), 25565),
@@ -593,6 +638,18 @@ mod tests {
         assert!(matches!(
             decode_agent_hello(&buf),
             Err(TunnelError::UnsupportedVersion(99))
+        ));
+    }
+
+    #[test]
+    fn test_decode_agent_hello_legacy_v2_forward_is_rejected() {
+        let mut buf = MAGIC.to_vec();
+        buf.push(LEGACY_VERSION);
+        buf.push(Intent::Forward as u8);
+        buf.extend_from_slice(&[0u8; 48]);
+        assert!(matches!(
+            decode_agent_hello(&buf),
+            Err(TunnelError::UnsupportedVersion(LEGACY_VERSION))
         ));
     }
 

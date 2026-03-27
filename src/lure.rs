@@ -537,10 +537,16 @@ impl Lure {
                         None,
                     );
                 } else {
+                    if let Some(version) = unsupported_tunnel_version(err) {
+                        LureLogger::tunnel_protocol_rejected(&client_addr, version, tun::VERSION);
+                    }
                     LureLogger::parser_failure(&client_addr, "client handshake", err);
                 }
             })?
             .inspect_err(|err| {
+                if let Some(version) = unsupported_tunnel_version(err) {
+                    LureLogger::tunnel_protocol_rejected(&client_addr, version, tun::VERSION);
+                }
                 LureLogger::parser_failure(&client_addr, "client handshake", err);
             })?;
 
@@ -551,6 +557,14 @@ impl Lure {
                 raw,
             } => (handshake, buffered, raw),
             IngressHello::Tunnel { hello } => {
+                if hello.version < tun::VERSION {
+                    LureLogger::tunnel_legacy_protocol(
+                        &client_addr,
+                        hello.version,
+                        tun::VERSION,
+                        hello.intent,
+                    );
+                }
                 if let Err(err) = self.handle_tunnel_ingress(connection, hello).await {
                     LureLogger::tunnel_ingress_error("handle_tunnel_ingress", &err);
                     return Err(err);
@@ -1397,6 +1411,13 @@ fn decode_handshake_frame(frame: &net::PacketFrame) -> anyhow::Result<HandshakeC
         return Err(ProtoError::TrailingBytes(body.len()).into());
     }
     Ok(pkt)
+}
+
+fn unsupported_tunnel_version(err: &anyhow::Error) -> Option<u8> {
+    match err.downcast_ref::<tun::TunnelError>() {
+        Some(tun::TunnelError::UnsupportedVersion(version)) => Some(*version),
+        _ => None,
+    }
 }
 
 enum IngressHello {
