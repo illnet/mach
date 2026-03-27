@@ -664,7 +664,12 @@ impl Lure {
                     "CacheQuery cache miss for tunnel route {}, serving placeholder",
                     route_id
                 );
-                query::send_status_failure(&mut client, &config, "OVERRIDE_QUERY").await?;
+                query::send_status_failure(
+                    &mut client,
+                    &config,
+                    "TUNNEL_CACHE_MISS",
+                )
+                .await?;
                 query::handle_ping_pong_local(&mut client, self.threat).await?;
                 return Ok(());
             }

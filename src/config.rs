@@ -239,6 +239,7 @@ fn default_string_value_for(key: &str) -> Option<&'static str> {
         "STATUS_HANDSHAKE_FAILED" => Some("Backend did not complete the handshake"),
         "STATUS_INVALID_RESPONSE" => Some("Backend returned an invalid status response"),
         "OVERRIDE_QUERY" => Some("Query handled by gateway"),
+        "TUNNEL_CACHE_MISS" => Some("Status unavailable while tunnel cache is warming"),
         "LOCAL_NOT_ALLOWED" => Some("Local backend is not allowed on this route"),
         "TUNNEL_TOKEN_MISSING" => Some("Tunnel is unavailable for this route"),
         _ => None,
