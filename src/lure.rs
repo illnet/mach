@@ -602,7 +602,9 @@ impl Lure {
         };
 
         match hs.next_state {
-            HandshakeNextState::Status => self.handle_status(handler, &hs, resolved).await,
+            HandshakeNextState::Status => {
+                self.handle_status(handler, &hs, resolved, handshake_raw).await
+            }
             HandshakeNextState::Login => {
                 self.handle_proxy(handler, &hs, resolved, handshake_raw)
                     .await
@@ -615,6 +617,7 @@ impl Lure {
         mut client: EncodedConnection,
         handshake: &OwnedHandshake,
         resolved: Option<ResolvedRoute>,
+        handshake_raw: Vec<u8>,
     ) -> anyhow::Result<()> {
         const INTENT: ClientIntent = ClientIntent {
             tag: IntentTag::Query,
@@ -630,6 +633,8 @@ impl Lure {
 
         let route = &resolved.route;
         let route_id = route.id;
+        let tunnel = resolved.tunnel;
+        let requested_tunnel = route_requests_tunnel(route, tunnel);
 
         // Check OverrideQuery flag: serve placeholder without contacting backend
         if route.override_query() {
@@ -658,88 +663,114 @@ impl Lure {
                 route_id
             );
 
-            // Tunnel backends are unreachable via direct TCP; on cache miss serve placeholder.
-            if route.tunnel() {
-                debug!(
-                    "CacheQuery cache miss for tunnel route {}, serving placeholder",
-                    route_id
-                );
-                query::send_status_failure(
-                    &mut client,
-                    &config,
-                    "TUNNEL_CACHE_MISS",
-                )
-                .await?;
-                query::handle_ping_pong_local(&mut client, self.threat).await?;
-                return Ok(());
-            }
         }
 
         // Live backend query path (used when cache_query is false, or on cache miss)
         let backend_addr = resolved.endpoint;
         let backend_label = backend_addr.to_string();
 
-        let backend = match backend::connect(
-            backend_addr,
-            handshake,
-            Some(resolved.endpoint_host.as_str()),
-            backend_addr.port(),
-            route.preserve_host(),
-            route.proxied(),
-            &config,
-            client_addr,
-        )
-        .await
-        {
-            Ok(connection) => connection,
-            Err(backend::BackendConnectError::Connect(err)) => {
-                if err.downcast_ref::<Elapsed>().is_some() {
-                    LureLogger::deadline_missed(
-                        "backend connect",
-                        Duration::from_secs(3),
-                        Some(&client_addr),
-                        Some(&backend_label),
-                    );
-                } else {
-                    LureLogger::backend_failure(Some(&client_addr), backend_addr, "connect", &err);
-                }
+        let mut server = if requested_tunnel {
+            let Some(key_id) = self.resolve_tunnel_key_id(route, tunnel).await else {
                 self.status_error(
                     &mut client,
                     &config,
-                    "MESSAGE_CANNOT_CONNECT",
-                    "Backend is offline or unreachable",
+                    "TUNNEL_TOKEN_MISSING",
+                    "Tunnel is unavailable for this route",
                 )
                 .await?;
                 return Ok(());
-            }
-            Err(backend::BackendConnectError::Handshake(err)) => {
-                if err.downcast_ref::<Elapsed>().is_some() {
-                    LureLogger::deadline_missed(
-                        "backend handshake",
-                        Duration::from_secs(1),
-                        Some(&client_addr),
-                        Some(&backend_label),
-                    );
-                } else {
+            };
+
+            match self
+                .open_tunnel_status_connection(route.as_ref(), backend_addr, key_id, &handshake_raw)
+                .await
+            {
+                Ok(server) => server,
+                Err(err) => {
                     LureLogger::backend_failure(
                         Some(&client_addr),
                         backend_addr,
-                        "handshake",
+                        "tunnel connect",
                         &err,
                     );
+                    self.status_error(
+                        &mut client,
+                        &config,
+                        "TUNNEL_UNAVAILABLE",
+                        "Tunnel is unavailable or not ready",
+                    )
+                    .await?;
+                    return Ok(());
                 }
-                self.status_error(
-                    &mut client,
-                    &config,
-                    "STATUS_HANDSHAKE_FAILED",
-                    "Backend did not complete the handshake",
-                )
-                .await?;
-                return Ok(());
             }
-        };
+        } else {
+            let backend = match backend::connect(
+                backend_addr,
+                handshake,
+                Some(resolved.endpoint_host.as_str()),
+                backend_addr.port(),
+                route.preserve_host(),
+                route.proxied(),
+                &config,
+                client_addr,
+            )
+            .await
+            {
+                Ok(connection) => connection,
+                Err(backend::BackendConnectError::Connect(err)) => {
+                    if err.downcast_ref::<Elapsed>().is_some() {
+                        LureLogger::deadline_missed(
+                            "backend connect",
+                            Duration::from_secs(3),
+                            Some(&client_addr),
+                            Some(&backend_label),
+                        );
+                    } else {
+                        LureLogger::backend_failure(
+                            Some(&client_addr),
+                            backend_addr,
+                            "connect",
+                            &err,
+                        );
+                    }
+                    self.status_error(
+                        &mut client,
+                        &config,
+                        "MESSAGE_CANNOT_CONNECT",
+                        "Backend is offline or unreachable",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(backend::BackendConnectError::Handshake(err)) => {
+                    if err.downcast_ref::<Elapsed>().is_some() {
+                        LureLogger::deadline_missed(
+                            "backend handshake",
+                            Duration::from_secs(1),
+                            Some(&client_addr),
+                            Some(&backend_label),
+                        );
+                    } else {
+                        LureLogger::backend_failure(
+                            Some(&client_addr),
+                            backend_addr,
+                            "handshake",
+                            &err,
+                        );
+                    }
+                    self.status_error(
+                        &mut client,
+                        &config,
+                        "STATUS_HANDSHAKE_FAILED",
+                        "Backend did not complete the handshake",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
 
-        let mut server = EncodedConnection::new(backend, SocketIntent::GreetToBackend);
+            EncodedConnection::new(backend, SocketIntent::GreetToBackend)
+        };
 
         let req = match self
             .threat
@@ -927,32 +958,7 @@ impl Lure {
         let server_address = session.destination_addr;
         // Tenant tunnel key is optional. We only hard-require it when an endpoint explicitly opts
         // into tunnel mode with @tunnel-key or @<key_id>.
-        let resolved_key_id: Option<TokenKeyId> = match tunnel {
-            crate::router::TunnelOpt::KeyId(id) => Some(TokenKeyId(id)),
-            crate::router::TunnelOpt::ZoneDefault => {
-                self.tunnels.key_id_for_zone(route.zone).await.or_else(|| {
-                    route.tunnel_token.map(|token| {
-                        // v2 backcompat: use the first 8 bytes of the 32-byte route token as key_id for HMAC.
-                        TokenKeyId({
-                            let mut arr = [0u8; 8];
-                            arr.copy_from_slice(&token[..8]);
-                            arr
-                        })
-                    })
-                })
-            }
-            crate::router::TunnelOpt::None => {
-                if let Some(token) = route.tunnel_token {
-                    Some(TokenKeyId({
-                        let mut arr = [0u8; 8];
-                        arr.copy_from_slice(&token[..8]);
-                        arr
-                    }))
-                } else {
-                    self.tunnels.key_id_for_zone(route.zone).await
-                }
-            }
-        };
+        let resolved_key_id = self.resolve_tunnel_key_id(route.as_ref(), tunnel).await;
 
         if requested_tunnel {
             if let Some(key_id) = resolved_key_id {
@@ -1021,6 +1027,42 @@ impl Lure {
     ) -> anyhow::Result<()> {
         let _ = route; // key selection is performed in the caller
 
+        let agent_connection = self
+            .open_tunnel_connection(route, session.destination_addr, key_id)
+            .await?;
+
+        let mut agent = EncodedConnection::new(agent_connection, SocketIntent::GreetToBackend);
+        agent.send_raw(&handshake_raw).await?;
+        agent.send_raw(login_raw).await?;
+
+        let pending = client.take_pending_inbound();
+        if !pending.is_empty() {
+            agent.send_raw(&pending).await?;
+        }
+
+        passthrough_now(client.into_inner(), agent.into_inner(), session).await?;
+        Ok(())
+    }
+
+    async fn open_tunnel_status_connection(
+        &self,
+        route: &Route,
+        target: SocketAddr,
+        key_id: TokenKeyId,
+        handshake_raw: &[u8],
+    ) -> anyhow::Result<EncodedConnection> {
+        let connection = self.open_tunnel_connection(route, target, key_id).await?;
+        let mut server = EncodedConnection::new(connection, SocketIntent::GreetToBackend);
+        server.send_raw(handshake_raw).await?;
+        Ok(server)
+    }
+
+    async fn open_tunnel_connection(
+        &self,
+        route: &Route,
+        target: SocketAddr,
+        key_id: TokenKeyId,
+    ) -> anyhow::Result<crate::sock::LureConnection> {
         let mut session_bytes = [0u8; 32];
         fill_random(&mut session_bytes)?;
         let session_token = SessionToken(session_bytes);
@@ -1034,17 +1076,17 @@ impl Lure {
                     ttl: 1,
                     tunnel_agent_request: tun::TunnelAgentRequest {
                         from: self.tunnel_forward_addr().await?,
-                        to: session.destination_addr,
+                        to: target,
                     },
                 },
-                session.destination_addr,
+                target,
                 &route.auth_mode,
                 self.tunnel_agent_dispatch().await?,
             )
             .await?;
 
-        let agent_connection = match timeout(Duration::from_secs(10), receiver).await {
-            Ok(Ok(conn)) => conn,
+        match timeout(Duration::from_secs(10), receiver).await {
+            Ok(Ok(conn)) => Ok(conn),
             Ok(Err(_)) => {
                 self.tunnels
                     .rollback_local_session(key_id, session_token)
@@ -1057,19 +1099,7 @@ impl Lure {
                     .await;
                 anyhow::bail!("tunnel agent connect timeout");
             }
-        };
-
-        let mut agent = EncodedConnection::new(agent_connection, SocketIntent::GreetToBackend);
-        agent.send_raw(&handshake_raw).await?;
-        agent.send_raw(login_raw).await?;
-
-        let pending = client.take_pending_inbound();
-        if !pending.is_empty() {
-            agent.send_raw(&pending).await?;
         }
-
-        passthrough_now(client.into_inner(), agent.into_inner(), session).await?;
-        Ok(())
     }
 
     async fn handle_tunnel_ingress(
@@ -1140,6 +1170,38 @@ impl Lure {
             TunnelAgentMode::Slave
         } else {
             TunnelAgentMode::Master
+        }
+    }
+
+    async fn resolve_tunnel_key_id(
+        &self,
+        route: &Route,
+        tunnel: crate::router::TunnelOpt,
+    ) -> Option<TokenKeyId> {
+        match tunnel {
+            crate::router::TunnelOpt::KeyId(id) => Some(TokenKeyId(id)),
+            crate::router::TunnelOpt::ZoneDefault => {
+                self.tunnels.key_id_for_zone(route.zone).await.or_else(|| {
+                    route.tunnel_token.map(|token| {
+                        TokenKeyId({
+                            let mut arr = [0u8; 8];
+                            arr.copy_from_slice(&token[..8]);
+                            arr
+                        })
+                    })
+                })
+            }
+            crate::router::TunnelOpt::None => {
+                if let Some(token) = route.tunnel_token {
+                    Some(TokenKeyId({
+                        let mut arr = [0u8; 8];
+                        arr.copy_from_slice(&token[..8]);
+                        arr
+                    }))
+                } else {
+                    self.tunnels.key_id_for_zone(route.zone).await
+                }
+            }
         }
     }
 
@@ -1448,6 +1510,14 @@ fn unsupported_tunnel_version(err: &anyhow::Error) -> Option<u8> {
     match err.downcast_ref::<tun::TunnelError>() {
         Some(tun::TunnelError::UnsupportedVersion(version)) => Some(*version),
         _ => None,
+    }
+}
+
+fn route_requests_tunnel(route: &Route, tunnel: crate::router::TunnelOpt) -> bool {
+    match tunnel {
+        crate::router::TunnelOpt::KeyId(_) => true,
+        crate::router::TunnelOpt::ZoneDefault => true,
+        crate::router::TunnelOpt::None => route.tunnel(),
     }
 }
 
