@@ -1,4 +1,5 @@
 use std::{
+    error::Error,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
@@ -945,7 +946,15 @@ impl Lure {
                     .await
                     .map_err(|e| {
                         let re = ReportableError::from(e);
-                        LureLogger::tunnel_session_error("session handling", &server_address, &re);
+                        LureLogger::tunnel_session_error(
+                            "session handling",
+                            &server_address,
+                            format_args!(
+                                "{re}; backend={}; cause={:#}",
+                                socket_backend_label(backend_kind()),
+                                re.source().unwrap_or(&re)
+                            ),
+                        );
                         re
                     });
                 return Ok(());
@@ -1417,6 +1426,14 @@ fn unsupported_tunnel_version(err: &anyhow::Error) -> Option<u8> {
     match err.downcast_ref::<tun::TunnelError>() {
         Some(tun::TunnelError::UnsupportedVersion(version)) => Some(*version),
         _ => None,
+    }
+}
+
+fn socket_backend_label(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Tokio => "tokio",
+        BackendKind::Epoll => "epoll",
+        BackendKind::Uring => "uring",
     }
 }
 
