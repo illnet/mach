@@ -7,6 +7,17 @@ use crate::{
     threat::{ClientFail, ClientIntent, IntentTag, ThreatControlService},
 };
 
+fn string_or_fallback(config: &LureConfig, key: &str, fallback: &str) -> String {
+    let value = config.string_value(key);
+    let value = value.as_ref();
+    let missing_marker = format!("{key}-is-not-written");
+    if value == missing_marker {
+        fallback.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 pub fn placeholder_status_response(brand: &str, message: &str) -> String {
     json!({
         "version": {
@@ -21,9 +32,17 @@ pub fn placeholder_status_response(brand: &str, message: &str) -> String {
 }
 
 pub fn placeholder_status_json(config: &LureConfig, label: &str) -> String {
-    let brand = config.string_value("SERVER_LIST_BRAND");
-    let target_label = config.string_value(label);
-    placeholder_status_response(brand.as_ref(), target_label.as_ref())
+    placeholder_status_json_with_fallback(config, label, "Gateway error")
+}
+
+pub fn placeholder_status_json_with_fallback(
+    config: &LureConfig,
+    label: &str,
+    fallback: &str,
+) -> String {
+    let brand = string_or_fallback(config, "SERVER_LIST_BRAND", "Lure");
+    let target_label = string_or_fallback(config, label, fallback);
+    placeholder_status_response(&brand, &target_label)
 }
 
 pub async fn send_status_failure(
@@ -32,6 +51,19 @@ pub async fn send_status_failure(
     label: &str,
 ) -> anyhow::Result<()> {
     let placeholder = placeholder_status_json(config, label);
+    client
+        .send(&net::StatusResponseS2c { json: &placeholder })
+        .await?;
+    Ok(())
+}
+
+pub async fn send_status_failure_with_fallback(
+    client: &mut EncodedConnection,
+    config: &LureConfig,
+    label: &str,
+    fallback: &str,
+) -> anyhow::Result<()> {
+    let placeholder = placeholder_status_json_with_fallback(config, label, fallback);
     client
         .send(&net::StatusResponseS2c { json: &placeholder })
         .await?;

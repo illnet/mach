@@ -1,5 +1,4 @@
 use std::{
-    error::Error,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
@@ -624,7 +623,8 @@ impl Lure {
         let client_addr = *client.as_inner().addr();
         let config = self.config_snapshot().await;
         let Some(resolved) = resolved else {
-            self.status_error(&mut client, &config).await?;
+            self.status_error(&mut client, &config, "ROUTE_NOT_FOUND", "Server route not found")
+                .await?;
             return Ok(());
         };
 
@@ -698,7 +698,13 @@ impl Lure {
                 } else {
                     LureLogger::backend_failure(Some(&client_addr), backend_addr, "connect", &err);
                 }
-                self.status_error(&mut client, &config).await?;
+                self.status_error(
+                    &mut client,
+                    &config,
+                    "MESSAGE_CANNOT_CONNECT",
+                    "Backend is offline or unreachable",
+                )
+                .await?;
                 return Ok(());
             }
             Err(backend::BackendConnectError::Handshake(err)) => {
@@ -717,7 +723,13 @@ impl Lure {
                         &err,
                     );
                 }
-                self.status_error(&mut client, &config).await?;
+                self.status_error(
+                    &mut client,
+                    &config,
+                    "STATUS_HANDSHAKE_FAILED",
+                    "Backend did not complete the handshake",
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -755,7 +767,13 @@ impl Lure {
             Ok(r) => r,
             Err(err) => {
                 LureLogger::parser_failure(&client_addr, "backend status response", &err);
-                self.status_error(&mut client, &config).await?;
+                self.status_error(
+                    &mut client,
+                    &config,
+                    "STATUS_INVALID_RESPONSE",
+                    "Backend returned an invalid status response",
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -949,11 +967,8 @@ impl Lure {
                         LureLogger::tunnel_session_error(
                             "session handling",
                             &server_address,
-                            format_args!(
-                                "{re}; backend={}; cause={:#}",
-                                socket_backend_label(backend_kind()),
-                                re.source().unwrap_or(&re)
-                            ),
+                            Some(socket_backend_label(backend_kind())),
+                            &re,
                         );
                         re
                     });
@@ -1294,9 +1309,11 @@ impl Lure {
         &self,
         client: &mut EncodedConnection,
         config: &LureConfig,
+        label: &str,
+        fallback: &str,
     ) -> anyhow::Result<()> {
         self.metrics.record_failure("status");
-        query::send_status_failure(client, config, "ERROR").await
+        query::send_status_failure_with_fallback(client, config, label, fallback).await
     }
 
     async fn disconnect_login<F, S, L>(

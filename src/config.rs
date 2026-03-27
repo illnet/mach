@@ -229,6 +229,22 @@ fn default_auth_mode() -> String {
     "protected".to_string()
 }
 
+fn default_string_value_for(key: &str) -> Option<&'static str> {
+    match key {
+        "SERVER_LIST_BRAND" => Some("Lure"),
+        "ROUTE_NOT_FOUND" => Some("Route not found"),
+        "SERVER_OFFLINE" => Some("Server offline"),
+        "ERROR" => Some("Gateway error"),
+        "MESSAGE_CANNOT_CONNECT" => Some("Backend is offline or unreachable"),
+        "STATUS_HANDSHAKE_FAILED" => Some("Backend did not complete the handshake"),
+        "STATUS_INVALID_RESPONSE" => Some("Backend returned an invalid status response"),
+        "OVERRIDE_QUERY" => Some("Query handled by gateway"),
+        "LOCAL_NOT_ALLOWED" => Some("Local backend is not allowed on this route"),
+        "TUNNEL_TOKEN_MISSING" => Some("Tunnel is unavailable for this route"),
+        _ => None,
+    }
+}
+
 impl Default for LureConfig {
     fn default() -> Self {
         Self {
@@ -283,6 +299,7 @@ impl LureConfig {
         self.strings
             .get(key)
             .cloned()
+            .or_else(|| default_string_value_for(key).map(Arc::from))
             .unwrap_or_else(|| Arc::from(format!("{key}-is-not-written")))
     }
 }
@@ -591,6 +608,21 @@ mod tests {
         let attr = flags.to_attr();
         assert!(attr.contains(RouteFlags::Redirection));
         assert!(attr.contains(RouteFlags::AllowsLocal));
+    }
+
+    #[test]
+    fn string_value_uses_builtin_fallbacks_for_common_user_messages() {
+        let config = LureConfig::default();
+
+        assert_eq!(config.string_value("SERVER_LIST_BRAND").as_ref(), "Lure");
+        assert_eq!(
+            config.string_value("MESSAGE_CANNOT_CONNECT").as_ref(),
+            "Backend is offline or unreachable"
+        );
+        assert_eq!(
+            config.string_value("STATUS_INVALID_RESPONSE").as_ref(),
+            "Backend returned an invalid status response"
+        );
     }
 
     #[test]

@@ -116,10 +116,12 @@ pub async fn passthrough_now(
     let (ra, rb, _rc) = tokio::join!(la, lb, lc);
 
     if let Err(era) = ra {
-        LureLogger::connection_error(&cad, Some(&rad), &era);
+        let err = ReportableError::from(era);
+        LureLogger::connection_error(&cad, Some(&rad), &err);
     }
     if let Err(erb) = rb {
-        LureLogger::connection_error(&cad, Some(&rad), &erb);
+        let err = ReportableError::from(erb);
+        LureLogger::connection_error(&cad, Some(&rad), &err);
     }
 
     Ok(())
