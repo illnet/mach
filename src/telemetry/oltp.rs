@@ -1,10 +1,9 @@
 #![allow(dead_code)]
 
-use std::{collections::HashMap, env, time::Duration};
-
+use std::env;
 use log::info;
 use opentelemetry::{KeyValue, global};
-use opentelemetry_otlp::{self, Protocol, WithExportConfig, WithHttpConfig};
+use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::{
     Resource,
     metrics::SdkMeterProvider,
@@ -61,126 +60,42 @@ pub fn create_resource_from_env() -> Resource {
 
     Resource::builder().with_attributes(attributes).build()
 }
-fn parse_headers() -> HashMap<String, String> {
-    let mut map: HashMap<String, String> = HashMap::new();
-    if let Ok(header_str) = dotenvy::var("OTEL_EXPORTER_OTLP_HEADERS") {
-        // Expect "key1=val1,key2=val2"
-        for pair in header_str.split(',') {
-            if let Some((k, v)) = pair.split_once('=') {
-                map.insert(k.trim().to_string(), v.trim().to_string());
-            }
-        }
-    }
-    map
-}
-
 fn build_span_exporter() -> opentelemetry_otlp::SpanExporter {
-    let endpoint = dotenvy::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .unwrap_or_else(|_| "http://localhost:4317".into());
-    let protocol = dotenvy::var("OTEL_EXPORTER_OTLP_PROTOCOL")
-        .unwrap_or_else(|_| "grpc".into())
-        .to_lowercase();
-
-    let timeout = dotenvy::var("OTEL_EXPORTER_OTLP_TIMEOUT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .map_or_else(|| Duration::from_secs(3), Duration::from_secs);
-
-    let headers = parse_headers();
-
-    let builder = match protocol.as_str() {
-        // "grpc" | "tonic" => {
-        //     builder = builder.with_tonic();
-        //     builder = builder
-        //         .with_endpoint(endpoint)
-        //         .with_timeout(timeout)
-        //         .with_metadata(headers);
-        // }
-        "http/protobuf" => opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_protocol(Protocol::HttpBinary)
-            .with_endpoint(endpoint)
-            .with_timeout(timeout)
-            .with_headers(headers),
-        "http/json" => opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_protocol(Protocol::HttpJson)
-            .with_endpoint(endpoint)
-            .with_timeout(timeout)
-            .with_headers(headers),
-        other => panic!("Unsupported OTLP_PROTOCOL: {other}"),
-    };
-
+    // SDK reads OTEL_EXPORTER_OTLP_{ENDPOINT,PROTOCOL,TIMEOUT,HEADERS} automatically.
+    // Default protocol: http/protobuf. Only override if the signal-specific endpoint var is set.
+    let mut builder = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_protocol(Protocol::HttpBinary);
+    if let Ok(ep) = env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") {
+        info!("Sending traces to {ep}");
+        builder = builder.with_endpoint(ep);
+    }
     builder.build().expect("failed to build OTLP SpanExporter")
 }
 
 fn build_metric_exporter() -> opentelemetry_otlp::MetricExporter {
-    let endpoint = dotenvy::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .unwrap_or_else(|_| "http://localhost:4318/v1/metrics".into());
-    let protocol = dotenvy::var("OTEL_EXPORTER_OTLP_PROTOCOL")
-        .unwrap_or_else(|_| "grpc".into())
-        .to_lowercase();
-
-    info!("Sending metric to {endpoint}");
-
-    let timeout = dotenvy::var("OTEL_EXPORTER_OTLP_TIMEOUT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .map_or_else(|| Duration::from_secs(3), Duration::from_secs);
-
-    let headers = parse_headers();
-
-    let builder = match protocol.as_str() {
-        // "grpc" | "tonic" => {
-        //     builder = builder.with_tonic();
-        //     builder = builder
-        //         .with_endpoint(endpoint)
-        //         .with_timeout(timeout)
-        //         .with_metadata(headers);
-        // }
-        "http/protobuf" => opentelemetry_otlp::MetricExporter::builder()
-            .with_http()
-            .with_protocol(Protocol::HttpBinary)
-            .with_endpoint(endpoint)
-            .with_timeout(timeout)
-            .with_headers(headers),
-        "http/json" => opentelemetry_otlp::MetricExporter::builder()
-            .with_http()
-            .with_protocol(Protocol::HttpBinary)
-            .with_endpoint(endpoint)
-            .with_timeout(timeout)
-            .with_headers(headers),
-        other => panic!("Unsupported OTLP_PROTOCOL: {other}"),
-    };
-
-    builder
-        .build()
-        .expect("failed to build OTLP MetricExporter")
+    // SDK reads OTEL_EXPORTER_OTLP_{ENDPOINT,PROTOCOL,TIMEOUT,HEADERS} automatically.
+    // Default protocol: http/protobuf. Only override if the signal-specific endpoint var is set.
+    let mut builder = opentelemetry_otlp::MetricExporter::builder()
+        .with_http()
+        .with_protocol(Protocol::HttpBinary);
+    if let Ok(ep) = env::var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") {
+        info!("Sending metrics to {ep}");
+        builder = builder.with_endpoint(ep);
+    }
+    builder.build().expect("failed to build OTLP MetricExporter")
 }
 
 #[must_use]
 pub fn init_tracer() -> SdkTracerProvider {
-    // Common resource, includes service.name and anything else
+    let _ = dotenvy::dotenv();
     let resource = create_resource_from_env();
-
     let span_exporter = build_span_exporter();
 
-    // Configure the tracer provider with batch exporter
+    // SDK reads OTEL_SPAN_EVENT_COUNT_LIMIT, OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT, OTEL_BSP_* automatically
     let tracer_provider = trace::SdkTracerProvider::builder()
         .with_sampler(Sampler::AlwaysOn)
         .with_id_generator(RandomIdGenerator::default())
-        .with_max_events_per_span(
-            dotenvy::var("OTEL_SPAN_MAX_EVENTS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(64),
-        )
-        .with_max_attributes_per_span(
-            dotenvy::var("OTEL_SPAN_MAX_ATTRIBUTES")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(16),
-        )
         .with_batch_exporter(span_exporter)
         .with_resource(resource)
         .build();
@@ -191,9 +106,11 @@ pub fn init_tracer() -> SdkTracerProvider {
 
 #[must_use]
 pub fn init_meter() -> SdkMeterProvider {
+    let _ = dotenvy::dotenv();
     let metric_exporter = build_metric_exporter();
     let resource = create_resource_from_env();
 
+    // SDK reads OTEL_METRIC_EXPORT_INTERVAL automatically (default 60s)
     let meter_provider = SdkMeterProvider::builder()
         .with_periodic_exporter(metric_exporter)
         .with_resource(resource);
