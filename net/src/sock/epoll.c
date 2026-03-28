@@ -545,8 +545,7 @@ typedef struct {
     size_t a2b_pipe_len;
     size_t b2a_pipe_len;
 
-    uint64_t c2s_bytes, s2c_bytes;
-    uint64_t c2s_chunks, s2c_chunks;
+    LureEpollLiveBytes *live;  /* Rust-allocated live counter region (may be NULL) */
 
     uint32_t abort_flag;   /* set atomically from other threads */
     uint32_t stall_ticks;  /* watchdog: ticks with no chunk progress */
@@ -561,6 +560,7 @@ typedef struct {
 typedef struct PendingSubmit {
     int fd_a, fd_b;
     uint64_t conn_id;
+    LureEpollLiveBytes *live;
     struct PendingSubmit *next;
 } PendingSubmit;
 
@@ -629,10 +629,10 @@ static void wslot_release(LureEpollWorker *w, uint32_t idx, int32_t result) {
     LureEpollDone done;
     memset(&done, 0, sizeof(done));
     done.conn_id    = s->conn_id;
-    done.c2s_bytes  = s->c2s_bytes;
-    done.s2c_bytes  = s->s2c_bytes;
-    done.c2s_chunks = s->c2s_chunks;
-    done.s2c_chunks = s->s2c_chunks;
+    done.c2s_bytes  = s->live ? s->live->c2s_bytes  : 0;
+    done.s2c_bytes  = s->live ? s->live->s2c_bytes  : 0;
+    done.c2s_chunks = s->live ? s->live->c2s_chunks : 0;
+    done.s2c_chunks = s->live ? s->live->s2c_chunks : 0;
     done.result     = result;
     (void)write(w->done_pipe_write, &done, sizeof(done));
 
@@ -660,7 +660,8 @@ static void wslot_release(LureEpollWorker *w, uint32_t idx, int32_t result) {
 
 /* ---- wsubmit_now: allocate slot and register with epoll ------------------- */
 
-static void wsubmit_now(LureEpollWorker *w, int fd_a, int fd_b, uint64_t conn_id) {
+static void wsubmit_now(LureEpollWorker *w, int fd_a, int fd_b, uint64_t conn_id,
+                        LureEpollLiveBytes *live) {
     /* No free slots — signal error and close fds. */
     if (w->free_head < 0) {
         LureEpollDone done;
@@ -682,6 +683,7 @@ static void wsubmit_now(LureEpollWorker *w, int fd_a, int fd_b, uint64_t conn_id
     s->fd_a      = fd_a;
     s->fd_b      = fd_b;
     s->conn_id   = conn_id;
+    s->live      = live;
     s->active    = 1;
     s->next_free = -1;
     s->a2b_pipe[0] = s->a2b_pipe[1] = -1;
@@ -769,11 +771,11 @@ static void wslot_process_event(LureEpollWorker *w, uint32_t idx,
         if (side == SIDE_A) {
             rc = splice_forward(s->fd_a, s->a2b_pipe[1], s->a2b_pipe[0],
                                 s->fd_b, &s->a2b_pipe_len, &s->eof_a);
-            if (rc == 0) s->c2s_chunks++;
+            if (rc == 0 && s->live) s->live->c2s_chunks++;
         } else {
             rc = splice_forward(s->fd_b, s->b2a_pipe[1], s->b2a_pipe[0],
                                 s->fd_a, &s->b2a_pipe_len, &s->eof_b);
-            if (rc == 0) s->s2c_chunks++;
+            if (rc == 0 && s->live) s->live->s2c_chunks++;
         }
         if (rc < 0) {
             wslot_release(w, idx, rc);
@@ -787,16 +789,26 @@ static void wslot_process_event(LureEpollWorker *w, uint32_t idx,
             while (s->b2a_pipe_len > 0) {
                 ssize_t n = splice(s->b2a_pipe[0], NULL, s->fd_a, NULL,
                                    s->b2a_pipe_len, SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
-                if (n > 0) { s->b2a_pipe_len -= (size_t)n; s->s2c_bytes += (uint64_t)n; }
-                else break;
+                if (n > 0) {
+                    s->b2a_pipe_len -= (size_t)n;
+                    if (s->live) {
+                        s->live->s2c_bytes   += (uint64_t)n;
+                        s->live->s2c_chunks  += 1;
+                    }
+                } else break;
             }
         } else {
             /* Drain a2b pipe to B (c2s direction). */
             while (s->a2b_pipe_len > 0) {
                 ssize_t n = splice(s->a2b_pipe[0], NULL, s->fd_b, NULL,
                                    s->a2b_pipe_len, SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
-                if (n > 0) { s->a2b_pipe_len -= (size_t)n; s->c2s_bytes += (uint64_t)n; }
-                else break;
+                if (n > 0) {
+                    s->a2b_pipe_len -= (size_t)n;
+                    if (s->live) {
+                        s->live->c2s_bytes   += (uint64_t)n;
+                        s->live->c2s_chunks  += 1;
+                    }
+                } else break;
             }
         }
     }
@@ -830,7 +842,7 @@ static void process_submits(LureEpollWorker *w) {
     while (head) {
         PendingSubmit *cur = head;
         head = head->next;
-        wsubmit_now(w, cur->fd_a, cur->fd_b, cur->conn_id);
+        wsubmit_now(w, cur->fd_a, cur->fd_b, cur->conn_id, cur->live);
         free(cur);
     }
 }
@@ -868,7 +880,7 @@ static void scan_stale_slots(LureEpollWorker *w) {
             continue;
         }
 
-        uint64_t chunks = s->c2s_chunks + s->s2c_chunks;
+        uint64_t chunks = (s->live ? (s->live->c2s_chunks + s->live->s2c_chunks) : 0);
         if (chunks == s->prev_chunks) {
             s->stall_ticks++;
             if (s->stall_ticks >= WORKER_STALL_TICKS_MAX) {
@@ -994,7 +1006,7 @@ LureEpollWorker *lure_epoll_worker_new(int done_pipe_write_fd) {
 }
 
 int lure_epoll_worker_submit(LureEpollWorker *w, int fd_a, int fd_b,
-                             uint64_t conn_id) {
+                             uint64_t conn_id, LureEpollLiveBytes *live) {
     PendingSubmit *node = (PendingSubmit *)malloc(sizeof(PendingSubmit));
     if (!node) {
         /* C closes the fds since caller relinquished ownership. */
@@ -1005,6 +1017,7 @@ int lure_epoll_worker_submit(LureEpollWorker *w, int fd_a, int fd_b,
     node->fd_a    = fd_a;
     node->fd_b    = fd_b;
     node->conn_id = conn_id;
+    node->live    = live;
     node->next    = NULL;
 
     pthread_mutex_lock(&w->queue_lock);

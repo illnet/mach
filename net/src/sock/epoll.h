@@ -55,6 +55,19 @@ typedef struct {
     uint32_t _pad;
 } LureEpollDone;
 
+/*
+ * Live byte/chunk counters shared with Rust for mid-session polling.
+ * Allocated and owned by Rust; passed to C at submit time.
+ * C writes plain (non-atomic) u64 values; Rust reads via read_volatile.
+ * Cache-line aligned (64 bytes) to avoid false sharing with other slot data.
+ */
+typedef struct __attribute__((aligned(64))) {
+    uint64_t c2s_bytes;
+    uint64_t s2c_bytes;
+    uint64_t c2s_chunks;
+    uint64_t s2c_chunks;
+} LureEpollLiveBytes;
+
 typedef struct LureEpollWorker LureEpollWorker;
 
 /*
@@ -68,11 +81,12 @@ LureEpollWorker* lure_epoll_worker_new(int done_pipe_write_fd);
 /*
  * Submit a connection pair to the worker.  The worker takes ownership of
  * fd_a and fd_b (it will close them when done, including on error).
+ * live points to Rust-allocated LureEpollLiveBytes for mid-session polling.
  * Returns 0 on success or -ENOMEM if the submit node cannot be allocated
  * (in which case fd_a/fd_b are closed by this function before returning).
  */
 int lure_epoll_worker_submit(LureEpollWorker* w, int fd_a, int fd_b,
-                             uint64_t conn_id);
+                             uint64_t conn_id, LureEpollLiveBytes* live);
 
 /* Request abort of the connection identified by conn_id. No-op if not found. */
 void lure_epoll_worker_abort(LureEpollWorker* w, uint64_t conn_id);

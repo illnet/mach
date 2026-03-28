@@ -528,6 +528,29 @@ const _: () = assert!(
     "LureEpollDone C/Rust size mismatch"
 );
 
+/// Live byte/chunk counters shared with C worker for mid-session polling.
+/// Rust allocates this, passes pointer to C; C writes plain u64 values.
+/// Rust polls via read_volatile every 100ms. Cache-line aligned to avoid false sharing.
+#[repr(C, align(64))]
+pub struct LureEpollLiveBytes {
+    pub c2s_bytes: u64,
+    pub s2c_bytes: u64,
+    pub c2s_chunks: u64,
+    pub s2c_chunks: u64,
+    // 32 bytes of implicit padding to fill cache line (compiler respects align(64))
+}
+
+impl LureEpollLiveBytes {
+    pub unsafe fn read_volatile(&self) -> EpollStats {
+        EpollStats {
+            c2s_bytes: unsafe { ptr::read_volatile(&raw const self.c2s_bytes) },
+            s2c_bytes: unsafe { ptr::read_volatile(&raw const self.s2c_bytes) },
+            c2s_chunks: unsafe { ptr::read_volatile(&raw const self.c2s_chunks) },
+            s2c_chunks: unsafe { ptr::read_volatile(&raw const self.s2c_chunks) },
+        }
+    }
+}
+
 #[repr(C)]
 struct LureEpollWorkerC {
     _private: [u8; 0],
@@ -543,6 +566,7 @@ unsafe extern "C" {
         fd_a: c_int,
         fd_b: c_int,
         conn_id: u64,
+        live: *mut LureEpollLiveBytes,
     ) -> c_int;
     fn lure_epoll_worker_abort(w: *mut LureEpollWorkerC, conn_id: u64);
     fn lure_epoll_worker_shutdown(w: *mut LureEpollWorkerC);
@@ -642,27 +666,37 @@ impl EpollManager {
 
     /// Submit a connection pair.  C takes ownership of both fds (closes them
     /// on completion or error).  Returns a receiver that resolves with the
-    /// final [`EpollDone`].
+    /// final [`EpollDone`] and a Box of live byte counters for mid-session polling.
     pub fn submit(
         &self,
         fd_a: RawFd,
         fd_b: RawFd,
-    ) -> io::Result<tokio::sync::oneshot::Receiver<EpollDone>> {
+    ) -> io::Result<(
+        tokio::sync::oneshot::Receiver<EpollDone>,
+        Box<LureEpollLiveBytes>,
+    )> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
 
+        let live = Box::new(LureEpollLiveBytes {
+            c2s_bytes: 0,
+            s2c_bytes: 0,
+            c2s_chunks: 0,
+            s2c_chunks: 0,
+        });
+
         let n = self.workers.len();
         let idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % n;
-        // SAFETY: ptr is valid; fd_a/fd_b ownership transferred to C.
-        let rc = unsafe { lure_epoll_worker_submit(self.workers[idx].ptr, fd_a, fd_b, id) };
+        // SAFETY: ptr is valid; fd_a/fd_b ownership transferred to C; live pointer is valid for session lifetime.
+        let rc = unsafe { lure_epoll_worker_submit(self.workers[idx].ptr, fd_a, fd_b, id, live.as_ref() as *const LureEpollLiveBytes as *mut _) };
         if rc < 0 {
             // C closed fd_a/fd_b already; just clean up the pending entry.
             self.pending.lock().unwrap().remove(&id);
             return Err(io::Error::from_raw_os_error(-rc));
         }
 
-        Ok(rx)
+        Ok((rx, live))
     }
 
     fn deliver(&self, frame: LureEpollDoneC) {
@@ -785,10 +819,30 @@ impl Connection {
         })?;
 
         // After submit, C owns fd_a/fd_b — do not close on error here.
-        let rx = mgr.submit(fd_a, fd_b)?;
+        let (rx, live) = mgr.submit(fd_a, fd_b)?;
 
         let progress = Arc::new(crate::sock::ProxyProgress::default());
         let prog2 = Arc::clone(&progress);
+        let prog_observer = Arc::clone(&progress);
+
+        // Spawn observer task to poll live counters every 100ms
+        tokio::task::spawn_local(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            loop {
+                interval.tick().await;
+                // SAFETY: live is valid and owned by this task; C writes until session close.
+                let snap = unsafe { live.read_volatile() };
+                prog_observer.c2s_bytes.store(snap.c2s_bytes, Ordering::Relaxed);
+                prog_observer.s2c_bytes.store(snap.s2c_bytes, Ordering::Relaxed);
+                prog_observer.c2s_chunks.store(snap.c2s_chunks, Ordering::Relaxed);
+                prog_observer.s2c_chunks.store(snap.s2c_chunks, Ordering::Relaxed);
+                // Keep observing until prog_observer is the last strong reference (session end)
+                if Arc::strong_count(&prog_observer) == 1 {
+                    break;
+                }
+            }
+            // live is dropped here after C is done writing (confirmed by session close)
+        });
 
         let future: Pin<
             Box<dyn Future<Output = io::Result<crate::sock::ProxyStats>> + Send + 'static>,
