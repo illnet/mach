@@ -19,11 +19,11 @@ use crate::{
 
 #[must_use]
 pub fn get_meter() -> Meter {
-    global::meter_provider().meter("alure")
+    global::meter_provider().meter("lure")
 }
 #[must_use]
 pub fn get_tracer() -> BoxedTracer {
-    global::tracer_provider().tracer("alure")
+    global::tracer_provider().tracer("lure")
 }
 
 #[derive(Serialize, Deserialize, Debug)]

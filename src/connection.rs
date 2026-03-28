@@ -60,8 +60,14 @@ struct ConnectionMetric {
 impl ConnectionMetric {
     fn new(metric: &Meter) -> Self {
         Self {
-            packet_count: metric.u64_counter("lure_proxy_packet_count").build(),
-            packet_size: metric.u64_histogram("lure_proxy_packet_size").build(),
+            packet_count: metric
+                .u64_counter("lure_proxy_packet")
+                .with_unit("{packet}")
+                .build(),
+            packet_size: metric
+                .u64_histogram("lure_proxy_packet_size")
+                .with_unit("By")
+                .build(),
         }
     }
 }

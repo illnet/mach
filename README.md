@@ -182,6 +182,103 @@ rewrite them into one or more `minitun` services based on endpoint grouping.
 You can also edit the small variable block at the top of the script instead of
 exporting overrides inline.
 
+## Observability (OTLP)
+
+Lure exports metrics and traces via OpenTelemetry Protocol (OTLP).
+
+### Enabling export
+
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` to your collector address:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 ./lure
+```
+
+Per-signal overrides are also supported:
+
+```bash
+OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://otel-collector:4318/v1/metrics
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://otel-collector:4317
+```
+
+Default protocol is `http/protobuf`. The meter and tracer scope name is `lure`.
+
+### Metric reference
+
+All metric names use underscores. Units are specified via OTel `.with_unit()`;
+exported metrics include unit annotations (e.g. `{packet}`, `By`, `ms`, `us`).
+
+#### Handshake metrics
+
+| Metric | Type | Unit | Attributes | Description |
+|---|---|---|---|---|
+| `lure_socket_open` | Counter | `{connection}` | — | TCP connections accepted |
+| `lure_handshake` | Counter | `{handshake}` | `state` | Handshake attempts (status or login) |
+| `lure_handshake_fail` | Counter | `{handshake}` | `state` | Failed handshakes |
+| `lure_handshake_duration` | Histogram | `ms` | `state` | Handshake round-trip time |
+
+`state` values: `status` (status-ping), `login`.
+
+#### Router metrics
+
+| Metric | Type | Unit | Description |
+|---|---|---|---|
+| `lure_router_routes` | Gauge | `{route}` | Active configured routes |
+| `lure_router_route_resolve` | Counter | `1` | Route lookups performed |
+| `lure_router_sessions` | Gauge | `{session}` | Active proxy sessions |
+| `lure_router_session_create` | Counter | `{session}` | Sessions created |
+| `lure_router_session_destroy` | Counter | `{session}` | Sessions destroyed |
+
+#### Proxy metrics
+
+| Metric | Type | Unit | Attributes | Description |
+|---|---|---|---|---|
+| `lure_proxy_packet` | Counter | `{packet}` | `intent` | Packets during handshake |
+| `lure_proxy_packet_size` | Histogram | `By` | `intent` | Packet size during handshake |
+| `lure_proxy_transport_volume` | Counter | `By` | `intent` | Bytes transferred in passthrough |
+| `lure_proxy_transport_packet` | Counter | `{packet}` | `intent` | Packets in passthrough |
+
+`intent` values: `frontbound` / `backbound` (handshake); `c2s` / `s2c` (passthrough).
+
+#### Tokio runtime metrics (stable)
+
+Emitted every 30 seconds. Triplet metrics (`*_total`, `*_max`, `*_min`) report
+three independent data points per interval.
+
+| Metric | Type | Unit | Description |
+|---|---|---|---|
+| `lure_runtime_workers` | Gauge | `{thread}` | Worker thread count |
+| `lure_runtime_park_total` | Gauge | `{park}` | Total worker park events |
+| `lure_runtime_park_max` | Gauge | `{park}` | Max worker park events |
+| `lure_runtime_park_min` | Gauge | `{park}` | Min worker park events |
+| `lure_runtime_busy_duration_total` | Counter | `us` | Total cumulative busy time |
+| `lure_runtime_busy_duration_max` | Counter | `us` | Busiest worker duration |
+| `lure_runtime_busy_duration_min` | Counter | `us` | Least busy worker duration |
+| `lure_runtime_queue_depth` | Gauge | `{task}` | Global task queue depth |
+
+#### Tokio runtime metrics (unstable)
+
+Requires `tokio_unstable` feature (enabled by default). Same reporting period as stable metrics.
+
+| Metric | Type | Unit | Description |
+|---|---|---|---|
+| `lure_runtime_noop_total`, `*_max`, `*_min` | Counter | `{noop}` | No-op polls |
+| `lure_runtime_steal_total`, `*_max`, `*_min` | Counter | `{steal}` | Tasks stolen between workers |
+| `lure_runtime_steal_operations_total`, `*_max`, `*_min` | Counter | `{operation}` | Work-stealing operations |
+| `lure_runtime_remote_schedule` | Counter | `{task}` | Tasks scheduled from outside |
+| `lure_runtime_local_schedule_total`, `*_max`, `*_min` | Counter | `{task}` | Tasks on local queues |
+| `lure_runtime_overflow_total`, `*_max`, `*_min` | Counter | `{overflow}` | Local queue overflows |
+| `lure_runtime_polls_total`, `*_max`, `*_min` | Counter | `{poll}` | Future polls |
+| `lure_runtime_local_queue_depth_total`, `*_max`, `*_min` | Gauge | `{task}` | Per-worker queue depth |
+| `lure_runtime_blocking_queue_depth` | Gauge | `{task}` | Blocking task queue depth |
+| `lure_runtime_tasks_live` | Gauge | `{task}` | Live (not dropped) tasks |
+| `lure_runtime_threads_blocking` | Gauge | `{thread}` | Blocking thread pool size |
+| `lure_runtime_threads_blocking_idle` | Gauge | `{thread}` | Idle blocking threads |
+| `lure_runtime_budget_forced_yield` | Counter | `{yield}` | Budget-forced task yields |
+| `lure_runtime_io_driver_ready` | Counter | `{event}` | I/O driver ready events |
+| `lure_runtime_busy_ratio` | Gauge | `1` | Runtime busy fraction (0.0–1.0) |
+| `lure_runtime_mean_polls_per_park` | Gauge | `{poll}` | Average polls between park events |
+
 ## Env Vars
 
 - `LURE_RPC`: RPC backend URL (optional)
@@ -190,7 +287,17 @@ exporting overrides inline.
 - `MINITUN_ENDPOINT`: endpoint for `minitun agent`
 - `MINITUN_TOKENS`: comma/newline-separated `key_id:secret` list for singleton `minitun`
 - `MINITUN_TOKEN`: single-token shorthand for `minitun`
-- `OTEL_EXPORTER_OTLP_ENDPOINT`: enable OTEL export when set
+- **OTLP / Observability:**
+  - `OTEL_EXPORTER_OTLP_ENDPOINT`: gRPC/HTTP collector endpoint; enables both metrics and traces
+  - `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`: metrics-only collector (overrides `ENDPOINT`)
+  - `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`: traces-only collector (overrides `ENDPOINT`)
+  - `OTEL_METRIC_EXPORT_INTERVAL`: meter push interval in ms (default: 60000)
+  - `OTEL_SERVICE_NAME`: service name resource attribute (default: `unknown-service`)
+  - `OTEL_SERVICE_VERSION`: service version resource attribute (optional)
+  - `OTEL_SERVICE_NAMESPACE`: service namespace resource attribute (optional)
+  - `OTEL_SERVICE_INSTANCE_ID`: instance ID resource attribute (optional)
+  - `OTEL_DEPLOYMENT_ENVIRONMENT`: deployment environment (optional)
+  - `OTEL_RESOURCE_ATTRIBUTES`: comma-separated `key=value` pairs for custom resource attributes (optional)
 - `LURE_ENABLE_TOKIO_CONSOLE=1`: enable Tokio console tracing subscriber
 - `LURE_IO_EPOLL=1`: enable epoll backend (beta)
 - `LURE_IO_URING=1`: enable tokio-uring backend (not recommended; requires `--features uring`)
