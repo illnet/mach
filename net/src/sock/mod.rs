@@ -560,21 +560,71 @@ pub struct ProxyStats {
     pub s2c_chunks: u64,
 }
 
+#[cfg(target_os = "linux")]
+impl From<epoll::EpollStats> for ProxyStats {
+    fn from(stats: epoll::EpollStats) -> Self {
+        ProxyStats {
+            c2s_bytes: stats.c2s_bytes,
+            s2c_bytes: stats.s2c_bytes,
+            c2s_chunks: stats.c2s_chunks,
+            s2c_chunks: stats.s2c_chunks,
+        }
+    }
+}
+
 /// Live-updatable progress counters for an in-flight proxy session.
 ///
 /// Updated with `Relaxed` ordering — values are approximate and intended for
 /// monitoring (OTEL metrics), not synchronization.
-#[derive(Default)]
+///
+/// On the epoll backend, `live` points directly to C's volatile counters,
+/// and `snapshot()` reads from there instead of the atomic fields below.
+/// On tokio/uring backends, `live` is `None` and the atomics are used.
 pub struct ProxyProgress {
     pub c2s_bytes: AtomicU64,
     pub s2c_bytes: AtomicU64,
     pub c2s_chunks: AtomicU64,
     pub s2c_chunks: AtomicU64,
+    // Only set for epoll backend. If present, snapshot() reads from here.
+    #[cfg(target_os = "linux")]
+    live: Option<Arc<epoll::LureEpollLiveBytes>>,
+}
+
+impl Default for ProxyProgress {
+    fn default() -> Self {
+        Self {
+            c2s_bytes: AtomicU64::new(0),
+            s2c_bytes: AtomicU64::new(0),
+            c2s_chunks: AtomicU64::new(0),
+            s2c_chunks: AtomicU64::new(0),
+            #[cfg(target_os = "linux")]
+            live: None,
+        }
+    }
 }
 
 impl ProxyProgress {
+    /// Create a new ProxyProgress backed by epoll live counters.
+    #[cfg(target_os = "linux")]
+    pub fn from_live(live: Arc<epoll::LureEpollLiveBytes>) -> Self {
+        Self {
+            c2s_bytes: AtomicU64::new(0),
+            s2c_bytes: AtomicU64::new(0),
+            c2s_chunks: AtomicU64::new(0),
+            s2c_chunks: AtomicU64::new(0),
+            live: Some(live),
+        }
+    }
+
     /// Snapshot current counters (approximate).
     pub fn snapshot(&self) -> ProxyStats {
+        // On epoll, read directly from C's volatile counters via live pointer.
+        #[cfg(target_os = "linux")]
+        if let Some(live) = &self.live {
+            return unsafe { live.read_volatile() }.into();
+        }
+
+        // On other backends, read from atomic fields.
         ProxyStats {
             c2s_bytes: self.c2s_bytes.load(Ordering::Relaxed),
             s2c_bytes: self.s2c_bytes.load(Ordering::Relaxed),

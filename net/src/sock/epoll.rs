@@ -673,13 +673,13 @@ impl EpollManager {
         fd_b: RawFd,
     ) -> io::Result<(
         tokio::sync::oneshot::Receiver<EpollDone>,
-        Box<LureEpollLiveBytes>,
+        Arc<LureEpollLiveBytes>,
     )> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
 
-        let live = Box::new(LureEpollLiveBytes {
+        let live = Arc::new(LureEpollLiveBytes {
             c2s_bytes: 0,
             s2c_bytes: 0,
             c2s_chunks: 0,
@@ -689,7 +689,7 @@ impl EpollManager {
         let n = self.workers.len();
         let idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % n;
         // SAFETY: ptr is valid; fd_a/fd_b ownership transferred to C; live pointer is valid for session lifetime.
-        let rc = unsafe { lure_epoll_worker_submit(self.workers[idx].ptr, fd_a, fd_b, id, live.as_ref() as *const LureEpollLiveBytes as *mut _) };
+        let rc = unsafe { lure_epoll_worker_submit(self.workers[idx].ptr, fd_a, fd_b, id, Arc::as_ptr(&live) as *mut _) };
         if rc < 0 {
             // C closed fd_a/fd_b already; just clean up the pending entry.
             self.pending.lock().unwrap().remove(&id);
@@ -821,28 +821,8 @@ impl Connection {
         // After submit, C owns fd_a/fd_b — do not close on error here.
         let (rx, live) = mgr.submit(fd_a, fd_b)?;
 
-        let progress = Arc::new(crate::sock::ProxyProgress::default());
-        let prog2 = Arc::clone(&progress);
-        let prog_observer = Arc::clone(&progress);
-
-        // Spawn observer task to poll live counters every 100ms
-        tokio::task::spawn_local(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(100));
-            loop {
-                interval.tick().await;
-                // SAFETY: live is valid and owned by this task; C writes until session close.
-                let snap = unsafe { live.read_volatile() };
-                prog_observer.c2s_bytes.store(snap.c2s_bytes, Ordering::Relaxed);
-                prog_observer.s2c_bytes.store(snap.s2c_bytes, Ordering::Relaxed);
-                prog_observer.c2s_chunks.store(snap.c2s_chunks, Ordering::Relaxed);
-                prog_observer.s2c_chunks.store(snap.s2c_chunks, Ordering::Relaxed);
-                // Keep observing until prog_observer is the last strong reference (session end)
-                if Arc::strong_count(&prog_observer) == 1 {
-                    break;
-                }
-            }
-            // live is dropped here after C is done writing (confirmed by session close)
-        });
+        // ProxyProgress backed directly by C's volatile counters; no observer task needed.
+        let progress = Arc::new(crate::sock::ProxyProgress::from_live(live));
 
         let future: Pin<
             Box<dyn Future<Output = io::Result<crate::sock::ProxyStats>> + Send + 'static>,
@@ -861,11 +841,6 @@ impl Connection {
                 c2s_chunks: done.stats.c2s_chunks,
                 s2c_chunks: done.stats.s2c_chunks,
             };
-            // Update progress with final stats so callers see the complete picture.
-            prog2.c2s_bytes.store(stats.c2s_bytes, Ordering::Relaxed);
-            prog2.s2c_bytes.store(stats.s2c_bytes, Ordering::Relaxed);
-            prog2.c2s_chunks.store(stats.c2s_chunks, Ordering::Relaxed);
-            prog2.s2c_chunks.store(stats.s2c_chunks, Ordering::Relaxed);
             Ok(stats)
         });
 
