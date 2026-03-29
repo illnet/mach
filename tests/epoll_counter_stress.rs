@@ -11,10 +11,18 @@
 
 #![cfg(target_os = "linux")]
 
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
-use std::time::Instant;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
+
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 
 /// Test configuration for different stress levels
 #[derive(Clone, Debug)]
@@ -31,7 +39,7 @@ impl StressConfig {
     fn light() -> Self {
         Self {
             num_connections: 20,
-            bytes_per_conn: 1024 * 1024,      // 1 MB per conn
+            bytes_per_conn: 1024 * 1024, // 1 MB per conn
             poll_interval_ms: 50,
         }
     }
@@ -39,7 +47,7 @@ impl StressConfig {
     fn medium() -> Self {
         Self {
             num_connections: 100,
-            bytes_per_conn: 1024 * 1024,      // 1 MB per conn
+            bytes_per_conn: 1024 * 1024, // 1 MB per conn
             poll_interval_ms: 100,
         }
     }
@@ -47,7 +55,7 @@ impl StressConfig {
     fn heavy() -> Self {
         Self {
             num_connections: 300,
-            bytes_per_conn: 512 * 1024,       // 512 KB per conn
+            bytes_per_conn: 512 * 1024, // 512 KB per conn
             poll_interval_ms: 100,
         }
     }
@@ -55,7 +63,7 @@ impl StressConfig {
     fn extreme() -> Self {
         Self {
             num_connections: 1000,
-            bytes_per_conn: 256 * 1024,       // 256 KB per conn
+            bytes_per_conn: 256 * 1024, // 256 KB per conn
             poll_interval_ms: 200,
         }
     }
@@ -114,10 +122,7 @@ async fn echo_server(listener: TcpListener, done: Arc<AtomicU64>) {
 }
 
 /// Single client connection: write N bytes, read N bytes back
-async fn client_conn(
-    server_addr: &str,
-    bytes_to_send: usize,
-) -> std::io::Result<(u64, u64)> {
+async fn client_conn(server_addr: &str, bytes_to_send: usize) -> std::io::Result<(u64, u64)> {
     let mut socket = TcpStream::connect(server_addr).await?;
     let test_data = vec![0x42u8; 8192];
 
@@ -228,7 +233,8 @@ async fn run_stress_test(config: StressConfig) {
 
     // Verify no tearing: all samples should monotonically increase
     assert_eq!(
-        total_sent, total_received,
+        total_sent,
+        total_received,
         "[{}] Echo integrity failed: sent {} but only received {}",
         config.label(),
         total_sent,

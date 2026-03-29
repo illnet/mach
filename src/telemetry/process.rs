@@ -306,10 +306,8 @@ impl ProcessMetricsService {
             .record(metrics.workers_count as u64, common_labels);
         self.park_total
             .record(metrics.total_park_count, common_labels);
-        self.park_max
-            .record(metrics.max_park_count, common_labels);
-        self.park_min
-            .record(metrics.min_park_count, common_labels);
+        self.park_max.record(metrics.max_park_count, common_labels);
+        self.park_min.record(metrics.min_park_count, common_labels);
         self.busy_duration_total.add(
             metrics.total_busy_duration.as_micros() as u64,
             common_labels,

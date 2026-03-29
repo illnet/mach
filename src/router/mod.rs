@@ -634,7 +634,11 @@ impl RouterInstance {
             let attributes = session.inspect.attributes.read().await.clone();
             log::debug!(
                 "inspect_session: id={}, c2s_bytes={}, s2c_bytes={}, c2s_chunks={}, s2c_chunks={}",
-                session.id, traffic.c2s_bytes, traffic.s2c_bytes, traffic.c2s_chunks, traffic.s2c_chunks
+                session.id,
+                traffic.c2s_bytes,
+                traffic.s2c_bytes,
+                traffic.c2s_chunks,
+                traffic.s2c_chunks
             );
             views.push(inspect::inspect_session_to_view(
                 session,

@@ -1,6 +1,7 @@
 /// Integration tests for tunnel protocol and registry
 /// Tests protocol encoding/decoding, registry state management, and concurrent safety
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 #[test]
 fn tunnel_basic_types() {
@@ -317,4 +318,151 @@ fn tunnel_hmac_computation() {
         hmac_forward, hmac_forward_default,
         "Request payload and ttl should affect the HMAC"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tunnel_registry_live_auth_handshake() {
+    use lure::{
+        config::TokenEntry,
+        router::AuthMode,
+        sock::{LureConnection, LureListener},
+        tunnel::{SessionToken, TokenKeyId, TunnelRegistry},
+    };
+    use tokio::{
+        sync::oneshot,
+        task::LocalSet,
+        time::{Duration, timeout},
+    };
+    use tun::{Intent, ServerMsg, compute_agent_hmac, decode_server_msg};
+
+    LocalSet::new()
+        .run_until(async move {
+            let secret = [0x42u8; 32];
+            let key_id = [0x01u8; 8];
+            let session = [0xAAu8; 32];
+            let target: SocketAddr = "127.0.0.1:25565".parse().unwrap();
+
+            let registry = Arc::new(TunnelRegistry::default());
+            registry
+                .upsert_token(&TokenEntry {
+                    key_id: hex::encode(key_id),
+                    secret: hex::encode(secret),
+                    name: Some("integration-test".to_string()),
+                    zone: None,
+                })
+                .await
+                .expect("token upsert should succeed");
+
+            let listener = LureListener::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .expect("listener bind should succeed");
+            let ingress = listener
+                .local_addr()
+                .expect("listener should have local addr");
+
+            let (registered_tx, registered_rx) = oneshot::channel();
+            let registry_task = tokio::task::spawn_local({
+                let registry = Arc::clone(&registry);
+                async move {
+                    let (listener_conn, _) = listener.accept().await?;
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_secs();
+                    let listen_hmac = compute_agent_hmac(
+                        &secret,
+                        &key_id,
+                        timestamp,
+                        Intent::Listen,
+                        None,
+                        None,
+                        0,
+                    );
+                    registry
+                        .register_listener(
+                            TokenKeyId(key_id),
+                            timestamp,
+                            listen_hmac,
+                            listener_conn,
+                        )
+                        .await?;
+                    let _ = registered_tx.send(());
+
+                    let (connect_conn, _) = listener.accept().await?;
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_secs();
+                    let connect_hmac = compute_agent_hmac(
+                        &secret,
+                        &key_id,
+                        timestamp,
+                        Intent::Connect,
+                        Some(&session),
+                        None,
+                        0,
+                    );
+                    registry
+                        .accept_connect(
+                            TokenKeyId(key_id),
+                            timestamp,
+                            connect_hmac,
+                            SessionToken(session),
+                            connect_conn,
+                        )
+                        .await
+                }
+            });
+
+            let _listen_agent = LureConnection::connect(ingress)
+                .await
+                .expect("listen agent should connect");
+            timeout(Duration::from_secs(5), registered_rx)
+                .await
+                .expect("listener registration should complete in time")
+                .expect("listener registration signal should succeed");
+
+            let session_rx = registry
+                .prepare_local_session(
+                    TokenKeyId(key_id),
+                    SessionToken(session),
+                    target,
+                    &AuthMode::Protected,
+                )
+                .await
+                .expect("session preparation should succeed");
+
+            let mut connect_agent = LureConnection::connect(ingress)
+                .await
+                .expect("connect agent should connect");
+
+            let (read, mut buf) = timeout(
+                Duration::from_secs(5),
+                connect_agent.read_chunk(vec![0u8; 64]),
+            )
+            .await
+            .expect("target address frame should arrive in time")
+            .expect("read from authenticated connect should succeed");
+            buf.truncate(read);
+
+            let (msg, consumed) = decode_server_msg(&buf)
+                .expect("target address frame should decode")
+                .expect("target address frame should be complete");
+            assert_eq!(
+                consumed,
+                buf.len(),
+                "decoded frame should consume the buffer"
+            );
+            assert_eq!(msg, ServerMsg::TargetAddr(target));
+
+            let delivered_conn = timeout(Duration::from_secs(5), session_rx)
+                .await
+                .expect("prepared session should complete in time")
+                .expect("prepared session should receive a connection");
+            drop(delivered_conn);
+
+            registry_task
+                .await
+                .expect("registry task should join")
+                .expect("registry operations should succeed");
+        })
+        .await;
 }

@@ -158,13 +158,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
-            let (c2s_bytes, s2c_bytes, c2s_chunks, s2c_chunks) = inspect::take_global_traffic_snapshot();
+            let (c2s_bytes, s2c_bytes, c2s_chunks, s2c_chunks) =
+                inspect::take_global_traffic_snapshot();
             if c2s_bytes > 0 || s2c_bytes > 0 {
                 let c2s_mb = c2s_bytes as f64 / 1_000_000.0;
                 let s2c_mb = s2c_bytes as f64 / 1_000_000.0;
                 log::info!(
                     "traffic_minute: c2s={:.2}MB packets={} s2c={:.2}MB packets={} total={:.2}MB",
-                    c2s_mb, c2s_chunks, s2c_mb, s2c_chunks, (c2s_mb + s2c_mb)
+                    c2s_mb,
+                    c2s_chunks,
+                    s2c_mb,
+                    s2c_chunks,
+                    (c2s_mb + s2c_mb)
                 );
             }
         }

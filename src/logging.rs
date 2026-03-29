@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::Error;
 use log::{debug, error, info, warn};
+
 use crate::error::ReportableError;
 
 pub struct LureLogger;
@@ -95,14 +96,13 @@ impl LureLogger {
     }
 
     pub fn disconnect_failure(addr: &SocketAddr, err: &Error) {
-        debug!("Failed to send disconnect to {addr}: {}", format_anyhow_chain(err));
+        debug!(
+            "Failed to send disconnect to {addr}: {}",
+            format_anyhow_chain(err)
+        );
     }
 
-    pub fn session_creation_failed(
-        addr: &SocketAddr,
-        hostname: &str,
-        err: &Error,
-    ) {
+    pub fn session_creation_failed(addr: &SocketAddr, hostname: &str, err: &Error) {
         debug!(
             "Failed to create session for {addr} (host '{hostname}'): {}",
             format_anyhow_chain(err)

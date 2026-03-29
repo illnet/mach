@@ -603,7 +603,8 @@ impl Lure {
 
         match hs.next_state {
             HandshakeNextState::Status => {
-                self.handle_status(handler, &hs, resolved, handshake_raw).await
+                self.handle_status(handler, &hs, resolved, handshake_raw)
+                    .await
             }
             HandshakeNextState::Login => {
                 self.handle_proxy(handler, &hs, resolved, handshake_raw)
@@ -626,8 +627,13 @@ impl Lure {
         let client_addr = *client.as_inner().addr();
         let config = self.config_snapshot().await;
         let Some(resolved) = resolved else {
-            self.status_error(&mut client, &config, "ROUTE_NOT_FOUND", "Server route not found")
-                .await?;
+            self.status_error(
+                &mut client,
+                &config,
+                "ROUTE_NOT_FOUND",
+                "Server route not found",
+            )
+            .await?;
             return Ok(());
         };
 
@@ -662,7 +668,6 @@ impl Lure {
                 "CacheQuery cache miss for route {}, querying backend",
                 route_id
             );
-
         }
 
         // Live backend query path (used when cache_query is false, or on cache miss)

@@ -365,29 +365,43 @@ pub fn compute_agent_hmac(
     request: Option<&TunnelAgentRequest>,
     ttl: u8,
 ) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
+    use sha2::{Digest, Sha256};
 
-    type HmacSha256 = Hmac<Sha256>;
+    const SHA256_BLOCK_LEN: usize = 64;
+    const IPAD: u8 = 0x36;
+    const OPAD: u8 = 0x5c;
 
-    let mut mac = HmacSha256::new_from_slice(secret).unwrap();
-    mac.update(key_id);
-    mac.update(&timestamp.to_be_bytes());
-    mac.update(&[intent as u8]);
+    let mut inner_key = [IPAD; SHA256_BLOCK_LEN];
+    let mut outer_key = [OPAD; SHA256_BLOCK_LEN];
+    for (idx, byte) in secret.iter().copied().enumerate() {
+        inner_key[idx] ^= byte;
+        outer_key[idx] ^= byte;
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(inner_key);
+    inner.update(key_id);
+    inner.update(timestamp.to_be_bytes());
+    inner.update([intent as u8]);
     if let Some(session) = session {
-        mac.update(session);
+        inner.update(session);
     }
     if let Some(request) = request {
-        mac.update(&[ttl]);
+        inner.update([ttl]);
         let mut buf = Vec::with_capacity(MAX_SOCKET_ADDR_PAYLOAD_LEN * 2);
         encode_socket_addr_payload(request.from, &mut buf);
         encode_socket_addr_payload(request.to, &mut buf);
-        mac.update(&buf);
+        inner.update(buf);
     }
 
-    let result = mac.finalize();
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(outer_key);
+    outer.update(inner_digest);
+
     let mut hmac_array = [0u8; 32];
-    hmac_array.copy_from_slice(result.into_bytes().as_ref());
+    hmac_array.copy_from_slice(&outer.finalize());
     hmac_array
 }
 
@@ -930,6 +944,10 @@ mod tests {
         let hmac = compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None, None, 0);
         // HMAC should be 32 bytes
         assert_eq!(hmac.len(), 32);
+        assert_eq!(
+            hex::encode(hmac),
+            "b7f850cca6d3fe03cab20e28e78bb9656360ec7412cec166f8a22ee011fdb0bc"
+        );
     }
 
     #[test]

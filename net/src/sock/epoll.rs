@@ -689,7 +689,15 @@ impl EpollManager {
         let n = self.workers.len();
         let idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % n;
         // SAFETY: ptr is valid; fd_a/fd_b ownership transferred to C; live pointer is valid for session lifetime.
-        let rc = unsafe { lure_epoll_worker_submit(self.workers[idx].ptr, fd_a, fd_b, id, Arc::as_ptr(&live) as *mut _) };
+        let rc = unsafe {
+            lure_epoll_worker_submit(
+                self.workers[idx].ptr,
+                fd_a,
+                fd_b,
+                id,
+                Arc::as_ptr(&live) as *mut _,
+            )
+        };
         if rc < 0 {
             // C closed fd_a/fd_b already; just clean up the pending entry.
             self.pending.lock().unwrap().remove(&id);

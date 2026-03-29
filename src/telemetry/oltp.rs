@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::env;
+
 use log::info;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::{Protocol, WithExportConfig};
@@ -83,7 +84,9 @@ fn build_metric_exporter() -> opentelemetry_otlp::MetricExporter {
         info!("Sending metrics to {ep}");
         builder = builder.with_endpoint(ep);
     }
-    builder.build().expect("failed to build OTLP MetricExporter")
+    builder
+        .build()
+        .expect("failed to build OTLP MetricExporter")
 }
 
 #[must_use]

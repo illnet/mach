@@ -26,7 +26,7 @@ opentelemetry_sdk = { version = "0.31", features = ["tokio", "tokio-stream", "rt
 serde = { version = "1.0", features = ["derive", "rc"] }
 # tokio = { version = "1.27", features = ["full", "rt-multi-thread", "tracing"] }
 tokio = { version = "1.48", features = ["full", "rt-multi-thread", "tracing"] }
-toml = "0.9"
+toml = "1.1"
 async-trait = "0.1"
 futures = "0.3"
 # Use rustls to support fully-static musl builds (avoid system OpenSSL).
@@ -38,7 +38,7 @@ base64 = "0.22"
 ed25519-dalek = { version = "2.1", features = ["std"] }
 getrandom = "0.4"
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 subtle = "2.5"
 hex = "0.4"
 mimalloc = { version = "0.1", optional = true }

@@ -14,14 +14,16 @@ path = "src/bin/tun.rs"
 [dependencies]
 thiserror = "2.0"
 net = { path = "../net" }
-tokio = { version = "1.48", features = ["full", "rt-multi-thread", "tracing"] }
+tokio = { version = "1.48", features = ["full", "rt-multi-thread", "tracing", "signal", "sync"] }
 base64 = "0.22"
 anyhow = "1.0"
-hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 clap = { version = "4", features = ["derive", "env"] }
 hex = "0.4"
 log = "0.4"
 env_logger = "0.11"
-dotenvy = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.1"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+libc = "0.2"
 sentry = { version = "0.47.0", default-features = false, features = ["backtrace", "contexts", "debug-images", "panic", "reqwest", "rustls", "tokio"] }

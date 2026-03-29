@@ -1,4 +1,10 @@
-use std::{sync::atomic::{AtomicU64, Ordering}, sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use net::{ProxyProgress, ProxyStats};
@@ -54,7 +60,11 @@ fn record_proxy_progress_delta(
     if dc2s_bytes > 0 || ds2c_bytes > 0 || dc2s_chunks > 0 || ds2c_chunks > 0 {
         log::debug!(
             "record_proxy_progress_delta: session_id={}, dc2s_bytes={}, ds2c_bytes={}, dc2s_chunks={}, ds2c_chunks={}",
-            inspect.id, dc2s_bytes, ds2c_bytes, dc2s_chunks, ds2c_chunks
+            inspect.id,
+            dc2s_bytes,
+            ds2c_bytes,
+            dc2s_chunks,
+            ds2c_chunks
         );
         volume_record.add(dc2s_bytes, core::slice::from_ref(c2st));
         volume_record.add(ds2c_bytes, core::slice::from_ref(s2ct));

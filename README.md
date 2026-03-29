@@ -133,54 +133,43 @@ LURE_IO_URING=1 cargo run --features uring
 Need NAT passthrough? Lure can hand a connection to a tunnel agent that lives inside the network.
 
 - Docs: `docs/tunnel.md`
-- Security model: only to traverse NAT. yet encryptions needed, as internet is not that hell scary...
+- Security model: only to traverse NAT (TLS/VPN recommended for encryption)
 
-Route example:
+### Agent Setup
+
+Create `~/.config/minitun.toml`:
+
+```toml
+[[tunnel]]
+endpoints = ["lure.example.com:25577"]
+token = "0011223344556677:8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f00112233445566778899aabb"
+```
+
+Run the agent:
+
+```bash
+minitun install --token 0011223344556677:8f1f2a3b... --endpoints lure.example.com:25577
+minitun run
+```
+
+### Route Configuration
+
+Add tunnel flags to a route in Lure's `settings.toml`:
 
 ```toml
 [[route]]
 matcher = "behind-nat.example.com"
 endpoint = "10.0.0.12:25565"
 priority = 0
-tunnel_token = "8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f00112233445566778899aabb" # lowkey not real token
 
 [route.flags]
 tunnel = true
+tunnel_token = "8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f00112233445566778899aabb"
 ```
 
-Then run `minitun` with one or more tunnel keys:
+### More Details
 
-```sh
-./minitun agent endpoint:25565 \
-  --token <KEY_ID_HEX_A>:<SECRET_HEX_A> \
-  --token <KEY_ID_HEX_B>:<SECRET_HEX_B>
-```
-
-Or use env for the singleton service layout:
-
-```sh
-MINITUN_ENDPOINT="endpoint:25565" \
-MINITUN_TOKENS="<KEY_ID_HEX_A>:<SECRET_HEX_A>,<KEY_ID_HEX_B>:<SECRET_HEX_B>" \
-./minitun agent
-```
-
-Install the latest `minitun` release on Linux x86_64 and migrate old `tunure`
-systemd services in one shot:
-
-```sh
-curl -fsSL -o /tmp/install_minitun.sh \
-  https://raw.githubusercontent.com/hUwUtao/Lure/main/scripts/install_minitun.sh
-chmod +x /tmp/install_minitun.sh
-ENDPOINT="endpoint:25565" \
-TOKENS_TEXT="<KEY_ID_HEX_A>:<SECRET_HEX_A>,<KEY_ID_HEX_B>:<SECRET_HEX_B>" \
-bash /tmp/install_minitun.sh
-```
-
-If old `tunure` units are present, the installer will discover them first and
-rewrite them into one or more `minitun` services based on endpoint grouping.
-
-You can also edit the small variable block at the top of the script instead of
-exporting overrides inline.
+See `docs/tunnel.md` for full configuration, systemd integration, multi-endpoint failover, hot reload, and troubleshooting.
 
 ## Observability (OTLP)
 

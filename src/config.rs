@@ -460,10 +460,7 @@ impl RouteConfig {
             tunnel: self.tunnel.unwrap_or(false),
             redirection: self.redirection.unwrap_or(false),
             allows_local: self.allows_local.unwrap_or(false),
-            auth_mode: self
-                .auth_mode
-                .clone()
-                .unwrap_or_else(default_auth_mode),
+            auth_mode: self.auth_mode.clone().unwrap_or_else(default_auth_mode),
             allowed_tokens: self.allowed_tokens.clone().unwrap_or_default(),
         })
     }
@@ -642,7 +639,9 @@ mod tests {
         )
         .expect("route config should deserialize");
 
-        let effective = route.effective_flags().expect("legacy flags should be detected");
+        let effective = route
+            .effective_flags()
+            .expect("legacy flags should be detected");
         assert!(effective.preserve_host);
         assert!(effective.proxy_protocol);
         assert!(effective.tunnel);
@@ -680,7 +679,9 @@ mod tests {
         )
         .expect("route config should deserialize");
 
-        let effective = route.effective_flags().expect("nested flags should be detected");
+        let effective = route
+            .effective_flags()
+            .expect("nested flags should be detected");
         assert!(!effective.preserve_host);
         assert!(effective.proxy_protocol);
     }

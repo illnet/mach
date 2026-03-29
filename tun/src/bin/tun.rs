@@ -1,13 +1,19 @@
 use std::{
+    collections::HashMap,
     net::{SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
-    process::Command as ProcessCommand,
     sync::Arc,
 };
 
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
 use tun::{AgentHello, Intent, ServerMsg};
+
+// =============================================================================
+// CLI Structures
+// =============================================================================
 
 #[derive(Parser)]
 #[command(name = "minitun")]
@@ -19,25 +25,101 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the tunnel agent (register, then serve session offers)
-    Agent(AgentArgs),
+    /// Start the tunnel agent using ~/.config/minitun.toml
+    Run,
+    /// Install binary to ~/.local/bin/minitun and manage config
+    Install(InstallArgs),
+    /// Send SIGHUP to the running minitun process to reload config
+    Reload,
+    /// Self-update from GitHub releases
+    Update,
+    /// Manage systemd service unit
+    Systemd(SystemdArgs),
+    /// Manage config file
+    Config(ConfigArgs),
     /// Compute a valid HMAC signature for a hello message (development helper)
     Sign(SignArgs),
-    /// Install/uninstall minitun as a systemd service
-    Systemd(SystemdArgs),
-    /// Placeholder update workflow for future self-updates
-    Update(UpdateArgs),
 }
 
 #[derive(Args)]
-struct AgentArgs {
-    /// Proxy address (host:port)
-    proxy: Option<String>,
-
+struct InstallArgs {
     /// Authentication token (format: key_id:secret, both hex-encoded).
-    /// Repeat this flag to run multiple tunnel keys in one minitun instance.
-    #[arg(short, long = "token")]
+    /// Repeat to add multiple tunnel entries.
+    #[arg(long = "token", action = clap::ArgAction::Append)]
     tokens: Vec<String>,
+
+    /// Endpoints for tunnel entries (space or comma separated, repeatable).
+    /// If single --endpoints, it applies to all --tokens.
+    #[arg(long = "endpoints", action = clap::ArgAction::Append)]
+    endpoints: Vec<String>,
+
+    /// Add/update a map entry key (must be paired with --map-addr).
+    #[arg(long = "map-name")]
+    map_name: Option<String>,
+
+    /// Map entry local address (paired with --map-name).
+    #[arg(long = "map-addr")]
+    map_addr: Option<String>,
+
+    /// Enable strict mode in config.
+    #[arg(long)]
+    strict: bool,
+
+    /// Set reconnect backoff duration (e.g. "1s", "500ms", "2m").
+    #[arg(long)]
+    reconnect: Option<String>,
+}
+
+#[derive(Args)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: ConfigCommand,
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Print the current config file.
+    Show,
+    /// Add a tunnel entry.
+    AddTunnel(AddTunnelArgs),
+    /// Remove a tunnel entry by index or key_id prefix.
+    RemoveTunnel { index_or_key: String },
+    /// Add a map entry.
+    AddMap { name: String, addr: String },
+    /// Remove a map entry.
+    RemoveMap { name: String },
+}
+
+#[derive(Args)]
+struct AddTunnelArgs {
+    /// Endpoints for the tunnel (space or comma separated, repeatable).
+    #[arg(long = "endpoints", action = clap::ArgAction::Append)]
+    endpoints: Vec<String>,
+    /// Token in format key_id:secret (both hex-encoded).
+    #[arg(long)]
+    token: String,
+}
+
+#[derive(Args)]
+struct SystemdArgs {
+    #[command(subcommand)]
+    command: SystemdCommand,
+}
+
+#[derive(Subcommand)]
+enum SystemdCommand {
+    /// Generate a systemd unit file template for the current config.
+    Gensys {
+        /// Install as a per-user service (default).
+        #[arg(long)]
+        user: bool,
+        /// Install as a system-wide service.
+        #[arg(long)]
+        system: bool,
+        /// Service name (default: minitun).
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -59,104 +141,110 @@ struct SignArgs {
     session: Option<String>,
 }
 
-#[derive(Args)]
-struct SystemdArgs {
-    #[command(subcommand)]
-    command: SystemdCommand,
+// =============================================================================
+// Config Structs and Serialization
+// =============================================================================
+
+/// Human-readable duration: "1s", "500ms", "2m". Default: 1s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HumanDuration(pub std::time::Duration);
+
+impl HumanDuration {
+    pub fn as_duration(self) -> std::time::Duration {
+        self.0
+    }
 }
 
-#[derive(Subcommand)]
-enum SystemdCommand {
-    /// Install and enable the singleton minitun systemd unit
-    Install(SystemdInstallArgs),
-    /// Disable and remove the singleton minitun systemd unit
-    Uninstall(SystemdUninstallArgs),
+impl Default for HumanDuration {
+    fn default() -> Self {
+        Self(std::time::Duration::from_secs(1))
+    }
 }
 
-#[derive(Args)]
-struct SystemdInstallArgs {
-    /// Proxy address (host:port) for the agent to connect to.
-    ///
-    /// You can also set MINITUN_ENDPOINT.
-    #[arg(long)]
-    endpoint: Option<String>,
-
-    /// Authentication token (format: key_id:secret, both hex-encoded).
-    /// Repeat this flag to run multiple tunnel keys in one minitun instance.
-    ///
-    /// You can also set MINITUN_TOKENS or MINITUN_TOKEN.
-    #[arg(short, long = "token")]
-    tokens: Vec<String>,
-
-    /// Install as a per-user service (default).
-    #[arg(long)]
-    user: bool,
-
-    /// Install as a system-wide service (writes to /etc/systemd/system).
-    #[arg(long)]
-    system: bool,
-
-    /// Override the service name (without .service).
-    ///
-    /// Default is minitun.
-    #[arg(long)]
-    name: Option<String>,
-
-    /// Copy the current minitun binary to a stable path and use it for the service.
-    #[arg(long, default_value_t = true)]
-    install_bin: bool,
-
-    /// Where to install the minitun binary to (overrides default).
-    ///
-    /// Defaults:
-    /// - user:   ~/.local/bin/minitun
-    /// - system: /usr/local/bin/minitun
-    #[arg(long)]
-    bin_path: Option<String>,
-
-    /// Extra RUST_LOG for the service (default: info)
-    #[arg(long, default_value = "info")]
-    rust_log: String,
-
-    /// After writing the unit, attempt to `systemctl enable --now`.
-    #[arg(long, default_value_t = true)]
-    enable_now: bool,
+fn parse_human_duration(s: &str) -> anyhow::Result<std::time::Duration> {
+    let s = s.trim();
+    if let Some(ms) = s.strip_suffix("ms") {
+        let n: u64 = ms
+            .trim()
+            .parse()
+            .context("invalid ms value")?;
+        return Ok(std::time::Duration::from_millis(n));
+    }
+    if let Some(secs) = s.strip_suffix('s') {
+        let n: u64 = secs
+            .trim()
+            .parse()
+            .context("invalid s value")?;
+        return Ok(std::time::Duration::from_secs(n));
+    }
+    if let Some(mins) = s.strip_suffix('m') {
+        let n: u64 = mins
+            .trim()
+            .parse()
+            .context("invalid m value")?;
+        return Ok(std::time::Duration::from_secs(n * 60));
+    }
+    // Fallback: bare integer treated as seconds
+    let n: u64 = s
+        .parse()
+        .context("invalid duration")?;
+    Ok(std::time::Duration::from_secs(n))
 }
 
-#[derive(Args)]
-struct SystemdUninstallArgs {
-    /// Uninstall from the per-user service directory (~/.config/systemd/user).
-    #[arg(long)]
-    user: bool,
-
-    /// Uninstall from the system service directory (/etc/systemd/system).
-    #[arg(long)]
-    system: bool,
-
-    /// Service name to uninstall (without .service). Defaults to `minitun`.
-    #[arg(long)]
-    name: Option<String>,
+impl<'de> Deserialize<'de> for HumanDuration {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        parse_human_duration(&s)
+            .map(Self)
+            .map_err(|e| serde::de::Error::custom(format!("{e}")))
+    }
 }
 
-#[derive(Args)]
-struct UpdateArgs {
-    /// Optional update channel name for the future updater.
-    #[arg(long, default_value = "stable")]
-    channel: String,
-
-    /// Placeholder manifest URL override.
-    #[arg(long)]
-    manifest_url: Option<String>,
-
-    /// Record intent to apply an update once the updater exists.
-    #[arg(long, default_value_t = false)]
-    apply: bool,
+impl Serialize for HumanDuration {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let ms = self.0.as_millis();
+        if ms % 1000 == 0 {
+            s.serialize_str(&format!("{}s", ms / 1000))
+        } else {
+            s.serialize_str(&format!("{ms}ms"))
+        }
+    }
 }
 
-struct TunConfig {
-    key_id: [u8; 8],
-    secret: [u8; 32],
-    label: String,
+/// One [[tunnel]] entry in the TOML config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelEntry {
+    pub endpoints: Vec<String>,
+    pub token: String,
+}
+
+/// Root config struct. All fields have sane defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct MiniTunConfig {
+    pub strict: bool,
+    pub reconnect: HumanDuration,
+    #[serde(rename = "tunnel")]
+    pub tunnels: Vec<TunnelEntry>,
+    pub map: HashMap<String, String>,
+}
+
+/// Internal struct derived from TunnelEntry after hex-parsing.
+#[derive(Clone)]
+pub struct TunConfig {
+    pub key_id: [u8; 8],
+    pub secret: [u8; 32],
+    pub label: String,        // hex::encode(key_id)
+    pub endpoints: Vec<String>, // raw endpoint strings for round-robin
+}
+
+impl std::fmt::Debug for TunConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TunConfig")
+            .field("label", &self.label)
+            .field("endpoints", &self.endpoints)
+            .finish()
+    }
 }
 
 fn parse_hex_exact<const N: usize>(input: &str) -> Result<[u8; N], String> {
@@ -173,16 +261,16 @@ fn parse_hex_exact<const N: usize>(input: &str) -> Result<[u8; N], String> {
     }
     let mut out = [0u8; N];
     for i in 0..N {
-        let byte =
-            u8::from_str_radix(&trimmed[i * 2..i * 2 + 2], 16).map_err(|err| err.to_string())?;
+        let byte = u8::from_str_radix(&trimmed[i * 2..i * 2 + 2], 16)
+            .map_err(|err| err.to_string())?;
         out[i] = byte;
     }
     Ok(out)
 }
 
 impl TunConfig {
-    fn from_token_string(token_str: &str) -> Result<Self, String> {
-        let parts: Vec<&str> = token_str.split(':').collect();
+    fn from_entry(entry: &TunnelEntry) -> Result<Self, String> {
+        let parts: Vec<&str> = entry.token.split(':').collect();
         if parts.len() != 2 {
             return Err("token format: key_id:secret (both hex-encoded)".to_string());
         }
@@ -194,74 +282,14 @@ impl TunConfig {
             key_id,
             secret,
             label: hex::encode(key_id),
+            endpoints: entry.endpoints.clone(),
         })
     }
 }
 
-fn env_trimmed(keys: &[&str]) -> Option<String> {
-    for key in keys {
-        let Some(value) = std::env::var(key).ok() else {
-            continue;
-        };
-        let value = value.trim();
-        if !value.is_empty() {
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
-fn parse_token_list(raw: &str) -> Vec<String> {
-    raw.split([',', '\n', '\r', ';'])
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn resolve_agent_endpoint(cli_proxy: Option<String>) -> anyhow::Result<String> {
-    if let Some(proxy) = cli_proxy.filter(|value| !value.trim().is_empty()) {
-        return Ok(proxy);
-    }
-
-    env_trimmed(&["MINITUN_ENDPOINT", "LURE_TUN_ENDPOINT"]).ok_or_else(|| {
-        anyhow::anyhow!("proxy endpoint is required (arg, MINITUN_ENDPOINT, or LURE_TUN_ENDPOINT)")
-    })
-}
-
-fn collect_agent_configs(cli_tokens: &[String]) -> anyhow::Result<Vec<TunConfig>> {
-    let mut token_values = cli_tokens.to_vec();
-    if token_values.is_empty() {
-        if let Some(raw) = env_trimmed(&["MINITUN_TOKENS", "LURE_TUN_TOKENS"]) {
-            token_values.extend(parse_token_list(&raw));
-        } else if let Some(raw) = env_trimmed(&["MINITUN_TOKEN", "LURE_TUN_TOKEN"]) {
-            token_values.push(raw);
-        }
-    }
-
-    if token_values.is_empty() {
-        anyhow::bail!(
-            "at least one token is required (use --token, MINITUN_TOKENS, MINITUN_TOKEN, or legacy LURE_TUN_TOKEN)"
-        );
-    }
-
-    let mut configs = Vec::with_capacity(token_values.len());
-    let mut seen = std::collections::HashSet::new();
-    for token in token_values {
-        let config = TunConfig::from_token_string(&token).map_err(|e| anyhow::anyhow!("{e}"))?;
-        if !seen.insert(config.key_id) {
-            warn!("duplicate tunnel token ignored: key_id={}", config.label);
-            continue;
-        }
-        configs.push(config);
-    }
-
-    if configs.is_empty() {
-        anyhow::bail!("no unique tunnel tokens configured");
-    }
-
-    Ok(configs)
-}
+// =============================================================================
+// Path Helpers
+// =============================================================================
 
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
@@ -298,293 +326,91 @@ fn copy_self_to(target: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn service_filename(service_name: &str) -> String {
-    if service_name.ends_with(".service") {
-        service_name.to_string()
-    } else {
-        format!("{service_name}.service")
+fn find_config_path() -> Option<PathBuf> {
+    if let Some(cfg_home) = xdg_config_home() {
+        let p = cfg_home.join("minitun.toml");
+        if p.exists() {
+            return Some(p);
+        }
     }
+    let local = PathBuf::from("minitun.toml");
+    if local.exists() {
+        return Some(local);
+    }
+    None
 }
 
-fn normalize_service_name(raw: &str) -> String {
-    let basename = raw
-        .trim()
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or("minitun")
-        .trim();
-    let normalized = basename.strip_suffix(".service").unwrap_or(basename);
-    if normalized.is_empty() {
-        "minitun".to_string()
-    } else {
-        normalized.to_string()
-    }
+fn default_config_path() -> anyhow::Result<PathBuf> {
+    xdg_config_home()
+        .map(|h| h.join("minitun.toml"))
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve $HOME or $XDG_CONFIG_HOME"))
 }
 
-fn systemctl(scope_user: bool, args: &[&str]) -> anyhow::Result<()> {
-    let mut cmd = ProcessCommand::new("systemctl");
-    if scope_user {
-        cmd.arg("--user");
-    }
-    cmd.args(args);
-    let status = cmd.status()?;
-    if !status.success() {
-        anyhow::bail!("systemctl failed: {status}");
-    }
+fn pid_file_path() -> anyhow::Result<PathBuf> {
+    xdg_config_home()
+        .map(|h| h.join("minitun.pid"))
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve $HOME or $XDG_CONFIG_HOME"))
+}
+
+// =============================================================================
+// Config I/O
+// =============================================================================
+
+fn load_config(path: &Path) -> anyhow::Result<MiniTunConfig> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config: {}", path.display()))?;
+    toml::from_str(&raw)
+        .with_context(|| format!("parsing config: {}", path.display()))
+}
+
+fn save_config(path: &Path, config: &MiniTunConfig) -> anyhow::Result<()> {
+    let serialized = toml::to_string_pretty(config)?;
+    // Validate the round-trip: re-parse what we just serialized.
+    let _: MiniTunConfig = toml::from_str(&serialized)
+        .context("config round-trip validation failed")?;
+    ensure_parent_dir(path)?;
+    let tmp_path = path.with_extension("toml.tmp");
+    std::fs::write(&tmp_path, &serialized)?;
+    std::fs::rename(&tmp_path, path)?;
     Ok(())
 }
 
-fn write_service_env_file(
-    path: &Path,
-    endpoint: &str,
-    tokens: &[String],
-    rust_log: &str,
-) -> anyhow::Result<()> {
-    use std::io::Write;
-    #[cfg(unix)]
-    let mut f = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)?
-    };
-    #[cfg(not(unix))]
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)?;
-    writeln!(f, "MINITUN_ENDPOINT={endpoint}")?;
-    writeln!(f, "MINITUN_TOKENS={}", tokens.join(","))?;
-    writeln!(f, "RUST_LOG={rust_log}")?;
-    Ok(())
+fn load_or_default_config(path: &Path) -> MiniTunConfig {
+    if path.exists() {
+        load_config(path).unwrap_or_else(|e| {
+            error!("failed to load config: {e}; starting fresh");
+            MiniTunConfig::default()
+        })
+    } else {
+        MiniTunConfig::default()
+    }
 }
 
-fn render_unit(exe: &Path, env_file: &Path, scope_user: bool) -> String {
-    // Keep secrets out of ExecStart args; use EnvironmentFile instead.
-    let wanted_by = if scope_user {
-        "default.target"
-    } else {
-        "multi-user.target"
-    };
-    format!(
-        r#"[Unit]
-Description=Minitun tunnel agent
-After=network-online.target
-Wants=network-online.target
+// =============================================================================
+// Utilities
+// =============================================================================
 
-[Service]
-Type=simple
-EnvironmentFile={}
-ExecStart={} agent
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy={}
-"#,
-        env_file.display(),
-        exe.display(),
-        wanted_by
-    )
+fn parse_endpoints(raw: &str) -> Vec<String> {
+    raw.split([',', ' '])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn resolve_endpoint(endpoint: &str) -> anyhow::Result<SocketAddr> {
-    // Fast-path: allow raw SocketAddr (IP:port) without any resolver calls.
     if let Ok(addr) = endpoint.parse::<SocketAddr>() {
         return Ok(addr);
     }
-
-    // Accept host:port and resolve via the system resolver.
-    // Note: this is a blocking call; acceptable for a CLI agent since it only runs on connect/reconnect.
     let mut addrs = endpoint.to_socket_addrs()?;
     addrs
         .next()
         .ok_or_else(|| anyhow::anyhow!("no addresses found for endpoint: {endpoint}"))
 }
 
-fn run_systemd_install(args: SystemdInstallArgs) -> anyhow::Result<()> {
-    let scope_user = if args.system {
-        false
-    } else if args.user {
-        true
-    } else {
-        // Default to --user; it does not require root.
-        true
-    };
-
-    if args.user && args.system {
-        anyhow::bail!("choose one: --user or --system");
-    }
-
-    let endpoint = resolve_agent_endpoint(args.endpoint)?;
-    let configs = collect_agent_configs(&args.tokens)?;
-    let normalized_service = args
-        .name
-        .as_deref()
-        .map(normalize_service_name)
-        .unwrap_or_else(|| "minitun".to_string());
-    let service_file = service_filename(&normalized_service);
-
-    let exe = std::env::current_exe()?;
-
-    let (unit_dir, env_dir) = if scope_user {
-        let cfg_home = xdg_config_home()
-            .ok_or_else(|| anyhow::anyhow!("cannot resolve config dir (HOME required)"))?;
-        (
-            cfg_home.join("systemd").join("user"),
-            cfg_home.join("minitun"),
-        )
-    } else {
-        (
-            PathBuf::from("/etc/systemd/system"),
-            PathBuf::from("/etc/minitun"),
-        )
-    };
-
-    let default_bin_path = if scope_user {
-        home_dir()
-            .ok_or_else(|| anyhow::anyhow!("HOME is required for --user install"))?
-            .join(".local")
-            .join("bin")
-            .join("minitun")
-    } else {
-        PathBuf::from("/usr/local/bin/minitun")
-    };
-    let installed_bin = args
-        .bin_path
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or(default_bin_path);
-    if args.install_bin {
-        if let Err(err) = copy_self_to(&installed_bin) {
-            error!(
-                "failed to install minitun binary to {}: {err}; using current exe instead",
-                installed_bin.display()
-            );
-        }
-    }
-    let exec_bin = if args.install_bin && installed_bin.exists() {
-        installed_bin.clone()
-    } else {
-        exe.clone()
-    };
-
-    ensure_dir(&unit_dir)?;
-    ensure_dir(&env_dir)?;
-
-    let env_file = env_dir.join(format!("{normalized_service}.env"));
-    let tokens: Vec<String> = configs
-        .iter()
-        .map(|config| format!("{}:{}", config.label, hex::encode(config.secret)))
-        .collect();
-    write_service_env_file(&env_file, &endpoint, &tokens, &args.rust_log)?;
-
-    let unit_path = unit_dir.join(&service_file);
-    std::fs::write(&unit_path, render_unit(&exec_bin, &env_file, scope_user))?;
-
-    info!("wrote unit: {}", unit_path.display());
-    info!("wrote env:  {}", env_file.display());
-    if args.install_bin {
-        info!("service exe: {}", exec_bin.display());
-    }
-
-    if args.enable_now {
-        if let Err(err) = systemctl(scope_user, &["daemon-reload"]) {
-            error!("systemctl daemon-reload failed: {err}");
-        }
-        if let Err(err) = systemctl(scope_user, &["enable", "--now", &service_file]) {
-            error!("systemctl enable --now failed: {err}");
-            eprintln!("unit written, but systemctl failed; try manually:");
-            if scope_user {
-                eprintln!("  systemctl --user daemon-reload");
-                eprintln!("  systemctl --user enable --now {service_file}");
-            } else {
-                eprintln!("  systemctl daemon-reload");
-                eprintln!("  systemctl enable --now {service_file}");
-            }
-        }
-    } else {
-        eprintln!("unit written; enable it with:");
-        if scope_user {
-            eprintln!("  systemctl --user daemon-reload");
-            eprintln!("  systemctl --user enable --now {service_file}");
-        } else {
-            eprintln!("  systemctl daemon-reload");
-            eprintln!("  systemctl enable --now {service_file}");
-        }
-    }
-
-    Ok(())
-}
-
-fn run_systemd_uninstall(args: SystemdUninstallArgs) -> anyhow::Result<()> {
-    let scope_user = if args.system {
-        false
-    } else if args.user {
-        true
-    } else {
-        true
-    };
-
-    if args.user && args.system {
-        anyhow::bail!("choose one: --user or --system");
-    }
-
-    let normalized_service = args
-        .name
-        .as_deref()
-        .map(normalize_service_name)
-        .unwrap_or_else(|| "minitun".to_string());
-    let service_file = service_filename(&normalized_service);
-    let cfg_home = if scope_user {
-        Some(
-            xdg_config_home()
-                .ok_or_else(|| anyhow::anyhow!("cannot resolve config dir (HOME required)"))?,
-        )
-    } else {
-        None
-    };
-    let unit_path = if scope_user {
-        cfg_home
-            .as_ref()
-            .expect("cfg_home must exist for scope_user")
-            .join("systemd")
-            .join("user")
-            .join(&service_file)
-    } else {
-        PathBuf::from("/etc/systemd/system").join(&service_file)
-    };
-    let env_path = if scope_user {
-        cfg_home
-            .as_ref()
-            .expect("cfg_home must exist for scope_user")
-            .join("minitun")
-            .join(format!("{normalized_service}.env"))
-    } else {
-        PathBuf::from("/etc/minitun").join(format!("{normalized_service}.env"))
-    };
-
-    // Best-effort stop/disable.
-    let _ = systemctl(scope_user, &["disable", "--now", &service_file]);
-    let _ = systemctl(scope_user, &["daemon-reload"]);
-
-    if unit_path.exists() {
-        std::fs::remove_file(&unit_path)?;
-        info!("removed unit: {}", unit_path.display());
-    } else {
-        info!("unit not found: {}", unit_path.display());
-    }
-
-    if env_path.exists() {
-        let _ = std::fs::remove_file(&env_path);
-    }
-
-    Ok(())
-}
+// =============================================================================
+// Async Protocol Functions
+// =============================================================================
 
 async fn read_server_msg(
     conn: &mut net::sock::LureConnection,
@@ -616,21 +442,36 @@ async fn send_agent_hello(
 }
 
 fn tune_socket(conn: &net::sock::LureConnection) {
-    if dotenvy::var("NO_NODELAY").is_err()
+    if std::env::var("NO_NODELAY").is_err()
         && let Err(err) = conn.set_nodelay(true)
     {
         debug!("failed to enable TCP_NODELAY: {err}");
     }
 }
 
-async fn handle_session(
+// =============================================================================
+// Shared State
+// =============================================================================
+
+struct SharedState {
+    config: Arc<tokio::sync::RwLock<MiniTunConfig>>,
     session_slots: Arc<tokio::sync::Semaphore>,
+}
+
+const MAX_CONCURRENT_TUNNEL_SESSIONS: usize = 1000;
+
+// =============================================================================
+// Session and Tunnel Handling
+// =============================================================================
+
+async fn handle_session(
+    shared: Arc<SharedState>,
     ingress: SocketAddr,
     config: TunConfig,
     session: [u8; 32],
 ) -> anyhow::Result<()> {
     let session_prefix = format!("{:02x}", session[0]);
-    let _permit = match session_slots.try_acquire_owned() {
+    let _permit = match shared.session_slots.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             warn!(
@@ -684,6 +525,22 @@ async fn handle_session(
         }
     };
 
+    // Strict mode check
+    {
+        let cfg = shared.config.read().await;
+        if cfg.strict {
+            let target_str = target.to_string();
+            let allowed = cfg.map.values().any(|v| v == &target_str);
+            if !allowed {
+                warn!(
+                    "strict mode: rejected target {target} for key_id={} session={session_prefix}",
+                    config.label
+                );
+                return Ok(());
+            }
+        }
+    }
+
     info!(
         "tunnel target received: key_id={} session={session_prefix} target={target}",
         config.label
@@ -695,8 +552,6 @@ async fn handle_session(
         target_conn.local_addr().ok(),
         target_conn.peer_addr().ok()
     );
-    // If the server already sent some tunneled bytes after TargetAddr in the same read,
-    // forward them to the backend before entering passthrough mode.
     if !buf.is_empty() {
         debug!(
             "forwarding buffered tunneled bytes: session={session_prefix} bytes={}",
@@ -717,12 +572,10 @@ async fn handle_session(
     Ok(())
 }
 
-const MAX_CONCURRENT_TUNNEL_SESSIONS: usize = 1000;
-
 async fn listen_once(
     ingress: SocketAddr,
-    config: TunConfig,
-    session_slots: Arc<tokio::sync::Semaphore>,
+    config: &TunConfig,
+    shared: Arc<SharedState>,
 ) -> anyhow::Result<()> {
     let mut listener = tun::connect_agent(ingress).await?;
     tune_socket(&listener);
@@ -779,14 +632,15 @@ async fn listen_once(
                 key_id: config.key_id,
                 secret: config.secret,
                 label: config.label.clone(),
+                endpoints: config.endpoints.clone(),
             };
             let from = forward.request.from;
-            let session_slots = Arc::clone(&session_slots);
+            let shared = Arc::clone(&shared);
             match net::sock::backend_kind() {
                 net::sock::BackendKind::Tokio | net::sock::BackendKind::Epoll => {
                     tokio::task::spawn_local(async move {
                         if let Err(e) =
-                            handle_session(session_slots, from, config, forward.session).await
+                            handle_session(shared, from, config, forward.session).await
                         {
                             error!("minitun handle_session failed: {e}");
                         }
@@ -795,7 +649,7 @@ async fn listen_once(
                 net::sock::BackendKind::Uring => {
                     net::sock::uring::spawn(async move {
                         if let Err(e) =
-                            handle_session(session_slots, from, config, forward.session).await
+                            handle_session(shared, from, config, forward.session).await
                         {
                             error!("minitun handle_session failed: {e}");
                         }
@@ -806,70 +660,561 @@ async fn listen_once(
     }
 }
 
-async fn run(ingress: SocketAddr, config: TunConfig) -> anyhow::Result<()> {
+async fn run(config: TunConfig, shared: Arc<SharedState>) {
     let mut delay = std::time::Duration::from_millis(250);
-    let max_delay = std::time::Duration::from_secs(5);
-    let session_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TUNNEL_SESSIONS));
+    let mut endpoint_idx: usize = 0;
 
     loop {
-        match listen_once(
-            ingress,
-            TunConfig {
-                key_id: config.key_id,
-                secret: config.secret,
-                label: config.label.clone(),
-            },
-            Arc::clone(&session_slots),
-        )
-        .await
-        {
-            Ok(()) => {
-                // listen_once currently never returns Ok, but keep this behavior robust.
-                delay = std::time::Duration::from_millis(250);
-            }
+        let max_delay = {
+            let cfg = shared.config.read().await;
+            cfg.reconnect.as_duration()
+        };
+
+        let endpoints = &config.endpoints;
+        if endpoints.is_empty() {
+            error!("tunnel key_id={} has no endpoints; stopping", config.label);
+            return;
+        }
+        let endpoint_str = &endpoints[endpoint_idx % endpoints.len()];
+
+        let ingress = match resolve_endpoint(endpoint_str) {
+            Ok(addr) => addr,
             Err(e) => {
                 error!(
-                    "listener disconnected: key_id={} err={e}; reconnecting in {delay:?}",
+                    "cannot resolve endpoint {endpoint_str} for key_id={}: {e}; \
+                     retrying in {delay:?}",
                     config.label
                 );
                 tokio::time::sleep(delay).await;
                 delay = std::cmp::min(max_delay, delay.saturating_mul(2));
+                endpoint_idx = endpoint_idx.wrapping_add(1);
+                continue;
+            }
+        };
+
+        match listen_once(ingress, &config, Arc::clone(&shared)).await {
+            Ok(()) => {
+                delay = std::time::Duration::from_millis(250);
+            }
+            Err(e) => {
+                error!(
+                    "listener disconnected: key_id={} endpoint={endpoint_str} err={e}; \
+                     reconnecting in {delay:?}",
+                    config.label
+                );
+                tokio::time::sleep(delay).await;
+                delay = std::cmp::min(max_delay, delay.saturating_mul(2));
+                endpoint_idx = endpoint_idx.wrapping_add(1);
             }
         }
     }
 }
 
-async fn run_many(ingress: SocketAddr, configs: Vec<TunConfig>) -> anyhow::Result<()> {
-    if configs.is_empty() {
-        anyhow::bail!("no tunnel keys configured");
+fn spawn_tunnel_task(
+    tc: TunConfig,
+    shared: Arc<SharedState>,
+) -> tokio::task::JoinHandle<()> {
+    match net::sock::backend_kind() {
+        net::sock::BackendKind::Tokio | net::sock::BackendKind::Epoll => {
+            tokio::task::spawn_local(async move {
+                run(tc, shared).await;
+            })
+        }
+        net::sock::BackendKind::Uring => {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+            net::sock::uring::spawn(async move {
+                let _ = run(tc, shared).await;
+                let _ = tx.send(()).await;
+            });
+            // Return a join handle that waits on the channel.
+            // This is a simplified solution; for production, use CancellationToken.
+            tokio::task::spawn_local(async move {
+                let _ = rx.recv().await;
+            })
+        }
     }
+}
 
-    info!(
-        "starting minitun singleton: endpoint={ingress} keys={} wire_version={}",
-        configs.len(),
-        tun::VERSION
-    );
-    for config in configs {
-        info!("registering tunnel key: key_id={}", config.label);
-        match net::sock::backend_kind() {
-            net::sock::BackendKind::Tokio | net::sock::BackendKind::Epoll => {
-                tokio::task::spawn_local(async move {
-                    if let Err(err) = run(ingress, config).await {
-                        error!("listener task failed: {err}");
-                    }
-                });
+// =============================================================================
+// PID File Management
+// =============================================================================
+
+fn write_pid_file(path: &Path) -> anyhow::Result<()> {
+    ensure_parent_dir(path)?;
+    let pid = std::process::id();
+    std::fs::write(path, format!("{pid}\n"))?;
+    Ok(())
+}
+
+struct PidFileGuard(PathBuf);
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+// =============================================================================
+// Orchestrator and Reload Logic
+// =============================================================================
+
+async fn apply_reload(
+    task_map: &mut HashMap<[u8; 8], tokio::task::JoinHandle<()>>,
+    active_configs: &mut HashMap<[u8; 8], TunConfig>,
+    shared: &Arc<SharedState>,
+    new_config: MiniTunConfig,
+) {
+    // Build new tunnel map by key_id.
+    let mut new_entries: HashMap<[u8; 8], TunConfig> = HashMap::new();
+    for entry in &new_config.tunnels {
+        match TunConfig::from_entry(entry) {
+            Ok(tc) => {
+                new_entries.insert(tc.key_id, tc);
             }
-            net::sock::BackendKind::Uring => {
-                net::sock::uring::spawn(async move {
-                    if let Err(err) = run(ingress, config).await {
-                        error!("listener task failed: {err}");
-                    }
-                });
+            Err(e) => {
+                error!("skipping invalid tunnel entry: {e}");
             }
         }
     }
 
-    std::future::pending::<anyhow::Result<()>>().await
+    // Find and remove tunnels that are no longer in config.
+    let removed: Vec<[u8; 8]> = task_map
+        .keys()
+        .filter(|k| !new_entries.contains_key(*k))
+        .copied()
+        .collect();
+    for key_id in removed {
+        info!("reload: removing tunnel key_id={}", hex::encode(key_id));
+        if let Some(handle) = task_map.remove(&key_id) {
+            handle.abort();
+        }
+        active_configs.remove(&key_id);
+    }
+
+    // Check for changed endpoints/token in existing tunnels.
+    let to_restart: Vec<[u8; 8]> = active_configs
+        .iter()
+        .filter_map(|(key_id, old_config)| {
+            match new_entries.get(key_id) {
+                Some(new_config) => {
+                    if old_config.endpoints != new_config.endpoints
+                        || old_config.secret != new_config.secret
+                    {
+                        Some(*key_id)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        })
+        .collect();
+
+    for key_id in to_restart {
+        info!(
+            "reload: restarting tunnel key_id={} (config changed)",
+            hex::encode(key_id)
+        );
+        if let Some(handle) = task_map.remove(&key_id) {
+            handle.abort();
+        }
+        if let Some(new_tc) = new_entries.get(&key_id) {
+            let handle = spawn_tunnel_task(new_tc.clone(), Arc::clone(shared));
+            task_map.insert(key_id, handle);
+            active_configs.insert(key_id, new_tc.clone());
+        }
+    }
+
+    // Add new tunnels.
+    for (key_id, tc) in &new_entries {
+        if !task_map.contains_key(key_id) {
+            info!("reload: adding tunnel key_id={}", hex::encode(key_id));
+            let handle = spawn_tunnel_task(tc.clone(), Arc::clone(shared));
+            task_map.insert(*key_id, handle);
+            active_configs.insert(*key_id, tc.clone());
+        }
+    }
+
+    // Update shared config for map/strict changes.
+    {
+        let mut cfg = shared.config.write().await;
+        *cfg = new_config;
+    }
+
+    info!("reload complete: {} active tunnels", task_map.len());
+}
+
+async fn run_orchestrator(
+    initial_config: MiniTunConfig,
+    config_path: PathBuf,
+    pid_path: PathBuf,
+) -> anyhow::Result<()> {
+    // Write PID file.
+    write_pid_file(&pid_path)?;
+    let _pid_guard = PidFileGuard(pid_path.clone());
+
+    let shared_config = Arc::new(tokio::sync::RwLock::new(initial_config.clone()));
+    let session_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TUNNEL_SESSIONS));
+    let shared = Arc::new(SharedState {
+        config: Arc::clone(&shared_config),
+        session_slots,
+    });
+
+    let mut task_map: HashMap<[u8; 8], tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut active_configs: HashMap<[u8; 8], TunConfig> = HashMap::new();
+
+    // Spawn initial tasks.
+    for entry in &initial_config.tunnels {
+        let tc = TunConfig::from_entry(entry)
+            .map_err(|e| anyhow::anyhow!("invalid token: {e}"))?;
+        let key_id = tc.key_id;
+        let handle = spawn_tunnel_task(tc.clone(), Arc::clone(&shared));
+        task_map.insert(key_id, handle);
+        active_configs.insert(key_id, tc);
+    }
+
+    info!(
+        "minitun started: {} tunnels, config={}",
+        initial_config.tunnels.len(),
+        config_path.display()
+    );
+
+    // Set up SIGHUP handler.
+    #[cfg(unix)]
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+
+    loop {
+        #[cfg(unix)]
+        {
+            sighup.recv().await;
+        }
+        #[cfg(not(unix))]
+        {
+            std::future::pending::<()>().await;
+        }
+
+        info!(
+            "SIGHUP received, reloading config from {}",
+            config_path.display()
+        );
+        let new_config = match load_config(&config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("config reload failed: {e}; keeping current config");
+                continue;
+            }
+        };
+
+        apply_reload(&mut task_map, &mut active_configs, &shared, new_config).await;
+    }
+}
+
+// =============================================================================
+// Commands
+// =============================================================================
+
+fn run_install(args: InstallArgs) -> anyhow::Result<()> {
+    // Copy binary to ~/.local/bin/minitun
+    if let Err(err) = copy_self_to(
+        &home_dir()
+            .ok_or_else(|| anyhow::anyhow!("HOME not set"))?
+            .join(".local")
+            .join("bin")
+            .join("minitun"),
+    ) {
+        error!("failed to install binary: {err}");
+    }
+
+    let path = default_config_path()?;
+    let mut config = load_or_default_config(&path);
+
+    // Parse endpoints
+    let all_endpoints: Vec<String> = args
+        .endpoints
+        .iter()
+        .flat_map(|e| parse_endpoints(e))
+        .collect();
+
+    // Merge tokens
+    if !args.tokens.is_empty() {
+        let mut parsed_tokens = Vec::new();
+        for token_str in &args.tokens {
+            TunConfig::from_entry(&TunnelEntry {
+                endpoints: all_endpoints.clone(),
+                token: token_str.clone(),
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            parsed_tokens.push((token_str.clone(), all_endpoints.clone()));
+        }
+
+        for (token, endpoints) in parsed_tokens {
+            // Find and update existing, or append
+            let parts: Vec<&str> = token.split(':').collect();
+            if parts.len() == 2 {
+                if let Ok(key_id) = parse_hex_exact::<8>(parts[0]) {
+                    let mut found = false;
+                    for entry in &mut config.tunnels {
+                        if let Ok(tc) = TunConfig::from_entry(entry) {
+                            if tc.key_id == key_id {
+                                entry.endpoints = endpoints.clone();
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !found {
+                        config.tunnels.push(TunnelEntry {
+                            endpoints: endpoints.clone(),
+                            token: token.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Merge map entries
+    if let (Some(name), Some(addr)) = (&args.map_name, &args.map_addr) {
+        config.map.insert(name.clone(), addr.clone());
+    }
+
+    // Set strict mode if flag given
+    if args.strict {
+        config.strict = true;
+    }
+
+    // Set reconnect if given
+    if let Some(dur_str) = &args.reconnect {
+        config.reconnect = HumanDuration(parse_human_duration(dur_str)
+            .context("invalid reconnect duration")?);
+    }
+
+    save_config(&path, &config)?;
+    info!("config saved to: {}", path.display());
+
+    Ok(())
+}
+
+fn run_reload() -> anyhow::Result<()> {
+    let pid_path = pid_file_path()?;
+    let raw = std::fs::read_to_string(&pid_path)
+        .with_context(|| format!("could not read PID file: {}", pid_path.display()))?;
+    let pid: u32 = raw
+        .trim()
+        .parse()
+        .context("PID file contains invalid number")?;
+    #[cfg(unix)]
+    {
+        let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGHUP) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!("failed to send SIGHUP to pid {pid}: {err}");
+        }
+        info!("sent SIGHUP to minitun pid={pid}");
+    }
+    #[cfg(not(unix))]
+    {
+        anyhow::bail!("reload is not supported on this platform");
+    }
+    Ok(())
+}
+
+fn run_update() -> anyhow::Result<()> {
+    let os = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "macos",
+        "windows" => "windows",
+        other => anyhow::bail!("unsupported OS for auto-update: {other}"),
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        other => anyhow::bail!("unsupported arch for auto-update: {other}"),
+    };
+
+    let url = format!(
+        "https://github.com/hUwUtao/Lure/releases/latest/download/minitun-{os}-{arch}"
+    );
+    info!("downloading update from {url}");
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(concat!("minitun/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let response = client.get(&url).send()?;
+    if !response.status().is_success() {
+        anyhow::bail!("update download failed: HTTP {}", response.status());
+    }
+    let bytes = response.bytes()?;
+
+    let current_exe = std::env::current_exe()?;
+    let tmp_path = current_exe.with_extension("update.tmp");
+    std::fs::write(&tmp_path, &bytes)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    std::fs::rename(&tmp_path, &current_exe)
+        .context("failed to replace current exe with updated binary")?;
+
+    info!("minitun updated successfully; restart to use new version");
+    Ok(())
+}
+
+fn run_config(args: ConfigArgs) -> anyhow::Result<()> {
+    match args.command {
+        ConfigCommand::Show => {
+            let path = find_config_path()
+                .ok_or_else(|| anyhow::anyhow!("no config file found"))?;
+            let cfg = load_config(&path)?;
+            println!("{}", toml::to_string_pretty(&cfg)?);
+        }
+        ConfigCommand::AddTunnel(a) => {
+            let path = default_config_path()?;
+            let mut cfg = load_or_default_config(&path);
+            let endpoints = a
+                .endpoints
+                .iter()
+                .flat_map(|e| parse_endpoints(e))
+                .collect::<Vec<_>>();
+            // Validate token before inserting.
+            TunConfig::from_entry(&TunnelEntry {
+                endpoints: endpoints.clone(),
+                token: a.token.clone(),
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            cfg.tunnels.push(TunnelEntry {
+                endpoints,
+                token: a.token,
+            });
+            save_config(&path, &cfg)?;
+            info!("tunnel added; {} total", cfg.tunnels.len());
+        }
+        ConfigCommand::RemoveTunnel { index_or_key } => {
+            let path = default_config_path()?;
+            let mut cfg = load_or_default_config(&path);
+            if let Ok(idx) = index_or_key.parse::<usize>() {
+                if idx >= cfg.tunnels.len() {
+                    anyhow::bail!("index {idx} out of range (have {})", cfg.tunnels.len());
+                }
+                cfg.tunnels.remove(idx);
+            } else {
+                let before = cfg.tunnels.len();
+                cfg.tunnels.retain(|e| {
+                    e.token
+                        .split(':')
+                        .next()
+                        .map(|k| !k.starts_with(&index_or_key))
+                        .unwrap_or(true)
+                });
+                let removed = before - cfg.tunnels.len();
+                if removed == 0 {
+                    anyhow::bail!("no tunnel matched key_id prefix: {index_or_key}");
+                }
+            }
+            save_config(&path, &cfg)?;
+        }
+        ConfigCommand::AddMap { name, addr } => {
+            let path = default_config_path()?;
+            let mut cfg = load_or_default_config(&path);
+            cfg.map.insert(name, addr);
+            save_config(&path, &cfg)?;
+        }
+        ConfigCommand::RemoveMap { name } => {
+            let path = default_config_path()?;
+            let mut cfg = load_or_default_config(&path);
+            if cfg.map.remove(&name).is_none() {
+                anyhow::bail!("map entry '{name}' not found");
+            }
+            save_config(&path, &cfg)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_systemd_gensys(user: bool, system: bool, name: Option<String>) -> anyhow::Result<()> {
+    let scope_user = if system { false } else { true };
+    if system && user {
+        anyhow::bail!("choose one: --user or --system");
+    }
+
+    let normalized_service = name
+        .as_deref()
+        .map(|n| {
+            let basename = n
+                .trim()
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or("minitun")
+                .trim();
+            let normalized = basename.strip_suffix(".service").unwrap_or(basename);
+            if normalized.is_empty() {
+                "minitun".to_string()
+            } else {
+                normalized.to_string()
+            }
+        })
+        .unwrap_or_else(|| "minitun".to_string());
+
+    let unit_dir = if scope_user {
+        let cfg_home = xdg_config_home()
+            .ok_or_else(|| anyhow::anyhow!("cannot resolve config dir (HOME required)"))?;
+        cfg_home.join("systemd").join("user")
+    } else {
+        PathBuf::from("/etc/systemd/system")
+    };
+
+    let exe = std::env::current_exe()?;
+    let config_path = default_config_path()?;
+    let service_file = if normalized_service.ends_with(".service") {
+        normalized_service.clone()
+    } else {
+        format!("{normalized_service}.service")
+    };
+
+    // Generate unit file content.
+    let unit_content = format!(
+        r#"[Unit]
+Description=Minitun tunnel agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={exe} run
+WorkingDirectory=~
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy={wanted_by}
+"#,
+        exe = exe.display(),
+        wanted_by = if scope_user { "default.target" } else { "multi-user.target" },
+    );
+
+    let unit_path = unit_dir.join(&service_file);
+
+    println!("# Generated systemd unit file for: {}", normalized_service);
+    println!("# Install location:");
+    println!("#   User:   {}", unit_path.display());
+    println!("#   System: /etc/systemd/system/{}", service_file);
+    println!();
+    println!("# Config file location: {}", config_path.display());
+    println!();
+    println!("{}", unit_content);
+    println!();
+    println!("# To install:");
+    println!("# 1. Copy the above unit file to the appropriate location");
+    println!("# 2. Run: systemctl{} daemon-reload",
+        if scope_user { " --user" } else { "" });
+    println!("# 3. Run: systemctl{} enable --now {}",
+        if scope_user { " --user" } else { "" },
+        service_file);
+
+    Ok(())
 }
 
 fn run_sign(args: SignArgs) -> anyhow::Result<()> {
@@ -879,7 +1224,14 @@ fn run_sign(args: SignArgs) -> anyhow::Result<()> {
         other => anyhow::bail!("invalid intent {other}"),
     };
 
-    let cfg = TunConfig::from_token_string(&args.token).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let parts: Vec<&str> = args.token.split(':').collect();
+    if parts.len() != 2 {
+        anyhow::bail!("token format: key_id:secret (both hex-encoded)");
+    }
+    let key_id = parse_hex_exact::<8>(parts[0])
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let secret = parse_hex_exact::<32>(parts[1])
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let timestamp = args.timestamp.unwrap_or_else(|| {
         std::time::SystemTime::now()
@@ -900,18 +1252,12 @@ fn run_sign(args: SignArgs) -> anyhow::Result<()> {
     };
 
     let hmac = tun::compute_agent_hmac(
-        &cfg.secret,
-        &cfg.key_id,
-        timestamp,
-        intent,
-        session.as_ref(),
-        None,
-        0,
+        &secret, &key_id, timestamp, intent, session.as_ref(), None, 0,
     );
 
     println!("version={}", tun::VERSION);
     println!("intent={}", args.intent);
-    println!("key_id={}", hex::encode(cfg.key_id));
+    println!("key_id={}", hex::encode(key_id));
     println!("timestamp={timestamp}");
     if let Some(s) = session {
         println!("session={}", hex::encode(s));
@@ -921,18 +1267,9 @@ fn run_sign(args: SignArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_update(args: UpdateArgs) -> anyhow::Result<()> {
-    let action = if args.apply { "apply" } else { "check" };
-    println!("minitun update placeholder");
-    println!("channel={}", args.channel);
-    println!("action={action}");
-    println!(
-        "manifest_url={}",
-        args.manifest_url.as_deref().unwrap_or("<default>")
-    );
-    println!("status=not-implemented");
-    Ok(())
-}
+// =============================================================================
+// Main Entry Point
+// =============================================================================
 
 const SENTRY_DSN: &str =
     "https://d8cb23f37184d406d4b129c0dc0b24d4@o1192891.ingest.us.sentry.io/4511109122293760";
@@ -956,34 +1293,16 @@ fn try_main() -> anyhow::Result<()> {
     });
 
     match cli.command {
-        Command::Systemd(args) => {
-            match args.command {
-                SystemdCommand::Install(install) => run_systemd_install(install),
-                SystemdCommand::Uninstall(uninstall) => run_systemd_uninstall(uninstall),
-            }?;
-        }
-        Command::Sign(args) => {
-            run_sign(args)?;
-        }
-        Command::Update(args) => {
-            run_update(args)?;
-        }
-        Command::Agent(args) => {
-            let proxy_raw = resolve_agent_endpoint(args.proxy)?;
-
-            let proxy: SocketAddr = match resolve_endpoint(&proxy_raw) {
-                Ok(addr) => addr,
-                Err(err) => {
-                    anyhow::bail!(
-                        "invalid proxy endpoint {}: {err}\nexpected: <ip:port> or <host:port>",
-                        proxy_raw
-                    );
-                }
-            };
-            info!("proxy endpoint resolved: {} -> {}", proxy_raw, proxy);
-
-            let configs = collect_agent_configs(&args.tokens)
-                .map_err(|err| anyhow::anyhow!("invalid token config: {err}"))?;
+        Command::Run => {
+            let path = find_config_path()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "no config file found; run `minitun install --token <t> --endpoints <e>` first"
+                ))?;
+            let config = load_config(&path)?;
+            if config.tunnels.is_empty() {
+                anyhow::bail!("config has no [[tunnel]] entries");
+            }
+            let pid_path = pid_file_path()?;
 
             let backend = net::sock::backend_kind();
             sentry::configure_scope(|scope| {
@@ -994,15 +1313,38 @@ fn try_main() -> anyhow::Result<()> {
                 net::sock::BackendKind::Tokio | net::sock::BackendKind::Epoll => {
                     let rt = tokio::runtime::Builder::new_multi_thread()
                         .enable_all()
-                        .build()
-                        .expect("failed to build tokio runtime");
+                        .build()?;
                     let local = tokio::task::LocalSet::new();
-                    rt.block_on(local.run_until(run_many(proxy, configs)))?;
+                    rt.block_on(local.run_until(run_orchestrator(config, path, pid_path)))?;
                 }
                 net::sock::BackendKind::Uring => {
-                    net::sock::uring::start(async move { run_many(proxy, configs).await })?;
+                    net::sock::uring::start(async move {
+                        run_orchestrator(config, path, pid_path).await
+                    })?;
                 }
             }
+        }
+        Command::Install(args) => {
+            run_install(args)?;
+        }
+        Command::Reload => {
+            run_reload()?;
+        }
+        Command::Update => {
+            run_update()?;
+        }
+        Command::Systemd(args) => {
+            match args.command {
+                SystemdCommand::Gensys { user, system, name } => {
+                    run_systemd_gensys(user, system, name)?;
+                }
+            }
+        }
+        Command::Config(args) => {
+            run_config(args)?;
+        }
+        Command::Sign(args) => {
+            run_sign(args)?;
         }
     }
 
@@ -1040,9 +1382,12 @@ fn backend_kind_name(kind: net::sock::BackendKind) -> &'static str {
 
 fn command_name(command: &Command) -> &'static str {
     match command {
-        Command::Agent(_) => "agent",
-        Command::Sign(_) => "sign",
+        Command::Run => "run",
+        Command::Install(_) => "install",
+        Command::Reload => "reload",
+        Command::Update => "update",
         Command::Systemd(_) => "systemd",
-        Command::Update(_) => "update",
+        Command::Config(_) => "config",
+        Command::Sign(_) => "sign",
     }
 }

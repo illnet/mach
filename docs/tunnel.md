@@ -35,9 +35,36 @@ tunnel = true
 
 ### minitun
 
-`minitun` is the singleton tunnel client. One process can register multiple tunnel keys against the same Lure endpoint.
+`minitun` is the singleton tunnel client. One process can register multiple tunnel keys against the same Lure endpoint using a TOML configuration file.
 
-Generate a cryptographically secure 32-byte token. Examples:
+#### Configuration
+
+Create `~/.config/minitun.toml`:
+
+```toml
+# Reconnect backoff (default: "1s")
+reconnect = "1s"
+
+# Optional: strict mode — only forward to addresses in [map]
+strict = false
+
+# Tunnel entries (each can have multiple endpoints for failover)
+[[tunnel]]
+endpoints = ["lure.example.com:25577"]
+token = "0011223344556677:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[[tunnel]]
+endpoints = ["sgp-lure.example.com:25577", "hkg-lure.example.com:25577"]
+token = "8899aabbccddeeff:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+# Optional: address whitelist for strict mode
+[map]
+lobby = "127.0.0.1:25565"
+```
+
+#### Generate Tokens
+
+Create cryptographically secure 32-byte tokens:
 
 ```bash
 # Using openssl
@@ -47,23 +74,50 @@ openssl rand -hex 32
 python3 -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-Store tokens securely in your configuration. Each tunnel route should have a unique token.
+Format: `key_id_hex:secret_hex` where:
+- `key_id_hex`: 16 hex chars (8 bytes)
+- `secret_hex`: 64 hex chars (32 bytes)
 
-Example:
+#### Setup
 
 ```bash
-./minitun agent proxy.example.com:25577 \
+# Install binary and create initial config
+minitun install \
   --token 0011223344556677:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  --token 8899aabbccddeeff:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  --endpoints "lure.example.com:25577" \
+  --map-name lobby --map-addr 127.0.0.1:25565
+
+# Add more tunnels
+minitun config add-tunnel \
+  --token 8899aabbccddeeff:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  --endpoints "sgp-lure.example.com:25577,hkg-lure.example.com:25577"
+
+# View current config
+minitun config show
 ```
 
-Or via env for the singleton service:
+#### Running
 
 ```bash
-MINITUN_ENDPOINT=proxy.example.com:25577 \
-MINITUN_TOKENS=$'0011223344556677:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n8899aabbccddeeff:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
-./minitun agent
+# Start the agent (reads ~/.config/minitun.toml)
+minitun run
+
+# Or as a systemd service
+minitun systemd gensys --user > ~/.config/systemd/user/minitun.service
+systemctl --user daemon-reload
+systemctl --user enable --now minitun
+
+# Reload config without restart
+minitun reload
 ```
+
+#### Self-Update
+
+```bash
+minitun update
+```
+
+Automatically downloads the latest binary from GitHub releases.
 
 ### Slave Forwarding Configuration
 
@@ -196,7 +250,7 @@ Tunnel events are logged using the standard Lure logger:
 Enable debug logging to see session lifecycle events:
 
 ```bash
-RUST_LOG=debug ./minitun agent proxy.example.com:25577 --token 0011223344556677:...
+RUST_LOG=debug minitun run
 ```
 
 ### Metrics
@@ -270,7 +324,7 @@ The following metrics are exposed:
 
 ```
 [Internal Network]
-  minitun (token: 8f1f2a3b...)
+  minitun (token: 0011223344556677:...)
        |
        | (TLS/WireGuard recommended)
        |
@@ -281,13 +335,21 @@ The following metrics are exposed:
    Minecraft Clients
 ```
 
-**minitun startup**:
-```bash
-./minitun agent proxy.example.com:25567 \
-  --token 0011223344556677:8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f00112233445566778899aabb
+**minitun config** (`~/.config/minitun.toml`):
+```toml
+[[tunnel]]
+endpoints = ["proxy.example.com:25567"]
+token = "0011223344556677:8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f00112233445566778899aabb"
 ```
 
-**Route configuration**:
+**Start agent**:
+```bash
+minitun install --token 0011223344556677:8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f00112233445566778899aabb \
+  --endpoints proxy.example.com:25567
+minitun run
+```
+
+**Route configuration in Lure** (`settings.toml`):
 ```toml
 [[route]]
 matcher = "behind-nat.example.com"
@@ -303,13 +365,19 @@ tunnel_token = "8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f00112233445566778899aabb
 
 Deploy multiple `minitun` instances with the same token if you want redundancy. Lure will keep one active listener per key, so restarts and failover are handled by reconnecting instances.
 
-```bash
-# Instance 1
-./minitun agent proxy.example.com:25567 --token 0011223344556677:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-
-# Instance 2
-./minitun agent proxy.example.com:25567 --token 0011223344556677:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+**Shared config** (`~/.config/minitun.toml`):
+```toml
+[[tunnel]]
+endpoints = ["proxy.example.com:25567"]
+token = "0011223344556677:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 ```
+
+**All instances run**:
+```bash
+minitun run
+```
+
+Both instances connect with the same token; Lure accepts whichever connects first. On restart, the other instance takes over automatically.
 
 ## Notes
 
