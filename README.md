@@ -130,46 +130,10 @@ LURE_IO_URING=1 cargo run --features uring
 
 ## Tunneling (Beta)
 
-Need NAT passthrough? Lure can hand a connection to a tunnel agent that lives inside the network.
+NAT passthrough via `minitun`, a lightweight tunnel agent. Supports multi-endpoint failover, hot-reload, and TOML config.
 
-- Docs: `docs/tunnel.md`
-- Security model: only to traverse NAT (TLS/VPN recommended for encryption)
-
-### Agent Setup
-
-Create `~/.config/minitun.toml`:
-
-```toml
-[[tunnel]]
-endpoints = ["lure.example.com:25577"]
-token = "0011223344556677:8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f00112233445566778899aabb"
-```
-
-Run the agent:
-
-```bash
-minitun install --token 0011223344556677:8f1f2a3b... --endpoints lure.example.com:25577
-minitun run
-```
-
-### Route Configuration
-
-Add tunnel flags to a route in Lure's `settings.toml`:
-
-```toml
-[[route]]
-matcher = "behind-nat.example.com"
-endpoint = "10.0.0.12:25565"
-priority = 0
-
-[route.flags]
-tunnel = true
-tunnel_token = "8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f00112233445566778899aabb"
-```
-
-### More Details
-
-See `docs/tunnel.md` for full configuration, systemd integration, multi-endpoint failover, hot reload, and troubleshooting.
+- **Agent docs:** [`tun/README.md`](tun/README.md)
+- **Wire protocol & security:** [`docs/tunnel.md`](docs/tunnel.md)
 
 ## Observability (OTLP)
 
