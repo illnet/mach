@@ -157,9 +157,11 @@ impl HumanDuration {
 
 impl Default for HumanDuration {
     fn default() -> Self {
-        Self(std::time::Duration::from_secs(1))
+        Self(std::time::Duration::from_secs(5))
     }
 }
+
+const MIN_RECONNECT: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn parse_human_duration(s: &str) -> anyhow::Result<std::time::Duration> {
     let s = s.trim();
@@ -667,7 +669,7 @@ async fn run(config: TunConfig, shared: Arc<SharedState>) {
     loop {
         let max_delay = {
             let cfg = shared.config.read().await;
-            cfg.reconnect.as_duration()
+            cfg.reconnect.as_duration().max(MIN_RECONNECT)
         };
 
         let endpoints = &config.endpoints;

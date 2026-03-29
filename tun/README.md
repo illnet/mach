@@ -17,7 +17,7 @@ Copies binary to `~/.local/bin/minitun` and writes config to `~/.config/minitun.
 ```toml
 # only forward to addresses in [map] when true
 strict = false
-reconnect = "1s"
+reconnect = "5s"  # max backoff, floor is 1s
 
 [[tunnel]]
 endpoints = ["lure.example.com:25577"]
