@@ -21,6 +21,18 @@ jobs:
           rustup toolchain install ${{ env.TOOLCHAIN }} --profile minimal --component clippy --component rustfmt
           rustup default ${{ env.TOOLCHAIN }}
 
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ env.TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.TOOLCHAIN }}-
+
       - name: Build (release)
         run: |
           cargo +${{ env.TOOLCHAIN }} build -p lure --bin lure --release --verbose
