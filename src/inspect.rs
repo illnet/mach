@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{sync::atomic::{AtomicU64, Ordering}, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use net::{ProxyProgress, ProxyStats};
@@ -13,6 +13,11 @@ use crate::{
         inspect::{InspectRequest, ListSessionsResponse, ListStatsResponse},
     },
 };
+
+static GLOBAL_C2S_BYTES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_S2C_BYTES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_C2S_CHUNKS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_S2C_CHUNKS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn transport_volume_counter() -> Counter<u64> {
     get_meter()
@@ -47,6 +52,10 @@ fn record_proxy_progress_delta(
     let ds2c_chunks = snap.s2c_chunks.saturating_sub(last.s2c_chunks);
 
     if dc2s_bytes > 0 || ds2c_bytes > 0 || dc2s_chunks > 0 || ds2c_chunks > 0 {
+        log::debug!(
+            "record_proxy_progress_delta: session_id={}, dc2s_bytes={}, ds2c_bytes={}, dc2s_chunks={}, ds2c_chunks={}",
+            inspect.id, dc2s_bytes, ds2c_bytes, dc2s_chunks, ds2c_chunks
+        );
         volume_record.add(dc2s_bytes, core::slice::from_ref(c2st));
         volume_record.add(ds2c_bytes, core::slice::from_ref(s2ct));
         packet_record.add(dc2s_chunks, core::slice::from_ref(c2st));
@@ -57,9 +66,23 @@ fn record_proxy_progress_delta(
         inspect.tenant.record_s2c(ds2c_bytes, ds2c_chunks);
         inspect.instance.record_c2s(dc2s_bytes, dc2s_chunks);
         inspect.instance.record_s2c(ds2c_bytes, ds2c_chunks);
+        // Update global counters for minute-level reporting
+        GLOBAL_C2S_BYTES.fetch_add(dc2s_bytes, Ordering::Relaxed);
+        GLOBAL_S2C_BYTES.fetch_add(ds2c_bytes, Ordering::Relaxed);
+        GLOBAL_C2S_CHUNKS.fetch_add(dc2s_chunks, Ordering::Relaxed);
+        GLOBAL_S2C_CHUNKS.fetch_add(ds2c_chunks, Ordering::Relaxed);
     }
 
     *last = snap;
+}
+
+/// Get and reset global traffic counters (client-to-server bytes, server-to-client bytes, packets).
+pub fn take_global_traffic_snapshot() -> (u64, u64, u64, u64) {
+    let c2s_bytes = GLOBAL_C2S_BYTES.swap(0, Ordering::Relaxed);
+    let s2c_bytes = GLOBAL_S2C_BYTES.swap(0, Ordering::Relaxed);
+    let c2s_chunks = GLOBAL_C2S_CHUNKS.swap(0, Ordering::Relaxed);
+    let s2c_chunks = GLOBAL_S2C_CHUNKS.swap(0, Ordering::Relaxed);
+    (c2s_bytes, s2c_bytes, c2s_chunks, s2c_chunks)
 }
 
 /// Poll [`ProxyProgress`] every 100 ms and push byte/chunk deltas to OTEL
@@ -79,10 +102,18 @@ pub(crate) async fn pump_proxy_progress(
     let s2ct = KeyValue::new("intent", "s2c");
     let c2st = KeyValue::new("intent", "c2s");
     let mut last = ProxyStats::default();
+    let mut tick_count = 0u64;
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                tick_count += 1;
                 let snap = progress.snapshot();
+                if snap.c2s_bytes > 0 || snap.s2c_bytes > 0 {
+                    log::debug!(
+                        "pump_proxy_progress tick {}: session_id={}, snap: c2s_bytes={}, s2c_bytes={}, c2s_chunks={}, s2c_chunks={}",
+                        tick_count, inspect.id, snap.c2s_bytes, snap.s2c_bytes, snap.c2s_chunks, snap.s2c_chunks
+                    );
+                }
                 record_proxy_progress_delta(
                     inspect.as_ref(),
                     &volume_record,
@@ -96,6 +127,10 @@ pub(crate) async fn pump_proxy_progress(
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     let snap = progress.snapshot();
+                    log::debug!(
+                        "pump_proxy_progress shutdown: session_id={}, final snap: c2s_bytes={}, s2c_bytes={}, c2s_chunks={}, s2c_chunks={}",
+                        inspect.id, snap.c2s_bytes, snap.s2c_bytes, snap.c2s_chunks, snap.s2c_chunks
+                    );
                     record_proxy_progress_delta(
                         inspect.as_ref(),
                         &volume_record,

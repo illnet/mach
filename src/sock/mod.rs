@@ -26,6 +26,10 @@ pub(crate) async fn passthrough_now(
     let _ = metrics_task.await;
     let stats = stats?;
     // Record final delta from stats (any remaining bytes not yet reported).
+    log::debug!(
+        "passthrough completed: session_id={}, c2s_bytes={}, s2c_bytes={}",
+        session.id, stats.c2s_bytes, stats.s2c_bytes
+    );
     session.inspect.record_c2s(stats.c2s_bytes);
     session.inspect.record_s2c(stats.s2c_bytes);
     Ok(())

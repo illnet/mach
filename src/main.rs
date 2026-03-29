@@ -1,7 +1,8 @@
-use std::{env, error::Error, io::ErrorKind};
+use std::{env, error::Error, io::ErrorKind, time::Duration};
 
 use lure::{
     config::{LureConfig, LureConfigLoadError, ProxySigningKey},
+    inspect,
     lure::Lure,
     sock::{BackendKind, backend_selection},
     telemetry::{oltp::init_meter, process::ProcessMetricsService},
@@ -151,6 +152,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     let lure = leak(Lure::new(config));
     lure.sync_routes_from_config().await?;
+
+    // Global metrics logger: log aggregate traffic every 60 seconds
+    spawn_named("Global metrics logger", async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let (c2s_bytes, s2c_bytes, c2s_chunks, s2c_chunks) = inspect::take_global_traffic_snapshot();
+            if c2s_bytes > 0 || s2c_bytes > 0 {
+                let c2s_mb = c2s_bytes as f64 / 1_000_000.0;
+                let s2c_mb = s2c_bytes as f64 / 1_000_000.0;
+                log::info!(
+                    "traffic_minute: c2s={:.2}MB packets={} s2c={:.2}MB packets={} total={:.2}MB",
+                    c2s_mb, c2s_chunks, s2c_mb, s2c_chunks, (c2s_mb + s2c_mb)
+                );
+            }
+        }
+    })?;
 
     #[cfg(unix)]
     {
