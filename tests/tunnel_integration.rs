@@ -107,6 +107,10 @@ fn tunnel_protocol_agent_hello_forward_roundtrip() {
                 from: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 25565),
                 to: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 25566),
             },
+            client_addr: Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+                45678,
+            )),
         }),
     };
 
@@ -247,7 +251,7 @@ fn tunnel_hmac_computation() {
 
     // Listen intent (no session)
     let hmac_listen =
-        compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None, None, 0);
+        compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None, None, 0, None);
     assert_eq!(hmac_listen.len(), 32, "HMAC should be 32 bytes");
 
     // Connect intent (with session)
@@ -259,6 +263,7 @@ fn tunnel_hmac_computation() {
         Some(&session),
         None,
         0,
+        None,
     );
     assert_eq!(hmac_connect.len(), 32, "HMAC should be 32 bytes");
 
@@ -270,13 +275,13 @@ fn tunnel_hmac_computation() {
 
     // Same inputs should be deterministic
     let hmac_listen2 =
-        compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None, None, 0);
+        compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None, None, 0, None);
     assert_eq!(hmac_listen, hmac_listen2, "HMAC should be deterministic");
 
     // Different key_id should change HMAC
     let key_id2 = [0x02u8; 8];
     let hmac_different_key =
-        compute_agent_hmac(&secret, &key_id2, timestamp, Intent::Listen, None, None, 0);
+        compute_agent_hmac(&secret, &key_id2, timestamp, Intent::Listen, None, None, 0, None);
     assert_ne!(
         hmac_listen, hmac_different_key,
         "Different key_id should produce different HMAC"
@@ -290,6 +295,7 @@ fn tunnel_hmac_computation() {
         Some(&session),
         Some(&request),
         60,
+        None,
     );
     let hmac_forward_repeat = compute_agent_hmac(
         &secret,
@@ -299,6 +305,7 @@ fn tunnel_hmac_computation() {
         Some(&session),
         Some(&request),
         60,
+        None,
     );
     let hmac_forward_default = compute_agent_hmac(
         &secret,
@@ -308,6 +315,7 @@ fn tunnel_hmac_computation() {
         Some(&session),
         None,
         0,
+        None,
     );
     assert_eq!(hmac_forward.len(), 32, "Forward HMAC should be 32 bytes");
     assert_eq!(
@@ -376,6 +384,7 @@ async fn tunnel_registry_live_auth_handshake() {
                         None,
                         None,
                         0,
+                        None,
                     );
                     registry
                         .register_listener(
@@ -383,6 +392,7 @@ async fn tunnel_registry_live_auth_handshake() {
                             timestamp,
                             listen_hmac,
                             listener_conn,
+                            tun::V3_VERSION,
                         )
                         .await?;
                     let _ = registered_tx.send(());
@@ -399,6 +409,7 @@ async fn tunnel_registry_live_auth_handshake() {
                         Some(&session),
                         None,
                         0,
+                        None,
                     );
                     registry
                         .accept_connect(
@@ -407,6 +418,7 @@ async fn tunnel_registry_live_auth_handshake() {
                             connect_hmac,
                             SessionToken(session),
                             connect_conn,
+                            tun::V3_VERSION,
                         )
                         .await
                 }
