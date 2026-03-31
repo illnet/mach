@@ -32,12 +32,13 @@ pub enum TunnelInspectMsg {
 
 pub struct TunnelInspectHook {
     tx: UnboundedSender<TunnelInspectMsg>,
+    is_master: bool,
 }
 
 impl TunnelInspectHook {
     #[must_use]
-    pub const fn new(tx: UnboundedSender<TunnelInspectMsg>) -> Self {
-        Self { tx }
+    pub fn new(tx: UnboundedSender<TunnelInspectMsg>, is_master: bool) -> Self {
+        Self { tx, is_master }
     }
 }
 
@@ -49,6 +50,9 @@ impl crate::telemetry::event::EventHook<EventEnvelope, EventEnvelope> for Tunnel
         event: &'_ EventEnvelope,
     ) -> anyhow::Result<()> {
         if let EventEnvelope::ListTunnelRequest(req) = event {
+            if !self.is_master {
+                return Ok(());
+            }
             let (tx, rx) = oneshot::channel();
             let _ = self.tx.send(TunnelInspectMsg::Snapshot {
                 req: req.req,
@@ -153,6 +157,7 @@ pub struct MasterForwardTunnelRequest {
     pub session: SessionToken,
     pub ttl: u8,
     pub tunnel_agent_request: tun::TunnelAgentRequest,
+    pub client_addr: Option<SocketAddr>,
 }
 
 pub struct TunnelAgentController {
@@ -178,6 +183,7 @@ pub struct TunnelRegistry {
 
 struct AgentRecord {
     id: u64,
+    version: u8,
     tx: mpsc::Sender<TunnelCommand>,
     task: tokio::task::JoinHandle<()>,
     connected_at: Instant,
@@ -196,6 +202,7 @@ enum TunnelCommand {
         session: SessionToken,
         ttl: u8,
         request: tun::TunnelAgentRequest,
+        client_addr: Option<SocketAddr>,
     },
 }
 
@@ -236,7 +243,13 @@ impl TunnelAgentController {
         let dispatch_result = match dispatch {
             TunnelAgentDispatch::LocalAgent => {
                 self.registry
-                    .forward_request_to_agent(tunnel_id, session, request.tunnel_agent_request, 0)
+                    .forward_request_to_agent(
+                        tunnel_id,
+                        session,
+                        request.tunnel_agent_request,
+                        0,
+                        request.client_addr,
+                    )
                     .await
             }
             TunnelAgentDispatch::Master(master_addr) => {
@@ -283,6 +296,7 @@ impl TunnelAgentController {
                 Some(&request.session.0),
                 Some(&request.tunnel_agent_request),
                 request.ttl,
+                request.client_addr.as_ref(),
                 &hmac,
             )
             .await?;
@@ -299,6 +313,7 @@ impl TunnelAgentController {
                 request.session,
                 request.tunnel_agent_request,
                 request.ttl.saturating_sub(1),
+                request.client_addr,
             )
             .await
     }
@@ -326,6 +341,7 @@ impl TunnelAgentController {
             Some(&request.session.0),
             Some(&request.tunnel_agent_request),
             request.ttl,
+            request.client_addr.as_ref(),
         );
 
         let hello = tun::AgentHello {
@@ -339,6 +355,7 @@ impl TunnelAgentController {
                 session: request.session.0,
                 ttl: request.ttl,
                 request: request.tunnel_agent_request,
+                client_addr: request.client_addr,
             }),
         };
         let mut buf = Vec::new();
@@ -477,6 +494,7 @@ impl TunnelRegistry {
         session: Option<&[u8; 32]>,
         request: Option<&tun::TunnelAgentRequest>,
         ttl: u8,
+        client_addr: Option<&SocketAddr>,
         provided_hmac: &[u8; 32],
     ) -> anyhow::Result<Arc<TokenInfo>> {
         // Check timestamp is within a small window for replay protection.
@@ -509,6 +527,7 @@ impl TunnelRegistry {
             session,
             request,
             ttl,
+            client_addr,
         );
 
         // Constant-time comparison to prevent timing attacks
@@ -528,6 +547,7 @@ impl TunnelRegistry {
         timestamp: u64,
         hmac: [u8; 32],
         mut connection: LureConnection,
+        agent_version: u8,
     ) -> anyhow::Result<()> {
         // Validate HMAC
         let _token_info = self
@@ -538,6 +558,7 @@ impl TunnelRegistry {
                 None,
                 None,
                 0,
+                None,
                 &hmac,
             )
             .await?;
@@ -560,15 +581,30 @@ impl TunnelRegistry {
                         session,
                         ttl,
                         request,
+                        client_addr,
                     } => {
-                        tun::encode_server_msg(
-                            &tun::ServerMsg::ForwardRequest(tun::ForwardRequestMsg {
-                                session: session.0,
-                                ttl,
-                                request,
-                            }),
-                            &mut buf,
-                        );
+                        if agent_version >= tun::VERSION && client_addr.is_some() {
+                            // v4: include real client IP
+                            tun::encode_server_msg(
+                                &tun::ServerMsg::ForwardRequestV4(tun::ForwardRequestV4Msg {
+                                    session: session.0,
+                                    ttl,
+                                    request,
+                                    client_addr: client_addr.expect("checked above"),
+                                }),
+                                &mut buf,
+                            );
+                        } else {
+                            // v3 / legacy: no client IP field
+                            tun::encode_server_msg(
+                                &tun::ServerMsg::ForwardRequest(tun::ForwardRequestMsg {
+                                    session: session.0,
+                                    ttl,
+                                    request,
+                                }),
+                                &mut buf,
+                            );
+                        }
                     }
                 }
                 if connection.write_all(buf).await.is_err() {
@@ -595,6 +631,7 @@ impl TunnelRegistry {
                 key_id,
                 AgentRecord {
                     id,
+                    version: agent_version,
                     tx: tx.clone(),
                     task,
                     connected_at: Instant::now(),
@@ -673,6 +710,7 @@ impl TunnelRegistry {
         session: SessionToken,
         request: tun::TunnelAgentRequest,
         ttl: u8,
+        client_addr: Option<SocketAddr>,
     ) -> anyhow::Result<()> {
         {
             let tokens = self.tokens.read().await;
@@ -702,6 +740,7 @@ impl TunnelRegistry {
                 session,
                 ttl,
                 request,
+                client_addr,
             })
             .await
             .is_ok()
@@ -723,6 +762,7 @@ impl TunnelRegistry {
         hmac: [u8; 32],
         session: SessionToken,
         mut connection: LureConnection,
+        agent_version: u8,
     ) -> anyhow::Result<()> {
         // Validate HMAC with session
         self.validate_hmac(
@@ -732,6 +772,7 @@ impl TunnelRegistry {
             Some(&session.0),
             None,
             0,
+            None,
             &hmac,
         )
         .await?;
@@ -760,12 +801,16 @@ impl TunnelRegistry {
 
         LureLogger::tunnel_session_accepted(&key_id_prefix(&key_id.0), &pending.target);
 
-        let mut buf = Vec::new();
-        tun::encode_server_msg(&tun::ServerMsg::TargetAddr(pending.target), &mut buf);
-        connection
-            .write_all(buf)
-            .await
-            .context("failed to send tunnel target")?;
+        if agent_version < tun::VERSION {
+            // v3 / legacy: send TargetAddr so agent knows where to connect
+            let mut buf = Vec::new();
+            tun::encode_server_msg(&tun::ServerMsg::TargetAddr(pending.target), &mut buf);
+            connection
+                .write_all(buf)
+                .await
+                .context("failed to send tunnel target")?;
+        }
+        // v4+: agent already has target from ForwardRequestV4.request.to; skip round-trip
 
         respond
             .send(connection)

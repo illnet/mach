@@ -662,6 +662,7 @@ async fn run_tun_agent(
         None,
         None,
         0,
+        None,
     );
     send_agent_hello(
         &mut listener,
@@ -744,6 +745,7 @@ async fn handle_session(
         Some(&session),
         None,
         0,
+        None,
     );
     send_agent_hello(
         &mut agent_conn,

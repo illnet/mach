@@ -20,8 +20,8 @@ use crate::{
     },
 };
 
-static GLOBAL_C2S_BYTES: AtomicU64 = AtomicU64::new(0);
-static GLOBAL_S2C_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static GLOBAL_C2S_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static GLOBAL_S2C_BYTES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_C2S_CHUNKS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_S2C_CHUNKS: AtomicU64 = AtomicU64::new(0);
 
@@ -76,6 +76,9 @@ fn record_proxy_progress_delta(
         inspect.tenant.record_s2c(ds2c_bytes, ds2c_chunks);
         inspect.instance.record_c2s(dc2s_bytes, dc2s_chunks);
         inspect.instance.record_s2c(ds2c_bytes, ds2c_chunks);
+        // Update session-level traffic so inspect_sessions() shows live stats
+        inspect.record_c2s_delta(dc2s_bytes, dc2s_chunks);
+        inspect.record_s2c_delta(ds2c_bytes, ds2c_chunks);
         // Update global counters for minute-level reporting
         GLOBAL_C2S_BYTES.fetch_add(dc2s_bytes, Ordering::Relaxed);
         GLOBAL_S2C_BYTES.fetch_add(ds2c_bytes, Ordering::Relaxed);
@@ -96,12 +99,12 @@ pub fn take_global_traffic_snapshot() -> (u64, u64, u64, u64) {
 }
 
 /// Poll [`ProxyProgress`] every 100 ms and push byte/chunk deltas to OTEL
-/// counters and persistent route/tenant/instance stats.
+/// counters and persistent route/tenant/instance/session-level stats.
 ///
 /// Run this concurrently with a proxy future and signal shutdown when the
-/// proxy completes. Session-level `inspect.traffic` is NOT updated here — call
-/// `inspect.record_c2s/s2c` with the final [`net::ProxyStats`] totals after
-/// the proxy finishes.
+/// proxy completes. Session-level `inspect.traffic` is updated here continuously.
+/// After the proxy finishes, reconcile any remaining bytes via the final
+/// [`net::ProxyStats`] totals.
 pub(crate) async fn pump_proxy_progress(
     inspect: Arc<crate::router::inspect::SessionInspectState>,
     progress: Arc<ProxyProgress>,

@@ -103,6 +103,7 @@ pub struct Lure {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) struct EventIdent {
     id: String,
+    is_master: bool,
 }
 
 #[async_trait]
@@ -245,6 +246,10 @@ impl Lure {
         self.tunnels.load_tokens(&snapshot.tunnel).await
     }
 
+    pub async fn inspect_stats(&self) -> crate::router::inspect::StatsSnapshot {
+        self.router.inspect_stats().await
+    }
+
     pub async fn start_with_shutdown(
         &'static self,
         ready: Option<tokio::sync::oneshot::Sender<SocketAddr>>,
@@ -297,8 +302,20 @@ impl Lure {
             })
             .ok();
 
+            let is_master = {
+                let cfg = self.config.read().await;
+                cfg.tunnel
+                    .master_url
+                    .as_ref()
+                    .is_none_or(|v| v.trim().is_empty())
+            };
             let event = init_event(rpc_url);
-            event.hook(EventIdent { id: inst }).await;
+            event
+                .hook(EventIdent {
+                    id: inst,
+                    is_master,
+                })
+                .await;
             event.hook(OwnedStatic::from(self.router)).await;
             event
                 .hook(crate::inspect::InspectHook::new(self.router))
@@ -307,7 +324,10 @@ impl Lure {
                 .hook(crate::tunnel::TunnelControlHook::new(tun_tx))
                 .await;
             event
-                .hook(crate::tunnel::TunnelInspectHook::new(tun_inspect_tx))
+                .hook(crate::tunnel::TunnelInspectHook::new(
+                    tun_inspect_tx,
+                    is_master,
+                ))
                 .await;
             event.clone().start();
         }
@@ -430,8 +450,20 @@ impl Lure {
             })
             .ok();
 
+            let is_master = {
+                let cfg = self.config.read().await;
+                cfg.tunnel
+                    .master_url
+                    .as_ref()
+                    .is_none_or(|v| v.trim().is_empty())
+            };
             let event = init_event(rpc_url);
-            event.hook(EventIdent { id: inst }).await;
+            event
+                .hook(EventIdent {
+                    id: inst,
+                    is_master,
+                })
+                .await;
             event.hook(OwnedStatic::from(self.router)).await;
             event
                 .hook(crate::inspect::InspectHook::new(self.router))
@@ -440,7 +472,10 @@ impl Lure {
                 .hook(crate::tunnel::TunnelControlHook::new(tun_tx))
                 .await;
             event
-                .hook(crate::tunnel::TunnelInspectHook::new(tun_inspect_tx))
+                .hook(crate::tunnel::TunnelInspectHook::new(
+                    tun_inspect_tx,
+                    is_master,
+                ))
                 .await;
             event.clone().start();
         }
@@ -687,7 +722,13 @@ impl Lure {
             };
 
             match self
-                .open_tunnel_status_connection(route.as_ref(), backend_addr, key_id, &handshake_raw)
+                .open_tunnel_status_connection(
+                    route.as_ref(),
+                    backend_addr,
+                    key_id,
+                    &handshake_raw,
+                    client_addr,
+                )
                 .await
             {
                 Ok(server) => server,
@@ -976,6 +1017,7 @@ impl Lure {
                         route.as_ref(),
                         &session,
                         key_id,
+                        address,
                     )
                     .await
                     .map_err(|e| {
@@ -1029,11 +1071,12 @@ impl Lure {
         route: &Route,
         session: &Session,
         key_id: TokenKeyId,
+        client_addr: SocketAddr,
     ) -> anyhow::Result<()> {
         let _ = route; // key selection is performed in the caller
 
         let agent_connection = self
-            .open_tunnel_connection(route, session.destination_addr, key_id)
+            .open_tunnel_connection(route, session.destination_addr, key_id, client_addr)
             .await?;
 
         let mut agent = EncodedConnection::new(agent_connection, SocketIntent::GreetToBackend);
@@ -1055,8 +1098,11 @@ impl Lure {
         target: SocketAddr,
         key_id: TokenKeyId,
         handshake_raw: &[u8],
+        client_addr: SocketAddr,
     ) -> anyhow::Result<EncodedConnection> {
-        let connection = self.open_tunnel_connection(route, target, key_id).await?;
+        let connection = self
+            .open_tunnel_connection(route, target, key_id, client_addr)
+            .await?;
         let mut server = EncodedConnection::new(connection, SocketIntent::GreetToBackend);
         server.send_raw(handshake_raw).await?;
         Ok(server)
@@ -1067,6 +1113,7 @@ impl Lure {
         route: &Route,
         target: SocketAddr,
         key_id: TokenKeyId,
+        client_addr: SocketAddr,
     ) -> anyhow::Result<crate::sock::LureConnection> {
         let mut session_bytes = [0u8; 32];
         fill_random(&mut session_bytes)?;
@@ -1079,6 +1126,7 @@ impl Lure {
                     tunnel_id: key_id,
                     session: session_token,
                     ttl: 1,
+                    client_addr: Some(client_addr),
                     tunnel_agent_request: tun::TunnelAgentRequest {
                         from: self.tunnel_forward_addr().await?,
                         to: target,
@@ -1116,7 +1164,13 @@ impl Lure {
         match hello.intent {
             tun::Intent::Listen => {
                 self.tunnels
-                    .register_listener(key_id, hello.timestamp, hello.hmac, connection)
+                    .register_listener(
+                        key_id,
+                        hello.timestamp,
+                        hello.hmac,
+                        connection,
+                        hello.version,
+                    )
                     .await?;
             }
             tun::Intent::Connect => {
@@ -1130,6 +1184,7 @@ impl Lure {
                         hello.hmac,
                         SessionToken(session),
                         connection,
+                        hello.version,
                     )
                     .await?;
             }
@@ -1147,6 +1202,7 @@ impl Lure {
                             session: SessionToken(forward.session),
                             ttl: forward.ttl,
                             tunnel_agent_request: forward.request,
+                            client_addr: forward.client_addr,
                         },
                         hello.timestamp,
                         hello.hmac,

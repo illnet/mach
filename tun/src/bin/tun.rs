@@ -166,30 +166,19 @@ const MIN_RECONNECT: std::time::Duration = std::time::Duration::from_secs(1);
 fn parse_human_duration(s: &str) -> anyhow::Result<std::time::Duration> {
     let s = s.trim();
     if let Some(ms) = s.strip_suffix("ms") {
-        let n: u64 = ms
-            .trim()
-            .parse()
-            .context("invalid ms value")?;
+        let n: u64 = ms.trim().parse().context("invalid ms value")?;
         return Ok(std::time::Duration::from_millis(n));
     }
     if let Some(secs) = s.strip_suffix('s') {
-        let n: u64 = secs
-            .trim()
-            .parse()
-            .context("invalid s value")?;
+        let n: u64 = secs.trim().parse().context("invalid s value")?;
         return Ok(std::time::Duration::from_secs(n));
     }
     if let Some(mins) = s.strip_suffix('m') {
-        let n: u64 = mins
-            .trim()
-            .parse()
-            .context("invalid m value")?;
+        let n: u64 = mins.trim().parse().context("invalid m value")?;
         return Ok(std::time::Duration::from_secs(n * 60));
     }
     // Fallback: bare integer treated as seconds
-    let n: u64 = s
-        .parse()
-        .context("invalid duration")?;
+    let n: u64 = s.parse().context("invalid duration")?;
     Ok(std::time::Duration::from_secs(n))
 }
 
@@ -218,6 +207,8 @@ impl Serialize for HumanDuration {
 pub struct TunnelEntry {
     pub endpoints: Vec<String>,
     pub token: String,
+    #[serde(default)]
+    pub proxy_protocol: bool,
 }
 
 /// Root config struct. All fields have sane defaults.
@@ -236,8 +227,9 @@ pub struct MiniTunConfig {
 pub struct TunConfig {
     pub key_id: [u8; 8],
     pub secret: [u8; 32],
-    pub label: String,        // hex::encode(key_id)
+    pub label: String,          // hex::encode(key_id)
     pub endpoints: Vec<String>, // raw endpoint strings for round-robin
+    pub proxy_protocol: bool,
 }
 
 impl std::fmt::Debug for TunConfig {
@@ -263,8 +255,8 @@ fn parse_hex_exact<const N: usize>(input: &str) -> Result<[u8; N], String> {
     }
     let mut out = [0u8; N];
     for i in 0..N {
-        let byte = u8::from_str_radix(&trimmed[i * 2..i * 2 + 2], 16)
-            .map_err(|err| err.to_string())?;
+        let byte =
+            u8::from_str_radix(&trimmed[i * 2..i * 2 + 2], 16).map_err(|err| err.to_string())?;
         out[i] = byte;
     }
     Ok(out)
@@ -285,6 +277,7 @@ impl TunConfig {
             secret,
             label: hex::encode(key_id),
             endpoints: entry.endpoints.clone(),
+            proxy_protocol: entry.proxy_protocol,
         })
     }
 }
@@ -361,15 +354,14 @@ fn pid_file_path() -> anyhow::Result<PathBuf> {
 fn load_config(path: &Path) -> anyhow::Result<MiniTunConfig> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config: {}", path.display()))?;
-    toml::from_str(&raw)
-        .with_context(|| format!("parsing config: {}", path.display()))
+    toml::from_str(&raw).with_context(|| format!("parsing config: {}", path.display()))
 }
 
 fn save_config(path: &Path, config: &MiniTunConfig) -> anyhow::Result<()> {
     let serialized = toml::to_string_pretty(config)?;
     // Validate the round-trip: re-parse what we just serialized.
-    let _: MiniTunConfig = toml::from_str(&serialized)
-        .context("config round-trip validation failed")?;
+    let _: MiniTunConfig =
+        toml::from_str(&serialized).context("config round-trip validation failed")?;
     ensure_parent_dir(path)?;
     let tmp_path = path.with_extension("toml.tmp");
     std::fs::write(&tmp_path, &serialized)?;
@@ -386,6 +378,56 @@ fn load_or_default_config(path: &Path) -> MiniTunConfig {
     } else {
         MiniTunConfig::default()
     }
+}
+
+/// Check for legacy env-var-based configuration (MINITUN_ENDPOINT, MINITUN_TOKEN,
+/// MINITUN_TOKENS) and, if found, build a MiniTunConfig from them.
+/// Returns Ok(None) if none of those env vars are set.
+fn try_migrate_from_env() -> anyhow::Result<Option<MiniTunConfig>> {
+    let endpoint_raw = std::env::var("MINITUN_ENDPOINT").unwrap_or_default();
+    let endpoints = parse_endpoints(&endpoint_raw);
+
+    let mut tokens: Vec<String> = Vec::new();
+
+    // Single token shorthand
+    if let Ok(t) = std::env::var("MINITUN_TOKEN") {
+        let t = t.trim().to_owned();
+        if !t.is_empty() {
+            tokens.push(t);
+        }
+    }
+
+    // Multi-token list (comma or newline separated)
+    if let Ok(ts) = std::env::var("MINITUN_TOKENS") {
+        for t in ts.split([',', '\n']) {
+            let t = t.trim().to_owned();
+            if !t.is_empty() && !tokens.contains(&t) {
+                tokens.push(t);
+            }
+        }
+    }
+
+    if tokens.is_empty() {
+        return Ok(None);
+    }
+
+    let mut tunnel_entries: Vec<TunnelEntry> = Vec::new();
+    for tok in &tokens {
+        let entry = TunnelEntry {
+            endpoints: endpoints.clone(),
+            token: tok.clone(),
+            proxy_protocol: false,
+        };
+        // Validate the token is parseable before writing a config
+        TunConfig::from_entry(&entry)
+            .map_err(|e| anyhow::anyhow!("env var token is invalid ({tok}): {e}"))?;
+        tunnel_entries.push(entry);
+    }
+
+    Ok(Some(MiniTunConfig {
+        tunnels: tunnel_entries,
+        ..Default::default()
+    }))
 }
 
 // =============================================================================
@@ -466,11 +508,37 @@ const MAX_CONCURRENT_TUNNEL_SESSIONS: usize = 1000;
 // Session and Tunnel Handling
 // =============================================================================
 
+/// Build a minimal PROXY protocol v2 binary header with the given client address.
+/// No TLV extensions — just the proxy address block.
+fn build_proxy_protocol_v2_header(client_addr: SocketAddr) -> anyhow::Result<Vec<u8>> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+    let (family, address) = match client_addr {
+        SocketAddr::V4(addr) => (
+            net::Family::Inet,
+            net::AddressInfo::Ipv4(addr, SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+        ),
+        SocketAddr::V6(addr) => (
+            net::Family::Inet6,
+            net::AddressInfo::Ipv6(addr, SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
+        ),
+    };
+    let header = net::Header {
+        command: net::Command::Proxy,
+        family,
+        protocol: net::Protocol::Stream,
+        address,
+        tlvs: vec![],
+    };
+    header.serialize().context("PPv2 serialize failed")
+}
+
 async fn handle_session(
     shared: Arc<SharedState>,
     ingress: SocketAddr,
     config: TunConfig,
     session: [u8; 32],
+    client_addr: Option<SocketAddr>, // v4: real client IP for PPv2
+    target_override: Option<SocketAddr>, // v4: skip TargetAddr round-trip
 ) -> anyhow::Result<()> {
     let session_prefix = format!("{:02x}", session[0]);
     let _permit = match shared.session_slots.clone().try_acquire_owned() {
@@ -502,6 +570,7 @@ async fn handle_session(
         Some(&session),
         None,
         0,
+        None,
     );
 
     send_agent_hello(
@@ -520,10 +589,15 @@ async fn handle_session(
 
     let mut buf = Vec::new();
     let mut read_buf = vec![0u8; 1024];
-    let target = loop {
-        match read_server_msg(&mut agent_conn, &mut buf, &mut read_buf).await? {
-            ServerMsg::TargetAddr(addr) => break addr,
-            _ => continue,
+    let target = if let Some(override_addr) = target_override {
+        // v4: target was included in ForwardRequestV4; skip the TargetAddr round-trip
+        override_addr
+    } else {
+        loop {
+            match read_server_msg(&mut agent_conn, &mut buf, &mut read_buf).await? {
+                ServerMsg::TargetAddr(addr) => break addr,
+                _ => continue,
+            }
         }
     };
 
@@ -554,6 +628,18 @@ async fn handle_session(
         target_conn.local_addr().ok(),
         target_conn.peer_addr().ok()
     );
+    // v4: send PROXY protocol v2 header to backend if proxy_protocol is enabled
+    if config.proxy_protocol {
+        if let Some(caddr) = client_addr {
+            let pp =
+                build_proxy_protocol_v2_header(caddr).context("failed to build PPv2 header")?;
+            target_conn
+                .write_all(pp)
+                .await
+                .context("failed to send PPv2 header to backend")?;
+            debug!("PPv2 sent: session={session_prefix} client_addr={caddr}");
+        }
+    }
     if !buf.is_empty() {
         debug!(
             "forwarding buffered tunneled bytes: session={session_prefix} bytes={}",
@@ -598,6 +684,7 @@ async fn listen_once(
         None,
         None,
         0,
+        None,
     );
 
     send_agent_hello(
@@ -624,39 +711,66 @@ async fn listen_once(
     let mut read_buf = vec![0u8; 1024];
     loop {
         let msg = read_server_msg(&mut listener, &mut buf, &mut read_buf).await?;
-        if let ServerMsg::ForwardRequest(forward) = msg {
-            let session_prefix = format!("{:02x}", forward.session[0]);
-            info!(
-                "session forwarded: session={session_prefix} from={} to={}",
-                forward.request.from, forward.request.to
-            );
-            let config = TunConfig {
-                key_id: config.key_id,
-                secret: config.secret,
-                label: config.label.clone(),
-                endpoints: config.endpoints.clone(),
-            };
-            let from = forward.request.from;
-            let shared = Arc::clone(&shared);
-            match net::sock::backend_kind() {
-                net::sock::BackendKind::Tokio | net::sock::BackendKind::Epoll => {
-                    tokio::task::spawn_local(async move {
-                        if let Err(e) =
-                            handle_session(shared, from, config, forward.session).await
-                        {
-                            error!("minitun handle_session failed: {e}");
-                        }
-                    });
-                }
-                net::sock::BackendKind::Uring => {
-                    net::sock::uring::spawn(async move {
-                        if let Err(e) =
-                            handle_session(shared, from, config, forward.session).await
-                        {
-                            error!("minitun handle_session failed: {e}");
-                        }
-                    });
-                }
+        let (session, ingress, client_addr, target_override) = match msg {
+            ServerMsg::ForwardRequest(forward) => {
+                // v3: agent must wait for TargetAddr from server; no client IP
+                (forward.session, forward.request.from, None, None)
+            }
+            ServerMsg::ForwardRequestV4(forward) => {
+                // v4: target is known upfront, real client IP included
+                (
+                    forward.session,
+                    forward.request.from,
+                    Some(forward.client_addr),
+                    Some(forward.request.to),
+                )
+            }
+            _ => continue,
+        };
+        let session_prefix = format!("{:02x}", session[0]);
+        info!(
+            "session forwarded: session={session_prefix} ingress={ingress} client={client_addr:?}",
+        );
+        let config = TunConfig {
+            key_id: config.key_id,
+            secret: config.secret,
+            label: config.label.clone(),
+            endpoints: config.endpoints.clone(),
+            proxy_protocol: config.proxy_protocol,
+        };
+        let shared = Arc::clone(&shared);
+        match net::sock::backend_kind() {
+            net::sock::BackendKind::Tokio | net::sock::BackendKind::Epoll => {
+                tokio::task::spawn_local(async move {
+                    if let Err(e) = handle_session(
+                        shared,
+                        ingress,
+                        config,
+                        session,
+                        client_addr,
+                        target_override,
+                    )
+                    .await
+                    {
+                        error!("minitun handle_session failed: {e}");
+                    }
+                });
+            }
+            net::sock::BackendKind::Uring => {
+                net::sock::uring::spawn(async move {
+                    if let Err(e) = handle_session(
+                        shared,
+                        ingress,
+                        config,
+                        session,
+                        client_addr,
+                        target_override,
+                    )
+                    .await
+                    {
+                        error!("minitun handle_session failed: {e}");
+                    }
+                });
             }
         }
     }
@@ -712,10 +826,7 @@ async fn run(config: TunConfig, shared: Arc<SharedState>) {
     }
 }
 
-fn spawn_tunnel_task(
-    tc: TunConfig,
-    shared: Arc<SharedState>,
-) -> tokio::task::JoinHandle<()> {
+fn spawn_tunnel_task(tc: TunConfig, shared: Arc<SharedState>) -> tokio::task::JoinHandle<()> {
     match net::sock::backend_kind() {
         net::sock::BackendKind::Tokio | net::sock::BackendKind::Epoll => {
             tokio::task::spawn_local(async move {
@@ -796,19 +907,17 @@ async fn apply_reload(
     // Check for changed endpoints/token in existing tunnels.
     let to_restart: Vec<[u8; 8]> = active_configs
         .iter()
-        .filter_map(|(key_id, old_config)| {
-            match new_entries.get(key_id) {
-                Some(new_config) => {
-                    if old_config.endpoints != new_config.endpoints
-                        || old_config.secret != new_config.secret
-                    {
-                        Some(*key_id)
-                    } else {
-                        None
-                    }
+        .filter_map(|(key_id, old_config)| match new_entries.get(key_id) {
+            Some(new_config) => {
+                if old_config.endpoints != new_config.endpoints
+                    || old_config.secret != new_config.secret
+                {
+                    Some(*key_id)
+                } else {
+                    None
                 }
-                None => None,
             }
+            None => None,
         })
         .collect();
 
@@ -867,8 +976,7 @@ async fn run_orchestrator(
 
     // Spawn initial tasks.
     for entry in &initial_config.tunnels {
-        let tc = TunConfig::from_entry(entry)
-            .map_err(|e| anyhow::anyhow!("invalid token: {e}"))?;
+        let tc = TunConfig::from_entry(entry).map_err(|e| anyhow::anyhow!("invalid token: {e}"))?;
         let key_id = tc.key_id;
         let handle = spawn_tunnel_task(tc.clone(), Arc::clone(&shared));
         task_map.insert(key_id, handle);
@@ -944,6 +1052,7 @@ fn run_install(args: InstallArgs) -> anyhow::Result<()> {
             TunConfig::from_entry(&TunnelEntry {
                 endpoints: all_endpoints.clone(),
                 token: token_str.clone(),
+                proxy_protocol: false,
             })
             .map_err(|e| anyhow::anyhow!("{e}"))?;
             parsed_tokens.push((token_str.clone(), all_endpoints.clone()));
@@ -968,6 +1077,7 @@ fn run_install(args: InstallArgs) -> anyhow::Result<()> {
                         config.tunnels.push(TunnelEntry {
                             endpoints: endpoints.clone(),
                             token: token.clone(),
+                            proxy_protocol: false,
                         });
                     }
                 }
@@ -987,8 +1097,8 @@ fn run_install(args: InstallArgs) -> anyhow::Result<()> {
 
     // Set reconnect if given
     if let Some(dur_str) = &args.reconnect {
-        config.reconnect = HumanDuration(parse_human_duration(dur_str)
-            .context("invalid reconnect duration")?);
+        config.reconnect =
+            HumanDuration(parse_human_duration(dur_str).context("invalid reconnect duration")?);
     }
 
     save_config(&path, &config)?;
@@ -1034,9 +1144,8 @@ fn run_update() -> anyhow::Result<()> {
         other => anyhow::bail!("unsupported arch for auto-update: {other}"),
     };
 
-    let url = format!(
-        "https://github.com/hUwUtao/Lure/releases/latest/download/minitun-{os}-{arch}"
-    );
+    let url =
+        format!("https://github.com/hUwUtao/Lure/releases/latest/download/minitun-{os}-{arch}");
     info!("downloading update from {url}");
 
     let client = reqwest::blocking::Client::builder()
@@ -1068,8 +1177,7 @@ fn run_update() -> anyhow::Result<()> {
 fn run_config(args: ConfigArgs) -> anyhow::Result<()> {
     match args.command {
         ConfigCommand::Show => {
-            let path = find_config_path()
-                .ok_or_else(|| anyhow::anyhow!("no config file found"))?;
+            let path = find_config_path().ok_or_else(|| anyhow::anyhow!("no config file found"))?;
             let cfg = load_config(&path)?;
             println!("{}", toml::to_string_pretty(&cfg)?);
         }
@@ -1085,11 +1193,13 @@ fn run_config(args: ConfigArgs) -> anyhow::Result<()> {
             TunConfig::from_entry(&TunnelEntry {
                 endpoints: endpoints.clone(),
                 token: a.token.clone(),
+                proxy_protocol: false,
             })
             .map_err(|e| anyhow::anyhow!("{e}"))?;
             cfg.tunnels.push(TunnelEntry {
                 endpoints,
                 token: a.token,
+                proxy_protocol: false,
             });
             save_config(&path, &cfg)?;
             info!("tunnel added; {} total", cfg.tunnels.len());
@@ -1194,7 +1304,11 @@ RestartSec=2
 WantedBy={wanted_by}
 "#,
         exe = exe.display(),
-        wanted_by = if scope_user { "default.target" } else { "multi-user.target" },
+        wanted_by = if scope_user {
+            "default.target"
+        } else {
+            "multi-user.target"
+        },
     );
 
     let unit_path = unit_dir.join(&service_file);
@@ -1210,11 +1324,15 @@ WantedBy={wanted_by}
     println!();
     println!("# To install:");
     println!("# 1. Copy the above unit file to the appropriate location");
-    println!("# 2. Run: systemctl{} daemon-reload",
-        if scope_user { " --user" } else { "" });
-    println!("# 3. Run: systemctl{} enable --now {}",
+    println!(
+        "# 2. Run: systemctl{} daemon-reload",
+        if scope_user { " --user" } else { "" }
+    );
+    println!(
+        "# 3. Run: systemctl{} enable --now {}",
         if scope_user { " --user" } else { "" },
-        service_file);
+        service_file
+    );
 
     Ok(())
 }
@@ -1230,10 +1348,8 @@ fn run_sign(args: SignArgs) -> anyhow::Result<()> {
     if parts.len() != 2 {
         anyhow::bail!("token format: key_id:secret (both hex-encoded)");
     }
-    let key_id = parse_hex_exact::<8>(parts[0])
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let secret = parse_hex_exact::<32>(parts[1])
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let key_id = parse_hex_exact::<8>(parts[0]).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let secret = parse_hex_exact::<32>(parts[1]).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let timestamp = args.timestamp.unwrap_or_else(|| {
         std::time::SystemTime::now()
@@ -1254,7 +1370,14 @@ fn run_sign(args: SignArgs) -> anyhow::Result<()> {
     };
 
     let hmac = tun::compute_agent_hmac(
-        &secret, &key_id, timestamp, intent, session.as_ref(), None, 0,
+        &secret,
+        &key_id,
+        timestamp,
+        intent,
+        session.as_ref(),
+        None,
+        0,
+        None,
     );
 
     println!("version={}", tun::VERSION);
@@ -1296,11 +1419,31 @@ fn try_main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Run => {
-            let path = find_config_path()
-                .ok_or_else(|| anyhow::anyhow!(
-                    "no config file found; run `minitun install --token <t> --endpoints <e>` first"
-                ))?;
-            let config = load_config(&path)?;
+            let (path, config) = if let Some(path) = find_config_path() {
+                let config = load_config(&path)?;
+                (path, config)
+            } else if let Some(migrated) = try_migrate_from_env()? {
+                let path = default_config_path()?;
+                warn!(
+                    "[migration] no config file found; auto-migrating from env vars \
+                     (MINITUN_ENDPOINT / MINITUN_TOKEN / MINITUN_TOKENS) \
+                     to {}",
+                    path.display()
+                );
+                save_config(&path, &migrated)?;
+                info!(
+                    "[migration] config written to {}. \
+                     Future starts use this file automatically. \
+                     To install as a service: `minitun systemd gensys`",
+                    path.display()
+                );
+                (path, migrated)
+            } else {
+                anyhow::bail!(
+                    "no config file found; run `minitun install --token <t> --endpoints <e>` first, \
+                     or set MINITUN_ENDPOINT and MINITUN_TOKEN env vars"
+                )
+            };
             if config.tunnels.is_empty() {
                 anyhow::bail!("config has no [[tunnel]] entries");
             }
@@ -1335,13 +1478,11 @@ fn try_main() -> anyhow::Result<()> {
         Command::Update => {
             run_update()?;
         }
-        Command::Systemd(args) => {
-            match args.command {
-                SystemdCommand::Gensys { user, system, name } => {
-                    run_systemd_gensys(user, system, name)?;
-                }
+        Command::Systemd(args) => match args.command {
+            SystemdCommand::Gensys { user, system, name } => {
+                run_systemd_gensys(user, system, name)?;
             }
-        }
+        },
         Command::Config(args) => {
             run_config(args)?;
         }

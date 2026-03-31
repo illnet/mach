@@ -771,11 +771,9 @@ static void wslot_process_event(LureEpollWorker *w, uint32_t idx,
         if (side == SIDE_A) {
             rc = splice_forward(s->fd_a, s->a2b_pipe[1], s->a2b_pipe[0],
                                 s->fd_b, &s->a2b_pipe_len, &s->eof_a);
-            if (rc == 0 && s->live) s->live->c2s_chunks++;
         } else {
             rc = splice_forward(s->fd_b, s->b2a_pipe[1], s->b2a_pipe[0],
                                 s->fd_a, &s->b2a_pipe_len, &s->eof_b);
-            if (rc == 0 && s->live) s->live->s2c_chunks++;
         }
         if (rc < 0) {
             wslot_release(w, idx, rc);

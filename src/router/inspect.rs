@@ -52,6 +52,24 @@ impl TrafficCountersAtomic {
         self.s2c_bytes.inc(bytes);
     }
 
+    pub fn record_c2s_delta(&self, bytes: u64, chunks: u64) {
+        self.c2s_chunks.inc(chunks);
+        self.c2s_bytes.inc(bytes);
+    }
+
+    pub fn record_s2c_delta(&self, bytes: u64, chunks: u64) {
+        self.s2c_chunks.inc(chunks);
+        self.s2c_bytes.inc(bytes);
+    }
+
+    pub fn c2s_bytes(&self) -> u64 {
+        self.c2s_bytes.load()
+    }
+
+    pub fn s2c_bytes(&self) -> u64 {
+        self.s2c_bytes.load()
+    }
+
     pub fn snapshot(&self) -> TrafficCounters {
         let now_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -393,18 +411,30 @@ impl SessionInspectState {
         self.tunnel.store(enabled, Ordering::Relaxed);
     }
 
-    pub fn record_c2s(&self, bytes: u64) {
-        self.traffic.record_c2s(bytes);
+    fn touch_last_activity(&self) {
         self.last_activity_ms.store(
             u64::try_from(self.instance.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
         );
     }
 
+    pub fn record_c2s(&self, bytes: u64) {
+        self.traffic.record_c2s(bytes);
+        self.touch_last_activity();
+    }
+
     pub fn record_s2c(&self, bytes: u64) {
         self.traffic.record_s2c(bytes);
-        self.last_activity_ms.store(
-            u64::try_from(self.instance.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-        );
+        self.touch_last_activity();
+    }
+
+    pub fn record_c2s_delta(&self, bytes: u64, chunks: u64) {
+        self.traffic.record_c2s_delta(bytes, chunks);
+        self.touch_last_activity();
+    }
+
+    pub fn record_s2c_delta(&self, bytes: u64, chunks: u64) {
+        self.traffic.record_s2c_delta(bytes, chunks);
+        self.touch_last_activity();
     }
 
     pub fn session_stats_snapshot(&self) -> SessionStats {

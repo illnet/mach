@@ -18,10 +18,13 @@ pub enum TunnelError {
     InvalidMsgKind(u8),
     #[error("invalid address family {0}")]
     InvalidAddrFamily(u8),
+    #[error("missing forward client address")]
+    MissingForwardClientAddr,
 }
 
 pub const MAGIC: [u8; 4] = *b"LTUN";
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
+pub const V3_VERSION: u8 = 3;
 pub const LEGACY_VERSION: u8 = 2;
 const MAX_SOCKET_ADDR_PAYLOAD_LEN: usize = 19;
 
@@ -66,6 +69,7 @@ pub struct ForwardHello {
     pub session: [u8; 32],
     pub ttl: u8,
     pub request: TunnelAgentRequest,
+    pub client_addr: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +79,16 @@ pub struct ForwardRequestMsg {
     pub request: TunnelAgentRequest,
 }
 
+/// Version 4 ForwardRequest — includes the real connecting client's IP address
+/// so the agent can send a PROXY protocol v2 header to the backend immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForwardRequestV4Msg {
+    pub session: [u8; 32],
+    pub ttl: u8,
+    pub request: TunnelAgentRequest, // from = Lure ingress, to = backend target
+    pub client_addr: SocketAddr,     // real client IP/port
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ServerMsgKind {
@@ -82,6 +96,7 @@ pub enum ServerMsgKind {
     TargetAddr = 2,
     ForwardAck = 3,
     ForwardRequest = 4,
+    ForwardRequestV4 = 5,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +105,7 @@ pub enum ServerMsg {
     TargetAddr(SocketAddr),
     ForwardAck([u8; 32]),
     ForwardRequest(ForwardRequestMsg),
+    ForwardRequestV4(ForwardRequestV4Msg),
 }
 
 pub async fn connect_agent(addr: SocketAddr) -> std::io::Result<sock::LureConnection> {
@@ -113,7 +129,7 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
     }
 
     let version = buf[4];
-    if version != VERSION && version != LEGACY_VERSION {
+    if version != VERSION && version != V3_VERSION && version != LEGACY_VERSION {
         return Err(TunnelError::UnsupportedVersion(version));
     }
 
@@ -124,7 +140,7 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
     }
 
     let intent = Intent::from_u8(buf[5])?;
-    if version < VERSION && matches!(intent, Intent::Forward) {
+    if version < V3_VERSION && matches!(intent, Intent::Forward) {
         return Err(TunnelError::UnsupportedVersion(version));
     }
 
@@ -167,12 +183,24 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
                 return Ok(None);
             };
             consumed += consumed_to;
+            let client_addr = if version >= VERSION {
+                let Some((client_addr, consumed_client_addr)) =
+                    decode_socket_addr_payload(&buf[consumed..])?
+                else {
+                    return Ok(None);
+                };
+                consumed += consumed_client_addr;
+                Some(client_addr)
+            } else {
+                None
+            };
             (
                 None,
                 Some(ForwardHello {
                     session,
                     ttl,
                     request: TunnelAgentRequest { from, to },
+                    client_addr,
                 }),
             )
         }
@@ -225,10 +253,16 @@ pub fn encode_agent_hello(hello: &AgentHello, out: &mut Vec<u8>) -> Result<(), T
         }
         Intent::Forward => {
             let forward = hello.forward.as_ref().expect("validated above");
+            if hello.version >= VERSION && forward.client_addr.is_none() {
+                return Err(TunnelError::MissingForwardClientAddr);
+            }
             out.extend_from_slice(&forward.session);
             out.push(forward.ttl);
             encode_socket_addr_payload(forward.request.from, out);
             encode_socket_addr_payload(forward.request.to, out);
+            if hello.version >= VERSION {
+                encode_socket_addr_payload(forward.client_addr.expect("validated above"), out);
+            }
         }
     }
     Ok(())
@@ -254,6 +288,14 @@ pub fn encode_server_msg(msg: &ServerMsg, out: &mut Vec<u8>) {
             out.push(request.ttl);
             encode_socket_addr_payload(request.request.from, out);
             encode_socket_addr_payload(request.request.to, out);
+        }
+        ServerMsg::ForwardRequestV4(msg) => {
+            out.push(ServerMsgKind::ForwardRequestV4 as u8);
+            out.extend_from_slice(&msg.session);
+            out.push(msg.ttl);
+            encode_socket_addr_payload(msg.request.from, out);
+            encode_socket_addr_payload(msg.request.to, out);
+            encode_socket_addr_payload(msg.client_addr, out);
         }
     }
 }
@@ -306,6 +348,37 @@ pub fn decode_server_msg(buf: &[u8]) -> Result<Option<(ServerMsg, usize)>, Tunne
                     request: TunnelAgentRequest { from, to },
                 }),
                 offset + consumed_to,
+            )))
+        }
+        x if x == ServerMsgKind::ForwardRequestV4 as u8 => {
+            // Minimum: kind(1) + session(32) + ttl(1) = 34 bytes before addrs
+            if buf.len() < 34 {
+                return Ok(None);
+            }
+            let mut session = [0u8; 32];
+            session.copy_from_slice(&buf[1..33]);
+            let ttl = buf[33];
+            let mut pos = 34;
+            let Some((from, n)) = decode_socket_addr_payload(&buf[pos..])? else {
+                return Ok(None);
+            };
+            pos += n;
+            let Some((to, n)) = decode_socket_addr_payload(&buf[pos..])? else {
+                return Ok(None);
+            };
+            pos += n;
+            let Some((client_addr, n)) = decode_socket_addr_payload(&buf[pos..])? else {
+                return Ok(None);
+            };
+            pos += n;
+            Ok(Some((
+                ServerMsg::ForwardRequestV4(ForwardRequestV4Msg {
+                    session,
+                    ttl,
+                    request: TunnelAgentRequest { from, to },
+                    client_addr,
+                }),
+                pos,
             )))
         }
         other => Err(TunnelError::InvalidMsgKind(other)),
@@ -364,6 +437,7 @@ pub fn compute_agent_hmac(
     session: Option<&[u8; 32]>,
     request: Option<&TunnelAgentRequest>,
     ttl: u8,
+    client_addr: Option<&SocketAddr>,
 ) -> [u8; 32] {
     use sha2::{Digest, Sha256};
 
@@ -391,6 +465,9 @@ pub fn compute_agent_hmac(
         let mut buf = Vec::with_capacity(MAX_SOCKET_ADDR_PAYLOAD_LEN * 2);
         encode_socket_addr_payload(request.from, &mut buf);
         encode_socket_addr_payload(request.to, &mut buf);
+        if let Some(client_addr) = client_addr {
+            encode_socket_addr_payload(*client_addr, &mut buf);
+        }
         inner.update(buf);
     }
 
@@ -600,6 +677,10 @@ mod tests {
                 session: [8u8; 32],
                 ttl: 1,
                 request,
+                client_addr: Some(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
+                    41234,
+                )),
             }),
         };
         let mut buf = Vec::new();
@@ -612,7 +693,72 @@ mod tests {
         assert_eq!(forward.session, [8u8; 32]);
         assert_eq!(forward.ttl, 1);
         assert_eq!(forward.request, request);
+        assert_eq!(
+            forward.client_addr,
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
+                41234,
+            ))
+        );
         assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn test_decode_agent_hello_v3_forward_roundtrip() {
+        let request = TunnelAgentRequest {
+            from: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), 25565),
+            to: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 2, 3, 4)), 25566),
+        };
+        let hello = AgentHello {
+            version: V3_VERSION,
+            intent: Intent::Forward,
+            key_id: [9u8; 8],
+            timestamp: 111222333,
+            hmac: [7u8; 32],
+            session: None,
+            forward: Some(ForwardHello {
+                session: [8u8; 32],
+                ttl: 1,
+                request,
+                client_addr: None,
+            }),
+        };
+        let mut buf = Vec::new();
+        encode_agent_hello(&hello, &mut buf).unwrap();
+
+        let (decoded, consumed) = decode_agent_hello(&buf).unwrap().unwrap();
+        assert_eq!(decoded.version, V3_VERSION);
+        assert_eq!(decoded.intent, Intent::Forward);
+        let forward = decoded.forward.expect("forward payload");
+        assert_eq!(forward.request, request);
+        assert_eq!(forward.client_addr, None);
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn test_encode_agent_hello_v4_forward_requires_client_addr() {
+        let hello = AgentHello {
+            version: VERSION,
+            intent: Intent::Forward,
+            key_id: [9u8; 8],
+            timestamp: 111222333,
+            hmac: [7u8; 32],
+            session: None,
+            forward: Some(ForwardHello {
+                session: [8u8; 32],
+                ttl: 1,
+                request: TunnelAgentRequest {
+                    from: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), 25565),
+                    to: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 2, 3, 4)), 25566),
+                },
+                client_addr: None,
+            }),
+        };
+        let mut buf = Vec::new();
+        assert!(matches!(
+            encode_agent_hello(&hello, &mut buf),
+            Err(TunnelError::MissingForwardClientAddr)
+        ));
     }
 
     #[test]
@@ -941,7 +1087,16 @@ mod tests {
         let key_id = [0x01u8; 8];
         let timestamp = 1234567890u64;
 
-        let hmac = compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None, None, 0);
+        let hmac = compute_agent_hmac(
+            &secret,
+            &key_id,
+            timestamp,
+            Intent::Listen,
+            None,
+            None,
+            0,
+            None,
+        );
         // HMAC should be 32 bytes
         assert_eq!(hmac.len(), 32);
         assert_eq!(
@@ -965,6 +1120,7 @@ mod tests {
             Some(&session),
             None,
             0,
+            None,
         );
         // HMAC should be 32 bytes
         assert_eq!(hmac.len(), 32);
@@ -977,8 +1133,16 @@ mod tests {
         let timestamp = 1234567890u64;
         let session = [0x99u8; 32];
 
-        let hmac_listen =
-            compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None, None, 0);
+        let hmac_listen = compute_agent_hmac(
+            &secret,
+            &key_id,
+            timestamp,
+            Intent::Listen,
+            None,
+            None,
+            0,
+            None,
+        );
         let hmac_connect = compute_agent_hmac(
             &secret,
             &key_id,
@@ -987,6 +1151,7 @@ mod tests {
             Some(&session),
             None,
             0,
+            None,
         );
 
         // Different intents should produce different HMACs
@@ -1000,8 +1165,16 @@ mod tests {
         let timestamp = 1234567890u64;
         let session = [0x99u8; 32];
 
-        let hmac_without_session =
-            compute_agent_hmac(&secret, &key_id, timestamp, Intent::Connect, None, None, 0);
+        let hmac_without_session = compute_agent_hmac(
+            &secret,
+            &key_id,
+            timestamp,
+            Intent::Connect,
+            None,
+            None,
+            0,
+            None,
+        );
         let hmac_with_session = compute_agent_hmac(
             &secret,
             &key_id,
@@ -1010,6 +1183,7 @@ mod tests {
             Some(&session),
             None,
             0,
+            None,
         );
 
         // Session should change the HMAC
@@ -1022,8 +1196,26 @@ mod tests {
         let key_id = [0x01u8; 8];
         let timestamp = 1234567890u64;
 
-        let hmac1 = compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None, None, 0);
-        let hmac2 = compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None, None, 0);
+        let hmac1 = compute_agent_hmac(
+            &secret,
+            &key_id,
+            timestamp,
+            Intent::Listen,
+            None,
+            None,
+            0,
+            None,
+        );
+        let hmac2 = compute_agent_hmac(
+            &secret,
+            &key_id,
+            timestamp,
+            Intent::Listen,
+            None,
+            None,
+            0,
+            None,
+        );
 
         // Same inputs should produce same HMAC
         assert_eq!(hmac1, hmac2);
@@ -1036,8 +1228,26 @@ mod tests {
         let key_id2 = [0x02u8; 8];
         let timestamp = 1234567890u64;
 
-        let hmac1 = compute_agent_hmac(&secret, &key_id1, timestamp, Intent::Listen, None, None, 0);
-        let hmac2 = compute_agent_hmac(&secret, &key_id2, timestamp, Intent::Listen, None, None, 0);
+        let hmac1 = compute_agent_hmac(
+            &secret,
+            &key_id1,
+            timestamp,
+            Intent::Listen,
+            None,
+            None,
+            0,
+            None,
+        );
+        let hmac2 = compute_agent_hmac(
+            &secret,
+            &key_id2,
+            timestamp,
+            Intent::Listen,
+            None,
+            None,
+            0,
+            None,
+        );
 
         // Different key_ids should produce different HMACs
         assert_ne!(hmac1, hmac2);
@@ -1050,8 +1260,26 @@ mod tests {
         let timestamp1 = 1234567890u64;
         let timestamp2 = 1234567891u64;
 
-        let hmac1 = compute_agent_hmac(&secret, &key_id, timestamp1, Intent::Listen, None, None, 0);
-        let hmac2 = compute_agent_hmac(&secret, &key_id, timestamp2, Intent::Listen, None, None, 0);
+        let hmac1 = compute_agent_hmac(
+            &secret,
+            &key_id,
+            timestamp1,
+            Intent::Listen,
+            None,
+            None,
+            0,
+            None,
+        );
+        let hmac2 = compute_agent_hmac(
+            &secret,
+            &key_id,
+            timestamp2,
+            Intent::Listen,
+            None,
+            None,
+            0,
+            None,
+        );
 
         // Different timestamps should produce different HMACs
         assert_ne!(hmac1, hmac2);
@@ -1064,8 +1292,26 @@ mod tests {
         let key_id = [0x01u8; 8];
         let timestamp = 1234567890u64;
 
-        let hmac1 = compute_agent_hmac(&secret1, &key_id, timestamp, Intent::Listen, None, None, 0);
-        let hmac2 = compute_agent_hmac(&secret2, &key_id, timestamp, Intent::Listen, None, None, 0);
+        let hmac1 = compute_agent_hmac(
+            &secret1,
+            &key_id,
+            timestamp,
+            Intent::Listen,
+            None,
+            None,
+            0,
+            None,
+        );
+        let hmac2 = compute_agent_hmac(
+            &secret2,
+            &key_id,
+            timestamp,
+            Intent::Listen,
+            None,
+            None,
+            0,
+            None,
+        );
 
         // Different secrets should produce different HMACs
         assert_ne!(hmac1, hmac2);
@@ -1090,6 +1336,7 @@ mod tests {
                 to: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 25566),
             }),
             1,
+            None,
         );
         let hmac2 = compute_agent_hmac(
             &secret,
@@ -1102,6 +1349,48 @@ mod tests {
                 to: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 25566),
             }),
             2,
+            None,
+        );
+
+        assert_ne!(hmac1, hmac2);
+    }
+
+    #[test]
+    fn test_compute_agent_hmac_forward_changes_with_client_addr() {
+        let secret = [0x42u8; 32];
+        let key_id = [0x01u8; 8];
+        let session = [0x24u8; 32];
+        let timestamp = 1234567890u64;
+        let request = TunnelAgentRequest {
+            from: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 10)), 25565),
+            to: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 25566),
+        };
+
+        let hmac1 = compute_agent_hmac(
+            &secret,
+            &key_id,
+            timestamp,
+            Intent::Forward,
+            Some(&session),
+            Some(&request),
+            1,
+            Some(&SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+                40000,
+            )),
+        );
+        let hmac2 = compute_agent_hmac(
+            &secret,
+            &key_id,
+            timestamp,
+            Intent::Forward,
+            Some(&session),
+            Some(&request),
+            1,
+            Some(&SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11)),
+                40000,
+            )),
         );
 
         assert_ne!(hmac1, hmac2);
