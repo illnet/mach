@@ -250,8 +250,16 @@ fn tunnel_hmac_computation() {
     };
 
     // Listen intent (no session)
-    let hmac_listen =
-        compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None, None, 0, None);
+    let hmac_listen = compute_agent_hmac(
+        &secret,
+        &key_id,
+        timestamp,
+        Intent::Listen,
+        None,
+        None,
+        0,
+        None,
+    );
     assert_eq!(hmac_listen.len(), 32, "HMAC should be 32 bytes");
 
     // Connect intent (with session)
@@ -274,14 +282,30 @@ fn tunnel_hmac_computation() {
     );
 
     // Same inputs should be deterministic
-    let hmac_listen2 =
-        compute_agent_hmac(&secret, &key_id, timestamp, Intent::Listen, None, None, 0, None);
+    let hmac_listen2 = compute_agent_hmac(
+        &secret,
+        &key_id,
+        timestamp,
+        Intent::Listen,
+        None,
+        None,
+        0,
+        None,
+    );
     assert_eq!(hmac_listen, hmac_listen2, "HMAC should be deterministic");
 
     // Different key_id should change HMAC
     let key_id2 = [0x02u8; 8];
-    let hmac_different_key =
-        compute_agent_hmac(&secret, &key_id2, timestamp, Intent::Listen, None, None, 0, None);
+    let hmac_different_key = compute_agent_hmac(
+        &secret,
+        &key_id2,
+        timestamp,
+        Intent::Listen,
+        None,
+        None,
+        0,
+        None,
+    );
     assert_ne!(
         hmac_listen, hmac_different_key,
         "Different key_id should produce different HMAC"
