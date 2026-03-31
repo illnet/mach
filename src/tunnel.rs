@@ -33,12 +33,21 @@ pub enum TunnelInspectMsg {
 pub struct TunnelInspectHook {
     tx: UnboundedSender<TunnelInspectMsg>,
     is_master: bool,
+    instance_id: String,
 }
 
 impl TunnelInspectHook {
     #[must_use]
-    pub fn new(tx: UnboundedSender<TunnelInspectMsg>, is_master: bool) -> Self {
-        Self { tx, is_master }
+    pub fn new(
+        tx: UnboundedSender<TunnelInspectMsg>,
+        is_master: bool,
+        instance_id: String,
+    ) -> Self {
+        Self {
+            tx,
+            is_master,
+            instance_id,
+        }
     }
 }
 
@@ -64,6 +73,7 @@ impl crate::telemetry::event::EventHook<EventEnvelope, EventEnvelope> for Tunnel
                     .produce_event(EventEnvelope::ListTunnelResponse(
                         crate::telemetry::inspect::ListTunnelResponse {
                             req: req.req,
+                            inst: self.instance_id.clone(),
                             snapshot,
                         },
                     ))

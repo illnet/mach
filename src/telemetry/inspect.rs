@@ -49,6 +49,7 @@ pub struct TunnelInspectSnapshot {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ListTunnelResponse {
     pub req: u64,
+    pub inst: String,
     pub snapshot: TunnelInspectSnapshot,
 }
 
@@ -86,6 +87,7 @@ pub struct SessionInspect {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ListSessionsResponse {
     pub req: u64,
+    pub inst: String,
     pub _v: Vec<SessionInspect>,
 }
 
