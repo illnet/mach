@@ -210,11 +210,15 @@ pub(crate) async fn drive_transport_metrics<F>(
 
 pub(crate) struct InspectHook {
     router: &'static RouterInstance,
+    instance_id: String,
 }
 
 impl InspectHook {
-    pub(crate) const fn new(router: &'static RouterInstance) -> Self {
-        Self { router }
+    pub(crate) fn new(router: &'static RouterInstance, instance_id: String) -> Self {
+        Self {
+            router,
+            instance_id,
+        }
     }
 
     async fn handle_list_sessions(
@@ -226,6 +230,7 @@ impl InspectHook {
         service
             .produce_event(EventEnvelope::ListSessionsResponse(ListSessionsResponse {
                 req: req.req,
+                inst: self.instance_id.clone(),
                 _v: sessions,
             }))
             .await?;

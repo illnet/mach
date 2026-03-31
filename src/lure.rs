@@ -312,13 +312,13 @@ impl Lure {
             let event = init_event(rpc_url);
             event
                 .hook(EventIdent {
-                    id: inst,
+                    id: inst.clone(),
                     is_master,
                 })
                 .await;
             event.hook(OwnedStatic::from(self.router)).await;
             event
-                .hook(crate::inspect::InspectHook::new(self.router))
+                .hook(crate::inspect::InspectHook::new(self.router, inst.clone()))
                 .await;
             event
                 .hook(crate::tunnel::TunnelControlHook::new(tun_tx))
@@ -327,6 +327,7 @@ impl Lure {
                 .hook(crate::tunnel::TunnelInspectHook::new(
                     tun_inspect_tx,
                     is_master,
+                    inst.clone(),
                 ))
                 .await;
             event.clone().start();
@@ -460,13 +461,13 @@ impl Lure {
             let event = init_event(rpc_url);
             event
                 .hook(EventIdent {
-                    id: inst,
+                    id: inst.clone(),
                     is_master,
                 })
                 .await;
             event.hook(OwnedStatic::from(self.router)).await;
             event
-                .hook(crate::inspect::InspectHook::new(self.router))
+                .hook(crate::inspect::InspectHook::new(self.router, inst.clone()))
                 .await;
             event
                 .hook(crate::tunnel::TunnelControlHook::new(tun_tx))
@@ -475,6 +476,7 @@ impl Lure {
                 .hook(crate::tunnel::TunnelInspectHook::new(
                     tun_inspect_tx,
                     is_master,
+                    inst.clone(),
                 ))
                 .await;
             event.clone().start();
