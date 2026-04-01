@@ -320,7 +320,7 @@ pub(crate) fn probe() -> io::Result<()> {
 }
 
 async fn observe_and_trip(shared_addr: usize, progress: Option<Arc<EpollProgress>>) {
-    let mut wd_last_chunks: Option<u64> = None;
+    let mut wd_last_progress: Option<u64> = None;
     let mut wd_tick_100ms = 0u32;
     let mut wd_stall_polls = 0u32;
 
@@ -331,16 +331,17 @@ async fn observe_and_trip(shared_addr: usize, progress: Option<Arc<EpollProgress
             progress.store_stats(stats);
         }
         let state = unsafe { shared.state_flags_volatile() };
-        let chunks = stats.c2s_chunks.saturating_add(stats.s2c_chunks);
+        let progress_bytes = stats.c2s_bytes.saturating_add(stats.s2c_bytes);
 
         // Fast observer loop for stats (100ms), with independent watchdog cadence (5s).
+        // Liveness tracks delivered bytes so slow drain phases do not look stalled.
         wd_tick_100ms = wd_tick_100ms.saturating_add(1);
         if wd_tick_100ms >= 50 {
             wd_tick_100ms = 0;
-            if let Some(prev) = wd_last_chunks {
-                if prev == chunks {
+            if let Some(prev) = wd_last_progress {
+                if prev == progress_bytes {
                     wd_stall_polls = wd_stall_polls.saturating_add(1);
-                    // 12 x 5s windows ~= 60s with no packet progress.
+                    // 12 x 5s windows ~= 60s with no delivered-byte progress.
                     if wd_stall_polls >= 12 {
                         unsafe { shared.set_abort_once() };
                     }
@@ -348,7 +349,7 @@ async fn observe_and_trip(shared_addr: usize, progress: Option<Arc<EpollProgress
                     wd_stall_polls = 0;
                 }
             }
-            wd_last_chunks = Some(chunks);
+            wd_last_progress = Some(progress_bytes);
         }
 
         if (state & LURE_EPOLL_DONE) != 0 {
@@ -926,5 +927,125 @@ impl crate::sock::Sock for Connection {
         peer: Box<dyn crate::sock::Sock>,
     ) -> io::Result<crate::sock::ProxyHandle> {
         (*self).into_proxy(peer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::oneshot,
+        time::{Duration, sleep, timeout},
+    };
+
+    use super::{Connection, Listener};
+
+    async fn run_echo_server(listener: TcpListener) {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    match socket.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            sleep(Duration::from_millis(1)).await;
+                            if socket.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxy_counts_match_full_duplex_payload() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend_task = tokio::spawn(run_echo_server(backend_listener));
+
+        let ingress_listener = Listener::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let ingress_addr = ingress_listener.local_addr().unwrap();
+
+        let (progress_tx, progress_rx) = oneshot::channel();
+        let proxy_task = tokio::spawn(async move {
+            let (incoming, _) = ingress_listener.accept().await.unwrap();
+            let upstream = Connection::connect(backend_addr).await.unwrap();
+            let handle = <Connection as crate::sock::Sock>::into_proxy(
+                Box::new(incoming),
+                Box::new(upstream),
+            )
+            .unwrap();
+            let progress = Arc::clone(&handle.progress);
+            let _ = progress_tx.send(progress);
+            handle.future.await.unwrap()
+        });
+
+        let client = tokio::net::TcpStream::connect(ingress_addr).await.unwrap();
+        client.set_nodelay(true).unwrap();
+        let (mut client_read, mut client_write) = client.into_split();
+        let payload_len = 2 * 1024 * 1024usize;
+        let payload = vec![0x42u8; payload_len];
+
+        let reader = tokio::spawn(async move {
+            let mut total = 0usize;
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                match client_read.read(&mut buf).await {
+                    Ok(0) => break Ok(total),
+                    Ok(n) => total += n,
+                    Err(err) => break Err(err),
+                }
+            }
+        });
+
+        for chunk in payload.chunks(16 * 1024) {
+            client_write.write_all(chunk).await.unwrap();
+            sleep(Duration::from_millis(1)).await;
+        }
+        client_write.shutdown().await.unwrap();
+
+        let progress = progress_rx.await.unwrap();
+        let live = timeout(Duration::from_secs(2), async {
+            loop {
+                let snap = progress.snapshot();
+                if snap.c2s_bytes > 0 && snap.s2c_bytes > 0 {
+                    break snap;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let echoed = timeout(Duration::from_secs(5), reader)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let stats = timeout(Duration::from_secs(5), proxy_task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(live.c2s_chunks > 0);
+        assert!(live.s2c_chunks > 0);
+        assert_eq!(echoed, payload_len);
+        assert_eq!(stats.c2s_bytes, payload_len as u64);
+        assert_eq!(stats.s2c_bytes, payload_len as u64);
+        assert!(stats.c2s_chunks > 0);
+        assert!(stats.s2c_chunks > 0);
+
+        backend_task.abort();
     }
 }

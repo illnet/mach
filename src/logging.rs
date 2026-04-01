@@ -212,6 +212,19 @@ impl LureLogger {
         info!("Tunnel agent registered: token={token_prefix}");
     }
 
+    pub fn tunnel_agent_replaced(
+        token_prefix: &str,
+        old_addr: &SocketAddr,
+        old_version: u8,
+        new_addr: &SocketAddr,
+        new_version: u8,
+    ) {
+        warn!(
+            "Tunnel agent replaced: token={token_prefix} old_peer={old_addr} old_version={old_version} \
+             new_peer={new_addr} new_version={new_version}"
+        );
+    }
+
     pub fn tunnel_agent_disconnected(token_prefix: &str) {
         debug!("Tunnel agent disconnected: token={token_prefix}");
     }

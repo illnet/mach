@@ -29,7 +29,7 @@ const DEFAULT_DURATION_SECS: u64 = 15;
 const DEFAULT_WARMUP_SECS: u64 = 5;
 const DEFAULT_CONCURRENCY: usize = 32;
 const DEFAULT_PAYLOAD: usize = 1024;
-const PROXY_BUF_SIZE: usize = 16 * 1024;
+const DEFAULT_CLIENT_PPS: u64 = 0;
 
 // Nanosecond precision timestamps for each operation
 struct TimestampedLatency {
@@ -38,19 +38,14 @@ struct TimestampedLatency {
     recv_ns: u64,  // Receive phase latency (time to read response)
 }
 
-// Request with embedded timestamp for validation
-#[repr(C)]
-struct PipelinedRequest {
-    seq_num: u64,        // Sequence number for matching
-    send_ts_ns: u64,     // Send timestamp (nanoseconds)
-    padding: [u8; 1008], // Pad to payload size
-}
-
+#[derive(Clone)]
 struct BenchConfig {
     duration: Duration,
     warmup: Duration,
     concurrency: usize,
     payload: usize,
+    client_pps: u64,
+    ramp: Vec<usize>,
 }
 
 struct BenchResult {
@@ -63,7 +58,6 @@ struct BenchResult {
 struct LatencyStats {
     count: usize,
     mean_ms: f64,
-    median_ms: f64,
     p50_ms: f64,
     p95_ms: f64,
     p99_ms: f64,
@@ -73,34 +67,70 @@ struct LatencyStats {
     recv_mean_ms: f64,
 }
 
+struct RampResult {
+    concurrency: usize,
+    result: BenchResult,
+}
+
 fn main() -> anyhow::Result<()> {
     let config = parse_args()?;
     let backend = sock::backend_selection();
 
     println!("backend: {:?} ({})", backend.kind, backend.reason);
     println!(
-        "config: duration={}s warmup={}s concurrency={} payload={}B",
+        "config: duration={}s warmup={}s concurrency={} payload={}B client_pps={} ramp={}",
         config.duration.as_secs(),
         config.warmup.as_secs(),
         config.concurrency,
-        config.payload
+        config.payload,
+        config.client_pps,
+        if config.ramp.is_empty() {
+            "-".to_string()
+        } else {
+            config
+                .ramp
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        }
     );
 
-    let echo = EchoServer::start()?;
-    let proxy = ProxyServer::start(backend.kind, echo.addr, config.payload)?;
-
-    if config.warmup.as_secs() > 0 {
-        let _ = run_client_load(&config, proxy.addr, false)?;
+    if config.ramp.is_empty() {
+        let result = run_once(backend.kind, &config)?;
+        report(&result);
+    } else {
+        let mut results = Vec::with_capacity(config.ramp.len());
+        for &concurrency in &config.ramp {
+            let mut step = config.clone();
+            step.concurrency = concurrency;
+            println!();
+            println!("ramp step: concurrency={concurrency}");
+            results.push(RampResult {
+                concurrency,
+                result: run_once(backend.kind, &step)?,
+            });
+        }
+        report_ramp(&results);
     }
 
-    let result = run_client_load(&config, proxy.addr, true)?;
+    Ok(())
+}
+
+fn run_once(kind: BackendKind, config: &BenchConfig) -> anyhow::Result<BenchResult> {
+    let echo = EchoServer::start()?;
+    let proxy = ProxyServer::start(kind, echo.addr)?;
+
+    if config.warmup.as_secs() > 0 {
+        let _ = run_client_load(config, proxy.addr, false)?;
+    }
+
+    let result = run_client_load(config, proxy.addr, true)?;
 
     proxy.stop();
     echo.stop();
 
-    report(&result);
-
-    Ok(())
+    Ok(result)
 }
 
 fn parse_args() -> anyhow::Result<BenchConfig> {
@@ -108,6 +138,8 @@ fn parse_args() -> anyhow::Result<BenchConfig> {
     let mut warmup = Duration::from_secs(DEFAULT_WARMUP_SECS);
     let mut concurrency = DEFAULT_CONCURRENCY;
     let mut payload = DEFAULT_PAYLOAD;
+    let mut client_pps = DEFAULT_CLIENT_PPS;
+    let mut ramp = Vec::new();
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -127,6 +159,18 @@ fn parse_args() -> anyhow::Result<BenchConfig> {
             "--payload" => {
                 let value = args.next().context("--payload requires a value")?;
                 payload = value.parse()?;
+            }
+            "--client-pps" => {
+                let value = args.next().context("--client-pps requires a value")?;
+                client_pps = value.parse()?;
+            }
+            "--ramp" => {
+                let value = args.next().context("--ramp requires a value")?;
+                ramp = value
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::parse)
+                    .collect::<Result<Vec<_>, _>>()?;
             }
             "--help" | "-h" => {
                 print_help();
@@ -148,6 +192,8 @@ fn parse_args() -> anyhow::Result<BenchConfig> {
         warmup,
         concurrency,
         payload,
+        client_pps,
+        ramp,
     })
 }
 
@@ -157,6 +203,8 @@ fn print_help() {
     println!("  --warmup <secs>       (default {DEFAULT_WARMUP_SECS})");
     println!("  --concurrency <n>      (default {DEFAULT_CONCURRENCY})");
     println!("  --payload <bytes>      (default {DEFAULT_PAYLOAD})");
+    println!("  --client-pps <n>       (default {DEFAULT_CLIENT_PPS}; 0 = unlimited)");
+    println!("  --ramp <a,b,c>         optional concurrency ramp");
 }
 
 fn run_client_load(
@@ -170,8 +218,9 @@ fn run_client_load(
     for _ in 0..config.concurrency {
         let tx = tx.clone();
         let payload = config.payload;
+        let client_pps = config.client_pps;
         thread::spawn(move || {
-            let result = client_worker(proxy_addr, payload, deadline, record_latencies);
+            let result = client_worker(proxy_addr, payload, client_pps, deadline, record_latencies);
             let _ = tx.send(result);
         });
     }
@@ -207,6 +256,7 @@ struct ThreadResult {
 fn client_worker(
     proxy_addr: SocketAddr,
     payload: usize,
+    client_pps: u64,
     deadline: Instant,
     record_latencies: bool,
 ) -> ThreadResult {
@@ -225,18 +275,65 @@ fn client_worker(
     };
     let _ = stream.set_nodelay(true);
 
-    // Pipelined I/O: send multiple requests, then drain responses
-    // This measures send and receive latency separately
-    const PIPELINE_DEPTH: usize = 8;
     let mut write_buf = vec![0u8; payload];
     let mut read_buf = vec![0u8; payload];
-    let mut pending_timestamps = Vec::new(); // vec of send_timestamp
 
     // Pre-fill write buffer with data
     for (i, b) in write_buf.iter_mut().enumerate() {
         *b = (i % 256) as u8;
     }
 
+    if client_pps > 0 {
+        let period = Duration::from_nanos((1_000_000_000u64 / client_pps.max(1)).max(1));
+        let mut next_tick = Instant::now();
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            if now < next_tick {
+                thread::sleep(next_tick - now);
+            }
+
+            let send_start_ns = get_nanos();
+            if stream.write_all(&write_buf).is_err() {
+                break;
+            }
+            let send_end_ns = get_nanos();
+
+            let recv_start_ns = get_nanos();
+            if stream.read_exact(&mut read_buf).is_err() {
+                break;
+            }
+            let recv_end_ns = get_nanos();
+
+            total_ops += 1;
+            if record_latencies {
+                latencies.push(TimestampedLatency {
+                    total_ns: recv_end_ns - send_start_ns,
+                    send_ns: send_end_ns - send_start_ns,
+                    recv_ns: recv_end_ns - recv_start_ns,
+                });
+            }
+
+            next_tick += period;
+            let now = Instant::now();
+            if next_tick < now {
+                next_tick = now;
+            }
+        }
+
+        return ThreadResult {
+            total_ops,
+            total_bytes: total_ops * payload as u64 * 2,
+            latencies,
+        };
+    }
+
+    // Unlimited mode: pipeline multiple writes before reading responses.
+    const PIPELINE_DEPTH: usize = 8;
+    let mut pending_timestamps = Vec::new();
     loop {
         let now = Instant::now();
         if now >= deadline && pending_timestamps.is_empty() {
@@ -332,6 +429,36 @@ fn report(result: &BenchResult) {
     }
 }
 
+fn report_ramp(results: &[RampResult]) {
+    println!();
+    println!("scaling:");
+    println!("  conc | ops/sec | MiB/s | mean ms | p50 ms | p95 ms | p99 ms | max ms");
+    println!("  -----+---------+-------+---------+--------+--------+--------+-------");
+    for entry in results {
+        let duration_secs = entry.result.duration.as_secs_f64().max(0.001);
+        let ops_per_sec = entry.result.total_ops as f64 / duration_secs;
+        let mib_per_sec = entry.result.total_bytes as f64 / (1024.0 * 1024.0) / duration_secs;
+        if let Some(stats) = latency_stats(&entry.result.latencies) {
+            println!(
+                "  {:>4} | {:>7.0} | {:>5.1} | {:>7.3} | {:>6.3} | {:>6.3} | {:>6.3} | {:>6.3}",
+                entry.concurrency,
+                ops_per_sec,
+                mib_per_sec,
+                stats.mean_ms,
+                stats.p50_ms,
+                stats.p95_ms,
+                stats.p99_ms,
+                stats.max_ms
+            );
+        } else {
+            println!(
+                "  {:>4} | {:>7.0} | {:>5.1} | {:>7} | {:>6} | {:>6} | {:>6} | {:>6}",
+                entry.concurrency, ops_per_sec, mib_per_sec, "-", "-", "-", "-", "-"
+            );
+        }
+    }
+}
+
 fn latency_stats(latencies: &[TimestampedLatency]) -> Option<LatencyStats> {
     if latencies.is_empty() {
         return None;
@@ -373,7 +500,6 @@ fn latency_stats(latencies: &[TimestampedLatency]) -> Option<LatencyStats> {
     Some(LatencyStats {
         count,
         mean_ms,
-        median_ms: p50_ms,
         p50_ms,
         p95_ms,
         p99_ms,
@@ -451,14 +577,14 @@ struct ProxyServer {
 }
 
 impl ProxyServer {
-    fn start(kind: BackendKind, backend_addr: SocketAddr, payload: usize) -> anyhow::Result<Self> {
+    fn start(kind: BackendKind, backend_addr: SocketAddr) -> anyhow::Result<Self> {
         let (addr_tx, addr_rx) = std::sync::mpsc::channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
 
         let join = thread::spawn(move || match kind {
-            BackendKind::Tokio => run_proxy_tokio(backend_addr, payload, addr_tx, stop_rx),
-            BackendKind::Epoll => run_proxy_tokio(backend_addr, payload, addr_tx, stop_rx),
-            BackendKind::Uring => run_proxy_uring(backend_addr, payload, addr_tx, stop_rx),
+            BackendKind::Tokio => run_proxy_tokio(backend_addr, addr_tx, stop_rx),
+            BackendKind::Epoll => run_proxy_tokio(backend_addr, addr_tx, stop_rx),
+            BackendKind::Uring => run_proxy_uring(backend_addr, addr_tx, stop_rx),
         });
 
         let addr = addr_rx.recv().context("failed to get proxy addr")?;
@@ -477,7 +603,6 @@ impl ProxyServer {
 
 fn run_proxy_tokio(
     backend_addr: SocketAddr,
-    payload: usize,
     addr_tx: std::sync::mpsc::Sender<SocketAddr>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
@@ -499,7 +624,7 @@ fn run_proxy_tokio(
                         res = listener.accept() => {
                             let (client, _) = res?;
                             tokio::task::spawn_local(async move {
-                                let _ = proxy_connection(client, backend_addr, payload).await;
+                                let _ = proxy_connection(client, backend_addr).await;
                             });
                         }
                     }
@@ -512,7 +637,6 @@ fn run_proxy_tokio(
 
 fn run_proxy_uring(
     backend_addr: SocketAddr,
-    payload: usize,
     addr_tx: std::sync::mpsc::Sender<SocketAddr>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
@@ -527,7 +651,7 @@ fn run_proxy_uring(
                 res = listener.accept() => {
                     let (client, _) = res?;
                     net::sock::uring::spawn(async move {
-                        let _ = proxy_connection(client, backend_addr, payload).await;
+                        let _ = proxy_connection(client, backend_addr).await;
                     });
                 }
             }
@@ -537,56 +661,13 @@ fn run_proxy_uring(
 }
 
 async fn proxy_connection(
-    mut client: sock::LureConnection,
+    client: sock::LureConnection,
     backend_addr: SocketAddr,
-    payload: usize,
 ) -> io::Result<()> {
-    let mut server = sock::LureConnection::connect(backend_addr).await?;
+    let server = sock::LureConnection::connect(backend_addr).await?;
     let _ = client.set_nodelay(true);
     let _ = server.set_nodelay(true);
-
-    let mut c2s_buf = vec![0u8; PROXY_BUF_SIZE];
-    let mut s2c_buf = vec![0u8; PROXY_BUF_SIZE];
-
-    loop {
-        match relay_exact(&mut client, &mut server, c2s_buf, payload).await {
-            Ok(buf) => c2s_buf = buf,
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(err) => return Err(err),
-        }
-        match relay_exact(&mut server, &mut client, s2c_buf, payload).await {
-            Ok(buf) => s2c_buf = buf,
-            Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(err) => return Err(err),
-        }
-    }
-
+    let handle = client.into_proxy(server)?;
+    let _ = handle.future.await?;
     Ok(())
-}
-
-async fn relay_exact(
-    from: &mut sock::LureConnection,
-    to: &mut sock::LureConnection,
-    mut buf: Vec<u8>,
-    mut remaining: usize,
-) -> io::Result<Vec<u8>> {
-    while remaining > 0 {
-        let read_len = remaining.min(PROXY_BUF_SIZE);
-        if buf.len() != read_len {
-            buf.resize(read_len, 0);
-        }
-        let (n, mut out) = from.read_chunk(buf).await?;
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed"));
-        }
-        out.truncate(n);
-        out = to.write_all(out).await?;
-        remaining = remaining.saturating_sub(n);
-        out.clear();
-        if out.capacity() < PROXY_BUF_SIZE {
-            out.reserve_exact(PROXY_BUF_SIZE - out.capacity());
-        }
-        buf = out;
-    }
-    Ok(buf)
 }

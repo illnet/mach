@@ -1128,7 +1128,7 @@ impl Lure {
                     tunnel_id: key_id,
                     session: session_token,
                     ttl: 1,
-                    client_addr: Some(client_addr),
+                    client_addr: route.proxied().then_some(client_addr),
                     tunnel_agent_request: tun::TunnelAgentRequest {
                         from: self.tunnel_forward_addr().await?,
                         to: target,
@@ -1141,7 +1141,14 @@ impl Lure {
             .await?;
 
         match timeout(Duration::from_secs(10), receiver).await {
-            Ok(Ok(conn)) => Ok(conn),
+            Ok(Ok(mut accepted)) => {
+                if route.proxied() && accepted.agent_version < tun::VERSION {
+                    let config = self.config_snapshot().await;
+                    let header = backend::proxy_protocol_header(&config, client_addr)?;
+                    accepted.connection.write_all(header).await?;
+                }
+                Ok(accepted.connection)
+            }
             Ok(Err(_)) => {
                 self.tunnels
                     .rollback_local_session(key_id, session_token)

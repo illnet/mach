@@ -628,17 +628,14 @@ async fn handle_session(
         target_conn.local_addr().ok(),
         target_conn.peer_addr().ok()
     );
-    // v4: send PROXY protocol v2 header to backend if proxy_protocol is enabled
-    if config.proxy_protocol {
-        if let Some(caddr) = client_addr {
-            let pp =
-                build_proxy_protocol_v2_header(caddr).context("failed to build PPv2 header")?;
-            target_conn
-                .write_all(pp)
-                .await
-                .context("failed to send PPv2 header to backend")?;
-            debug!("PPv2 sent: session={session_prefix} client_addr={caddr}");
-        }
+    // v4 request includes client_addr only when Lure wants early PP authoring.
+    if let Some(caddr) = client_addr {
+        let pp = build_proxy_protocol_v2_header(caddr).context("failed to build PPv2 header")?;
+        target_conn
+            .write_all(pp)
+            .await
+            .context("failed to send PPv2 header to backend")?;
+        debug!("PPv2 sent: session={session_prefix} client_addr={caddr}");
     }
     if !buf.is_empty() {
         debug!(

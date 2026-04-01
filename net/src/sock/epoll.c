@@ -41,6 +41,8 @@ struct LureEpollConnection {
 
     int eof_a;
     int eof_b;
+    int hup_a;
+    int hup_b;
     int shut_wr_a;
     int shut_wr_b;
     uint32_t prev_ev_a;  // Track previous interest mask to avoid unnecessary epoll_ctl
@@ -63,6 +65,10 @@ static inline void shared_clear_flag(LureEpollShared* shared, uint32_t flag) {
 
 static inline int conn_abort_requested(const struct LureEpollConnection* conn) {
     return __atomic_load_n(&conn->abort_flag, __ATOMIC_ACQUIRE) != 0;
+}
+
+static inline uint64_t live_progress_bytes(const LureEpollLiveBytes *live) {
+    return live ? (live->c2s_bytes + live->s2c_bytes) : 0;
 }
 
 static inline int set_nonblocking(int fd) {
@@ -113,11 +119,37 @@ static int epoll_mod(int epoll_fd, int fd, uint64_t key, uint32_t events) {
     return epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
 }
 
+// Drain buffered pipe data to dst_fd.
+// Updates *pipe_len with residual bytes in pipe and records delivered bytes.
+// Returns 0 on success or -errno on error.
+static int splice_drain_pipe(int pipe_read, int dst_fd,
+                             size_t *pipe_len, uint64_t *bytes_counter)
+{
+    while (*pipe_len > 0) {
+        ssize_t n = splice(pipe_read, NULL, dst_fd, NULL,
+                           *pipe_len,
+                           SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
+        if (n > 0) {
+            *pipe_len -= (size_t)n;
+            if (bytes_counter) {
+                *bytes_counter += (uint64_t)n;
+            }
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break;  // dst backpressure
+        } else {
+            return -errno;
+        }
+    }
+    return 0;
+}
+
 // Splice data from src_fd into pipe, then drain pipe to dst_fd.
-// Updates *pipe_len with residual bytes in pipe.
+// Updates *pipe_len with residual bytes in pipe and records logical chunk
+// ingress plus delivered bytes.
 // Returns 0 on success, -errno on error, sets *eof if src closed.
 static int splice_forward(int src_fd, int pipe_write, int pipe_read, int dst_fd,
-                          size_t *pipe_len, int *eof)
+                          size_t *pipe_len, int *eof,
+                          uint64_t *bytes_counter, uint64_t *chunks_counter)
 {
     // Fill the pipe from src (only if pipe has room)
     if (*pipe_len < PIPE_CAP && !*eof) {
@@ -126,6 +158,9 @@ static int splice_forward(int src_fd, int pipe_write, int pipe_read, int dst_fd,
                            SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
         if (n > 0) {
             *pipe_len += (size_t)n;
+            if (chunks_counter) {
+                *chunks_counter += 1;
+            }
         } else if (n == 0) {
             *eof = 1;
         } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -133,20 +168,7 @@ static int splice_forward(int src_fd, int pipe_write, int pipe_read, int dst_fd,
         }
     }
 
-    // Drain pipe to dst (as much as possible)
-    while (*pipe_len > 0) {
-        ssize_t n = splice(pipe_read, NULL, dst_fd, NULL,
-                           *pipe_len,
-                           SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
-        if (n > 0) {
-            *pipe_len -= (size_t)n;
-        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            break;  // dst backpressure
-        } else {
-            return -errno;
-        }
-    }
-    return 0;
+    return splice_drain_pipe(pipe_read, dst_fd, pipe_len, bytes_counter);
 }
 
 static int refresh_interest(struct LureEpollConnection* conn) {
@@ -178,6 +200,28 @@ static inline int is_complete(const struct LureEpollConnection* conn) {
            conn->b2a_pipe_len == 0;
 }
 
+static int probe_hup_side_conn(struct LureEpollConnection *conn, int side) {
+    if (side == SIDE_A) {
+        if (!conn->hup_a || conn->eof_a || conn->a2b_pipe_len >= PIPE_CAP) {
+            return 0;
+        }
+        return splice_forward(
+            conn->shared->fd_a, conn->a2b_pipe[1], conn->a2b_pipe[0],
+            conn->shared->fd_b, &conn->a2b_pipe_len, &conn->eof_a,
+            &conn->shared->c2s_bytes, &conn->shared->c2s_chunks
+        );
+    }
+
+    if (!conn->hup_b || conn->eof_b || conn->b2a_pipe_len >= PIPE_CAP) {
+        return 0;
+    }
+    return splice_forward(
+        conn->shared->fd_b, conn->b2a_pipe[1], conn->b2a_pipe[0],
+        conn->shared->fd_a, &conn->b2a_pipe_len, &conn->eof_b,
+        &conn->shared->s2c_bytes, &conn->shared->s2c_chunks
+    );
+}
+
 static void* io_main(void* arg) {
     struct LureEpollConnection* conn = (struct LureEpollConnection*)arg;
     struct epoll_event events[MAX_EVENTS];
@@ -200,66 +244,77 @@ static void* io_main(void* arg) {
         for (int i = 0; i < n; i++) {
             uint32_t ev = events[i].events;
             uint64_t side = events[i].data.u64;
+            int want_read = (ev & (EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0;
+
+            if (ev & (EPOLLHUP | EPOLLRDHUP)) {
+                if (side == SIDE_A) conn->hup_a = 1;
+                else                conn->hup_b = 1;
+            }
 
             if (side == SIDE_A) {
-                if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-                    conn->eof_a = 1;
-                }
-                if (ev & EPOLLIN) {
+                if (want_read) {
                     // Splice from A into a2b pipe, then drain a2b pipe to B
                     int rc = splice_forward(
                         conn->shared->fd_a, conn->a2b_pipe[1], conn->a2b_pipe[0],
-                        conn->shared->fd_b, &conn->a2b_pipe_len, &conn->eof_a
+                        conn->shared->fd_b, &conn->a2b_pipe_len, &conn->eof_a,
+                        &conn->shared->c2s_bytes, &conn->shared->c2s_chunks
                     );
                     if (rc < 0) {
                         conn->result = rc;
                         goto done;
                     }
-                    conn->shared->c2s_bytes += 0;  // Spliced data counted at write endpoint
-                    conn->shared->c2s_chunks += 1;
                 }
                 if (ev & EPOLLOUT) {
                     // Drain remaining b2a pipe data to A
-                    while (conn->b2a_pipe_len > 0) {
-                        ssize_t n = splice(conn->b2a_pipe[0], NULL, conn->shared->fd_a, NULL,
-                                          conn->b2a_pipe_len, SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
-                        if (n > 0) {
-                            conn->b2a_pipe_len -= (size_t)n;
-                            conn->shared->s2c_bytes += (uint64_t)n;
-                        } else {
-                            break;  // backpressure
-                        }
-                    }
-                }
-            } else {
-                if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-                    conn->eof_b = 1;
-                }
-                if (ev & EPOLLIN) {
-                    // Splice from B into b2a pipe, then drain b2a pipe to A
-                    int rc = splice_forward(
-                        conn->shared->fd_b, conn->b2a_pipe[1], conn->b2a_pipe[0],
-                        conn->shared->fd_a, &conn->b2a_pipe_len, &conn->eof_b
+                    int rc = splice_drain_pipe(
+                        conn->b2a_pipe[0],
+                        conn->shared->fd_a,
+                        &conn->b2a_pipe_len,
+                        &conn->shared->s2c_bytes
                     );
                     if (rc < 0) {
                         conn->result = rc;
                         goto done;
                     }
-                    conn->shared->s2c_bytes += 0;  // Spliced data counted at write endpoint
-                    conn->shared->s2c_chunks += 1;
+                }
+            } else {
+                if (want_read) {
+                    // Splice from B into b2a pipe, then drain b2a pipe to A
+                    int rc = splice_forward(
+                        conn->shared->fd_b, conn->b2a_pipe[1], conn->b2a_pipe[0],
+                        conn->shared->fd_a, &conn->b2a_pipe_len, &conn->eof_b,
+                        &conn->shared->s2c_bytes, &conn->shared->s2c_chunks
+                    );
+                    if (rc < 0) {
+                        conn->result = rc;
+                        goto done;
+                    }
                 }
                 if (ev & EPOLLOUT) {
                     // Drain remaining a2b pipe data to B
-                    while (conn->a2b_pipe_len > 0) {
-                        ssize_t n = splice(conn->a2b_pipe[0], NULL, conn->shared->fd_b, NULL,
-                                          conn->a2b_pipe_len, SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
-                        if (n > 0) {
-                            conn->a2b_pipe_len -= (size_t)n;
-                            conn->shared->c2s_bytes += (uint64_t)n;
-                        } else {
-                            break;  // backpressure
-                        }
+                    int rc = splice_drain_pipe(
+                        conn->a2b_pipe[0],
+                        conn->shared->fd_b,
+                        &conn->a2b_pipe_len,
+                        &conn->shared->c2s_bytes
+                    );
+                    if (rc < 0) {
+                        conn->result = rc;
+                        goto done;
                     }
+                }
+            }
+
+            {
+                int rc = probe_hup_side_conn(conn, SIDE_A);
+                if (rc < 0) {
+                    conn->result = rc;
+                    goto done;
+                }
+                rc = probe_hup_side_conn(conn, SIDE_B);
+                if (rc < 0) {
+                    conn->result = rc;
+                    goto done;
                 }
             }
         }
@@ -537,6 +592,7 @@ typedef struct {
     uint64_t conn_id;
 
     int eof_a, eof_b;
+    int hup_a, hup_b;
     int shut_wr_a, shut_wr_b;
     uint32_t prev_ev_a, prev_ev_b;
 
@@ -548,8 +604,8 @@ typedef struct {
     LureEpollLiveBytes *live;  /* Rust-allocated live counter region (may be NULL) */
 
     uint32_t abort_flag;   /* set atomically from other threads */
-    uint32_t stall_ticks;  /* watchdog: ticks with no chunk progress */
-    uint64_t prev_chunks;  /* chunk snapshot at last watchdog pass */
+    uint32_t stall_ticks;  /* watchdog: ticks with no delivered-byte progress */
+    uint64_t prev_progress;  /* byte-progress snapshot at last watchdog pass */
 
     int32_t next_free;     /* free-list linkage; -1 == end of list */
     int     active;        /* 1 while slot is occupied */
@@ -753,6 +809,7 @@ fail:
 static void wslot_process_event(LureEpollWorker *w, uint32_t idx,
                                 int side, uint32_t ev) {
     LureEpollSlot *s = &w->slots[idx];
+    int want_read = (ev & (EPOLLIN | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0;
     if (!s->active) return;
 
     /* Check for externally requested abort. */
@@ -761,19 +818,23 @@ static void wslot_process_event(LureEpollWorker *w, uint32_t idx,
         return;
     }
 
-    if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-        if (side == SIDE_A) s->eof_a = 1;
-        else                s->eof_b = 1;
+    if (ev & (EPOLLHUP | EPOLLRDHUP)) {
+        if (side == SIDE_A) s->hup_a = 1;
+        else                s->hup_b = 1;
     }
 
-    if (ev & EPOLLIN) {
+    if (want_read) {
         int rc;
         if (side == SIDE_A) {
             rc = splice_forward(s->fd_a, s->a2b_pipe[1], s->a2b_pipe[0],
-                                s->fd_b, &s->a2b_pipe_len, &s->eof_a);
+                                s->fd_b, &s->a2b_pipe_len, &s->eof_a,
+                                s->live ? &s->live->c2s_bytes : NULL,
+                                s->live ? &s->live->c2s_chunks : NULL);
         } else {
             rc = splice_forward(s->fd_b, s->b2a_pipe[1], s->b2a_pipe[0],
-                                s->fd_a, &s->b2a_pipe_len, &s->eof_b);
+                                s->fd_a, &s->b2a_pipe_len, &s->eof_b,
+                                s->live ? &s->live->s2c_bytes : NULL,
+                                s->live ? &s->live->s2c_chunks : NULL);
         }
         if (rc < 0) {
             wslot_release(w, idx, rc);
@@ -784,30 +845,53 @@ static void wslot_process_event(LureEpollWorker *w, uint32_t idx,
     if (ev & EPOLLOUT) {
         if (side == SIDE_A) {
             /* Drain b2a pipe to A (s2c direction). */
-            while (s->b2a_pipe_len > 0) {
-                ssize_t n = splice(s->b2a_pipe[0], NULL, s->fd_a, NULL,
-                                   s->b2a_pipe_len, SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
-                if (n > 0) {
-                    s->b2a_pipe_len -= (size_t)n;
-                    if (s->live) {
-                        s->live->s2c_bytes   += (uint64_t)n;
-                        s->live->s2c_chunks  += 1;
-                    }
-                } else break;
+            int rc = splice_drain_pipe(
+                s->b2a_pipe[0],
+                s->fd_a,
+                &s->b2a_pipe_len,
+                s->live ? &s->live->s2c_bytes : NULL
+            );
+            if (rc < 0) {
+                wslot_release(w, idx, rc);
+                return;
             }
         } else {
             /* Drain a2b pipe to B (c2s direction). */
-            while (s->a2b_pipe_len > 0) {
-                ssize_t n = splice(s->a2b_pipe[0], NULL, s->fd_b, NULL,
-                                   s->a2b_pipe_len, SPLICE_F_NONBLOCK | SPLICE_F_MOVE);
-                if (n > 0) {
-                    s->a2b_pipe_len -= (size_t)n;
-                    if (s->live) {
-                        s->live->c2s_bytes   += (uint64_t)n;
-                        s->live->c2s_chunks  += 1;
-                    }
-                } else break;
+            int rc = splice_drain_pipe(
+                s->a2b_pipe[0],
+                s->fd_b,
+                &s->a2b_pipe_len,
+                s->live ? &s->live->c2s_bytes : NULL
+            );
+            if (rc < 0) {
+                wslot_release(w, idx, rc);
+                return;
             }
+        }
+    }
+
+    if (s->hup_a && !s->eof_a && s->a2b_pipe_len < PIPE_CAP) {
+        int rc = splice_forward(
+            s->fd_a, s->a2b_pipe[1], s->a2b_pipe[0],
+            s->fd_b, &s->a2b_pipe_len, &s->eof_a,
+            s->live ? &s->live->c2s_bytes : NULL,
+            s->live ? &s->live->c2s_chunks : NULL
+        );
+        if (rc < 0) {
+            wslot_release(w, idx, rc);
+            return;
+        }
+    }
+    if (s->hup_b && !s->eof_b && s->b2a_pipe_len < PIPE_CAP) {
+        int rc = splice_forward(
+            s->fd_b, s->b2a_pipe[1], s->b2a_pipe[0],
+            s->fd_a, &s->b2a_pipe_len, &s->eof_b,
+            s->live ? &s->live->s2c_bytes : NULL,
+            s->live ? &s->live->s2c_chunks : NULL
+        );
+        if (rc < 0) {
+            wslot_release(w, idx, rc);
+            return;
         }
     }
 
@@ -878,8 +962,8 @@ static void scan_stale_slots(LureEpollWorker *w) {
             continue;
         }
 
-        uint64_t chunks = (s->live ? (s->live->c2s_chunks + s->live->s2c_chunks) : 0);
-        if (chunks == s->prev_chunks) {
+        uint64_t progress = live_progress_bytes(s->live);
+        if (progress == s->prev_progress) {
             s->stall_ticks++;
             if (s->stall_ticks >= WORKER_STALL_TICKS_MAX) {
                 wslot_release(w, i, -ETIMEDOUT);
@@ -887,7 +971,7 @@ static void scan_stale_slots(LureEpollWorker *w) {
             }
         } else {
             s->stall_ticks = 0;
-            s->prev_chunks = chunks;
+            s->prev_progress = progress;
         }
     }
 }

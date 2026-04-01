@@ -52,6 +52,13 @@ pub async fn connect(
     Ok(server.into_inner())
 }
 
+pub(crate) fn proxy_protocol_header(
+    config: &LureConfig,
+    client_addr: SocketAddr,
+) -> anyhow::Result<Vec<u8>> {
+    Ok(create_proxy_protocol_header(client_addr, config)?.to_vec())
+}
+
 fn backend_handshake_parts<'a>(
     handshake: &'a OwnedHandshake,
     endpoint_host: Option<&str>,

@@ -174,6 +174,11 @@ pub struct TunnelAgentController {
     registry: Arc<TunnelRegistry>,
 }
 
+pub struct AcceptedTunnelConnection {
+    pub connection: LureConnection,
+    pub agent_version: u8,
+}
+
 pub struct TunnelRegistry {
     /// Token registry by `key_id`
     tokens: RwLock<HashMap<TokenKeyId, Arc<TokenInfo>>>,
@@ -194,6 +199,7 @@ pub struct TunnelRegistry {
 struct AgentRecord {
     id: u64,
     version: u8,
+    peer_addr: SocketAddr,
     tx: mpsc::Sender<TunnelCommand>,
     task: tokio::task::JoinHandle<()>,
     connected_at: Instant,
@@ -203,7 +209,7 @@ struct AgentRecord {
 struct PendingSession {
     key_id: TokenKeyId,
     target: SocketAddr,
-    respond: Option<oneshot::Sender<LureConnection>>,
+    respond: Option<oneshot::Sender<AcceptedTunnelConnection>>,
     created_at: Instant,
 }
 
@@ -242,7 +248,7 @@ impl TunnelAgentController {
         target: SocketAddr,
         auth_mode: &AuthMode,
         dispatch: TunnelAgentDispatch,
-    ) -> anyhow::Result<oneshot::Receiver<LureConnection>> {
+    ) -> anyhow::Result<oneshot::Receiver<AcceptedTunnelConnection>> {
         let tunnel_id = request.tunnel_id;
         let session = request.session;
         let receiver = self
@@ -559,6 +565,8 @@ impl TunnelRegistry {
         mut connection: LureConnection,
         agent_version: u8,
     ) -> anyhow::Result<()> {
+        let peer_addr = *connection.addr();
+
         // Validate HMAC
         let _token_info = self
             .validate_hmac(
@@ -632,22 +640,31 @@ impl TunnelRegistry {
         .context("failed to spawn tunnel listener task")?;
 
         // Replace any existing registration for this key_id (common on agent restart).
-        {
+        let old = {
             let mut agents = self.agents.write().await;
-            if let Some(old) = agents.remove(&key_id) {
-                old.task.abort();
-            }
             agents.insert(
                 key_id,
                 AgentRecord {
                     id,
                     version: agent_version,
+                    peer_addr,
                     tx: tx.clone(),
                     task,
                     connected_at: Instant::now(),
                     offers_sent: 0,
                 },
+            )
+        };
+
+        if let Some(old) = old {
+            LureLogger::tunnel_agent_replaced(
+                &key_id_prefix(&key_id.0),
+                &old.peer_addr,
+                old.version,
+                &peer_addr,
+                agent_version,
             );
+            old.task.abort();
         }
 
         Ok(())
@@ -659,7 +676,7 @@ impl TunnelRegistry {
         session: SessionToken,
         target: SocketAddr,
         auth_mode: &AuthMode,
-    ) -> anyhow::Result<oneshot::Receiver<LureConnection>> {
+    ) -> anyhow::Result<oneshot::Receiver<AcceptedTunnelConnection>> {
         // If the key_id isn't currently registered, don't offer a session (prevents
         // offering to stale/removed tokens and avoids pending-session leaks).
         {
@@ -823,7 +840,10 @@ impl TunnelRegistry {
         // v4+: agent already has target from ForwardRequestV4.request.to; skip round-trip
 
         respond
-            .send(connection)
+            .send(AcceptedTunnelConnection {
+                connection,
+                agent_version,
+            })
             .map_err(|_| anyhow::anyhow!("pending tunnel session closed"))?;
 
         let agents = self.agents.read().await;
