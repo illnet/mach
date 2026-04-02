@@ -361,7 +361,7 @@ impl TunnelAgentController {
         );
 
         let hello = tun::AgentHello {
-            version: tun::VERSION,
+            version: forward_wire_version(request.client_addr),
             intent: tun::Intent::Forward,
             key_id: request.tunnel_id.0,
             timestamp,
@@ -1044,6 +1044,14 @@ fn parse_secret(secret_str: &str) -> anyhow::Result<[u8; 32]> {
     Ok(out)
 }
 
+fn forward_wire_version(client_addr: Option<SocketAddr>) -> u8 {
+    if client_addr.is_some() {
+        tun::VERSION
+    } else {
+        tun::V3_VERSION
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1091,5 +1099,14 @@ mod tests {
         let snapshot = registry.inspect_snapshot().await;
         assert_eq!(snapshot.pending_total, 1);
         assert!(snapshot.pending[0].target.contains("127.0.0.1:25565"));
+    }
+
+    #[test]
+    fn forward_wire_version_tracks_proxy_metadata_availability() {
+        assert_eq!(forward_wire_version(None), tun::V3_VERSION);
+        assert_eq!(
+            forward_wire_version(Some("203.0.113.9:41234".parse().unwrap())),
+            tun::VERSION
+        );
     }
 }
