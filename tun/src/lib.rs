@@ -1,4 +1,4 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub use net::sock;
 
@@ -18,8 +18,6 @@ pub enum TunnelError {
     InvalidMsgKind(u8),
     #[error("invalid address family {0}")]
     InvalidAddrFamily(u8),
-    #[error("missing forward client address")]
-    MissingForwardClientAddr,
 }
 
 pub const MAGIC: [u8; 4] = *b"LTUN";
@@ -86,7 +84,7 @@ pub struct ForwardRequestV4Msg {
     pub session: [u8; 32],
     pub ttl: u8,
     pub request: TunnelAgentRequest, // from = Lure ingress, to = backend target
-    pub client_addr: SocketAddr,     // real client IP/port
+    pub client_addr: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,7 +188,7 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
                     return Ok(None);
                 };
                 consumed += consumed_client_addr;
-                Some(client_addr)
+                decode_forward_client_addr(client_addr)
             } else {
                 None
             };
@@ -253,15 +251,12 @@ pub fn encode_agent_hello(hello: &AgentHello, out: &mut Vec<u8>) -> Result<(), T
         }
         Intent::Forward => {
             let forward = hello.forward.as_ref().expect("validated above");
-            if hello.version >= VERSION && forward.client_addr.is_none() {
-                return Err(TunnelError::MissingForwardClientAddr);
-            }
             out.extend_from_slice(&forward.session);
             out.push(forward.ttl);
             encode_socket_addr_payload(forward.request.from, out);
             encode_socket_addr_payload(forward.request.to, out);
             if hello.version >= VERSION {
-                encode_socket_addr_payload(forward.client_addr.expect("validated above"), out);
+                encode_socket_addr_payload(forward_client_addr_wire_value(forward.client_addr), out);
             }
         }
     }
@@ -295,7 +290,7 @@ pub fn encode_server_msg(msg: &ServerMsg, out: &mut Vec<u8>) {
             out.push(msg.ttl);
             encode_socket_addr_payload(msg.request.from, out);
             encode_socket_addr_payload(msg.request.to, out);
-            encode_socket_addr_payload(msg.client_addr, out);
+            encode_socket_addr_payload(forward_client_addr_wire_value(msg.client_addr), out);
         }
     }
 }
@@ -376,12 +371,24 @@ pub fn decode_server_msg(buf: &[u8]) -> Result<Option<(ServerMsg, usize)>, Tunne
                     session,
                     ttl,
                     request: TunnelAgentRequest { from, to },
-                    client_addr,
+                    client_addr: decode_forward_client_addr(client_addr),
                 }),
                 pos,
             )))
         }
         other => Err(TunnelError::InvalidMsgKind(other)),
+    }
+}
+
+fn forward_client_addr_wire_value(client_addr: Option<SocketAddr>) -> SocketAddr {
+    client_addr.unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+}
+
+fn decode_forward_client_addr(client_addr: SocketAddr) -> Option<SocketAddr> {
+    if client_addr.ip().is_unspecified() && client_addr.port() == 0 {
+        None
+    } else {
+        Some(client_addr)
     }
 }
 
@@ -736,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_agent_hello_v4_forward_requires_client_addr() {
+    fn test_encode_agent_hello_v4_forward_roundtrip_without_client_addr() {
         let hello = AgentHello {
             version: VERSION,
             intent: Intent::Forward,
@@ -755,10 +762,12 @@ mod tests {
             }),
         };
         let mut buf = Vec::new();
-        assert!(matches!(
-            encode_agent_hello(&hello, &mut buf),
-            Err(TunnelError::MissingForwardClientAddr)
-        ));
+        encode_agent_hello(&hello, &mut buf).unwrap();
+
+        let (decoded, consumed) = decode_agent_hello(&buf).unwrap().unwrap();
+        let forward = decoded.forward.expect("forward payload");
+        assert_eq!(forward.client_addr, None);
+        assert_eq!(consumed, buf.len());
     }
 
     #[test]
@@ -967,6 +976,25 @@ mod tests {
         let (decoded, consumed) = decode_server_msg(&buf).unwrap().unwrap();
         assert_eq!(decoded, msg);
         assert_eq!(consumed, 33);
+    }
+
+    #[test]
+    fn test_decode_server_msg_forward_request_v4_roundtrip_without_client_addr() {
+        let msg = ServerMsg::ForwardRequestV4(ForwardRequestV4Msg {
+            session: [0xCD; 32],
+            ttl: 1,
+            request: TunnelAgentRequest {
+                from: "10.0.0.1:25565".parse().unwrap(),
+                to: "10.0.0.2:25566".parse().unwrap(),
+            },
+            client_addr: None,
+        });
+        let mut buf = Vec::new();
+        encode_server_msg(&msg, &mut buf);
+
+        let (decoded, consumed) = decode_server_msg(&buf).unwrap().unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(consumed, buf.len());
     }
 
     #[test]

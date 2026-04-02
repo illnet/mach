@@ -361,7 +361,7 @@ impl TunnelAgentController {
         );
 
         let hello = tun::AgentHello {
-            version: forward_wire_version(request.client_addr),
+            version: tun::VERSION,
             intent: tun::Intent::Forward,
             key_id: request.tunnel_id.0,
             timestamp,
@@ -601,14 +601,15 @@ impl TunnelRegistry {
                         request,
                         client_addr,
                     } => {
-                        if agent_version >= tun::VERSION && client_addr.is_some() {
-                            // v4: include real client IP
+                        if agent_version >= tun::VERSION {
+                            // v4+: keep the target inline and encode a sentinel client address
+                            // when no proxy metadata is being forwarded.
                             tun::encode_server_msg(
                                 &tun::ServerMsg::ForwardRequestV4(tun::ForwardRequestV4Msg {
                                     session: session.0,
                                     ttl,
                                     request,
-                                    client_addr: client_addr.expect("checked above"),
+                                    client_addr,
                                 }),
                                 &mut buf,
                             );
@@ -1044,14 +1045,6 @@ fn parse_secret(secret_str: &str) -> anyhow::Result<[u8; 32]> {
     Ok(out)
 }
 
-fn forward_wire_version(client_addr: Option<SocketAddr>) -> u8 {
-    if client_addr.is_some() {
-        tun::VERSION
-    } else {
-        tun::V3_VERSION
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,11 +1095,29 @@ mod tests {
     }
 
     #[test]
-    fn forward_wire_version_tracks_proxy_metadata_availability() {
-        assert_eq!(forward_wire_version(None), tun::V3_VERSION);
-        assert_eq!(
-            forward_wire_version(Some("203.0.113.9:41234".parse().unwrap())),
-            tun::VERSION
+    fn tunnel_v4_forward_request_keeps_optional_proxy_metadata() {
+        let mut buf = Vec::new();
+        tun::encode_server_msg(
+            &tun::ServerMsg::ForwardRequestV4(tun::ForwardRequestV4Msg {
+                session: [0xAB; 32],
+                ttl: 1,
+                request: tun::TunnelAgentRequest {
+                    from: "10.0.0.1:25565".parse().unwrap(),
+                    to: "10.0.0.2:25566".parse().unwrap(),
+                },
+                client_addr: None,
+            }),
+            &mut buf,
         );
+
+        let (decoded, consumed) = tun::decode_server_msg(&buf).unwrap().unwrap();
+        assert_eq!(consumed, buf.len());
+        match decoded {
+            tun::ServerMsg::ForwardRequestV4(msg) => {
+                assert_eq!(msg.request.to, "10.0.0.2:25566".parse().unwrap());
+                assert_eq!(msg.client_addr, None);
+            }
+            other => panic!("unexpected server msg: {other:?}"),
+        }
     }
 }

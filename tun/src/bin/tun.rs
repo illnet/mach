@@ -550,10 +550,15 @@ async fn handle_session(
             return Ok(());
         }
     };
+    let connect_version = if target_override.is_some() {
+        tun::VERSION
+    } else {
+        tun::V3_VERSION
+    };
     info!(
         "session forwarded: key_id={} session={session_prefix} (connecting back to edge, wire_version={})",
         config.label,
-        tun::VERSION
+        connect_version
     );
     let mut agent_conn = tun::connect_agent(ingress).await?;
     tune_socket(&agent_conn);
@@ -576,7 +581,7 @@ async fn handle_session(
     send_agent_hello(
         &mut agent_conn,
         AgentHello {
-            version: tun::VERSION,
+            version: connect_version,
             intent: Intent::Connect,
             key_id: config.key_id,
             timestamp,
@@ -714,11 +719,12 @@ async fn listen_once(
                 (forward.session, forward.request.from, None, None)
             }
             ServerMsg::ForwardRequestV4(forward) => {
-                // v4: target is known upfront, real client IP included
+                // v4: target is known upfront; client_addr is present only when
+                // Lure wants the tunnel to emit PROXY protocol.
                 (
                     forward.session,
                     forward.request.from,
-                    Some(forward.client_addr),
+                    forward.client_addr,
                     Some(forward.request.to),
                 )
             }
