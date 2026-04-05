@@ -66,6 +66,8 @@ uring = ["net/uring"]
 
 [profile.release]
 incremental = true
+lto = "thin"
+strip = "symbols"
 
 [profile.profiling]
 inherits = "release"
