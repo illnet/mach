@@ -6,6 +6,7 @@ edition = "2024"
 [lib]
 name = "tun"
 path = "src/lib.rs"
+doctest = false
 
 [[bin]]
 name = "minitun"
@@ -14,8 +15,7 @@ path = "src/bin/tun.rs"
 [dependencies]
 thiserror = "2.0"
 net = { path = "../net" }
-tokio = { version = "1.48", features = ["rt-multi-thread", "signal", "sync", "time", "macros"] }
-base64 = "0.22"
+tokio = { version = "1.48", default-features = false, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 anyhow = "1.0"
 sha2 = "0.11"
 clap = { version = "4", features = ["derive", "env"] }

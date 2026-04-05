@@ -4,11 +4,11 @@ version = "0.5.0"
 edition = "2024"
 default-run = "lure"
 
-[workspace.metadata.cargo-shear]
-ignored = ["tonic"]
-
 [workspace]
 members = ["net", "tun"]
+
+[lib]
+doctest = false
 
 [dependencies]
 anyhow = "1.0"
@@ -16,51 +16,41 @@ bytes = "1.10"
 log = "0.4.27"
 libc = "0.2"
 net = { path = "net" }
-num_cpus = "1.16"
 tun = { path = "tun" }
-opentelemetry = "0.31"
-opentelemetry-otlp = { version = "0.31", features = ["tokio", "http-proto", "reqwest-rustls-webpki-roots", "http-json"] }
+opentelemetry = { version = "0.31", default-features = false, features = ["metrics", "trace"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-rustls-webpki-roots", "metrics", "trace"] }
 dotenvy = "0.15"
-opentelemetry-stdout = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["tokio", "tokio-stream", "rt-tokio", "http", "url"] }
+opentelemetry-stdout = { version = "0.31", default-features = false, features = ["metrics"], optional = true }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["metrics", "trace", "rt-tokio"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
-# tokio = { version = "1.27", features = ["full", "rt-multi-thread", "tracing"] }
-tokio = { version = "1.48", features = ["full", "rt-multi-thread", "tracing"] }
+tokio = { version = "1.48", default-features = false, features = ["io-util", "macros", "rt-multi-thread", "signal", "sync", "time", "tracing"] }
 toml = "1.1"
 async-trait = "0.1"
 futures = "0.3"
 # Use rustls to support fully-static musl builds (avoid system OpenSSL).
-reqwest = { version = "0.13", default-features = false, features = ["stream", "gzip", "rustls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 serde_json = "1.0"
-governor = "0.10"
+governor = { version = "0.10", default-features = false, features = ["dashmap", "quanta", "std"] }
 thiserror = "2.0"
 base64 = "0.22"
 ed25519-dalek = { version = "2.1", features = ["std"] }
 getrandom = "0.4"
-hmac = "0.12"
-sha2 = "0.11"
 subtle = "2.5"
 hex = "0.4"
 mimalloc = { version = "0.1", optional = true }
-tonic = { version = "0.14", optional = true }
 tokio-metrics = "0.4"
 env_logger = "0.11"
 fake_serialize = "0.1"
-console-subscriber = "0.5"
 sentry = { version = "0.47.0", default-features = false, features = ["backtrace", "contexts", "debug-images", "panic", "reqwest", "rustls", "tokio"] }
 
 [features]
 # by default we build HTTP-only
 default = ["mimalloc", "tokio_unstable"]
 # if you want gRPC support, `cargo build --features grpc-tonic`
-grpc-tonic = [
-    "opentelemetry-otlp/tonic",
-    "opentelemetry-otlp/grpc-tonic",
-    "dep:tonic",
-]
+grpc-tonic = ["opentelemetry-otlp/grpc-tonic"]
 mimalloc = ["dep:mimalloc"]
 tokio_unstable = []
-verbose = []
+verbose = ["dep:opentelemetry-stdout"]
 packet-debug = ["net/packet-debug"]
 uring = ["net/uring"]
 

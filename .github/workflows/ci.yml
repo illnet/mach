@@ -1,0 +1,326 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      publish_docker:
+        description: "Push the Linux Docker image"
+        required: false
+        default: false
+        type: boolean
+      publish_release:
+        description: "Publish a GitHub release for a tag ref"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  CARGO_TERM_COLOR: always
+  TOOLCHAIN: nightly-2026-02-06
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    outputs:
+      pack_base: ${{ steps.meta.outputs.pack_base }}
+      publish_docker: ${{ steps.meta.outputs.publish_docker }}
+      publish_release: ${{ steps.meta.outputs.publish_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute workflow metadata
+        id: meta
+        shell: bash
+        run: |
+          version="$(
+            cargo metadata --no-deps --format-version 1 | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for pkg in data.get("packages", []):
+              if pkg.get("name") == "lure":
+                  print(pkg.get("version", ""))
+                  break
+          '
+          )"
+          gitsha="$(git rev-parse --short=12 HEAD)"
+          pack_base="lure_${version}+${gitsha}"
+
+          publish_docker=false
+          publish_release=false
+
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            if [[ "${{ github.ref }}" == "refs/heads/main" || "${{ github.ref }}" == refs/tags/* ]]; then
+              publish_docker=true
+            fi
+            if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+              publish_release=true
+            fi
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.publish_docker }}" == "true" ]]; then
+              publish_docker=true
+            fi
+            if [[ "${{ inputs.publish_release }}" == "true" && "${{ github.ref }}" == refs/tags/* ]]; then
+              publish_release=true
+            fi
+          fi
+
+          echo "pack_base=${pack_base}" >> "$GITHUB_OUTPUT"
+          echo "publish_docker=${publish_docker}" >> "$GITHUB_OUTPUT"
+          echo "publish_release=${publish_release}" >> "$GITHUB_OUTPUT"
+
+  linux_build:
+    runs-on: ubuntu-latest
+    needs: prep
+    env:
+      CARGO_TARGET_DIR: target-linux
+      TARGET: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools pkg-config
+          sudo rm -rf /var/lib/apt/lists/*
+
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ runner.os }}-linux-${{ env.TOOLCHAIN }}-${{ env.TARGET }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-linux-${{ env.TOOLCHAIN }}-${{ env.TARGET }}-
+
+      - name: Install nightly toolchain
+        run: |
+          rustup toolchain install ${{ env.TOOLCHAIN }} --profile minimal --component clippy --component rustfmt
+          rustup target add ${{ env.TARGET }} --toolchain ${{ env.TOOLCHAIN }}
+
+      - name: Build release binaries
+        run: |
+          cargo +${{ env.TOOLCHAIN }} build -p lure --bin lure --release --target ${{ env.TARGET }} --verbose
+          cargo +${{ env.TOOLCHAIN }} build -p tun --bin minitun --release --target ${{ env.TARGET }} --verbose
+
+      - name: Run tests
+        run: cargo +${{ env.TOOLCHAIN }} test --release --target ${{ env.TARGET }} --verbose
+
+      - name: Prepare Linux artifact
+        shell: bash
+        run: |
+          mkdir -p artifacts/linux-amd64
+          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/lure artifacts/linux-amd64/lure
+          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/minitun artifacts/linux-amd64/minitun
+          cp README.md LICENSE settings.toml artifacts/linux-amd64/
+          chmod +x artifacts/linux-amd64/lure artifacts/linux-amd64/minitun
+          (
+            cd artifacts/linux-amd64
+            sha256sum lure minitun README.md LICENSE settings.toml > SHA256SUMS
+          )
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64
+          path: artifacts/linux-amd64
+          if-no-files-found: error
+          overwrite: true
+
+  windows_build:
+    runs-on: windows-latest
+    needs: prep
+    env:
+      CARGO_TARGET_DIR: target-windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install ${{ env.TOOLCHAIN }} --profile minimal --component clippy --component rustfmt
+
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\.cargo\registry\index\
+            ~\.cargo\registry\cache\
+            ~\.cargo\git\db\
+            ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ runner.os }}-windows-${{ env.TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-windows-${{ env.TOOLCHAIN }}-
+
+      - name: Build release binaries
+        shell: pwsh
+        run: |
+          cargo +${{ env.TOOLCHAIN }} build -p lure --bin lure --release --verbose
+          cargo +${{ env.TOOLCHAIN }} build -p tun --bin minitun --release --verbose
+
+      - name: Prepare Windows artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts/windows-amd64 | Out-Null
+          Copy-Item -Force $env:CARGO_TARGET_DIR\release\lure.exe artifacts/windows-amd64/lure.exe
+          Copy-Item -Force $env:CARGO_TARGET_DIR\release\minitun.exe artifacts/windows-amd64/minitun.exe
+          Copy-Item -Force README.md artifacts/windows-amd64/README.md
+          Copy-Item -Force LICENSE artifacts/windows-amd64/LICENSE
+          Copy-Item -Force settings.toml artifacts/windows-amd64/settings.toml
+          $hashLines = @(
+            (Get-FileHash -Algorithm SHA256 artifacts/windows-amd64/lure.exe).Hash.ToLower() + "  lure.exe"
+            (Get-FileHash -Algorithm SHA256 artifacts/windows-amd64/minitun.exe).Hash.ToLower() + "  minitun.exe"
+            (Get-FileHash -Algorithm SHA256 artifacts/windows-amd64/README.md).Hash.ToLower() + "  README.md"
+            (Get-FileHash -Algorithm SHA256 artifacts/windows-amd64/LICENSE).Hash.ToLower() + "  LICENSE"
+            (Get-FileHash -Algorithm SHA256 artifacts/windows-amd64/settings.toml).Hash.ToLower() + "  settings.toml"
+          )
+          $hashLines | Out-File -Encoding ascii artifacts/windows-amd64/SHA256SUMS
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-amd64
+          path: artifacts/windows-amd64
+          if-no-files-found: error
+          overwrite: true
+
+  bundle:
+    runs-on: ubuntu-latest
+    needs:
+      - prep
+      - linux_build
+      - windows_build
+    steps:
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64
+          path: bundle/linux-amd64
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-amd64
+          path: bundle/windows-amd64
+
+      - name: Create combined bundle
+        shell: bash
+        run: |
+          mkdir -p dist
+          bundle_name="${{ needs.prep.outputs.pack_base }}_bundle.zip"
+          (
+            cd bundle
+            zip -r "../dist/${bundle_name}" linux-amd64 windows-amd64
+          )
+          (
+            cd dist
+            mkdir -p release-assets
+            cp ../bundle/linux-amd64/lure release-assets/lure-linux-x86_64
+            cp ../bundle/linux-amd64/minitun release-assets/minitun-linux-x86_64
+            cp ../bundle/linux-amd64/minitun release-assets/minitun
+            cp ../bundle/windows-amd64/lure.exe release-assets/lure-windows-x86_64.exe
+            cp ../bundle/windows-amd64/minitun.exe release-assets/minitun-windows-x86_64.exe
+
+            sha256sum "${bundle_name}" release-assets/* > SHA256SUMS
+          )
+
+      - name: Upload combined bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: combined-bundle
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS
+            dist/release-assets/*
+          if-no-files-found: error
+          overwrite: true
+
+  docker:
+    runs-on: ubuntu-latest
+    needs:
+      - prep
+      - linux_build
+    if: needs.prep.outputs.publish_docker == 'true'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64
+          path: artifacts/linux-amd64
+
+      - name: Stage Docker payload
+        run: cp artifacts/linux-amd64/lure ./lure
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,format=long
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.copy
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  release:
+    runs-on: ubuntu-latest
+    needs:
+      - prep
+      - bundle
+    if: needs.prep.outputs.publish_release == 'true'
+    permissions:
+      contents: write
+    steps:
+      - name: Download combined bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: combined-bundle
+          path: dist
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS
+            dist/release-assets/*

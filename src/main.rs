@@ -40,9 +40,6 @@ fn try_main() -> Result<(), Box<dyn Error>> {
     }
 
     let _ = dotenvy::dotenv();
-    if env_flag_enabled("LURE_ENABLE_TOKIO_CONSOLE") {
-        console_subscriber::init();
-    }
     #[cfg(debug_assertions)]
     env_logger::builder()
         .filter_level(log::LevelFilter::Debug)
@@ -292,13 +289,4 @@ fn apply_tunnel_master_url(config: &mut LureConfig) {
 
     config.tunnel.master_url = Some(trimmed.to_string());
     log::info!("tunnel master url loaded from env");
-}
-
-fn env_flag_enabled(name: &str) -> bool {
-    env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
 }
