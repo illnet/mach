@@ -1,6 +1,6 @@
 [package]
 name = "tun"
-version = "0.1.0"
+version = "0.5.3"
 edition = "2024"
 
 [lib]
@@ -24,6 +24,6 @@ log = "0.4"
 env_logger = "0.11"
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.1"
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"] }
 libc = "0.2"
-sentry = { version = "0.47.0", default-features = false, features = ["backtrace", "contexts", "debug-images", "panic", "reqwest", "rustls", "tokio"] }
+sentry = { version = "0.47.0", default-features = false, features = ["contexts", "panic", "rustls", "ureq"] }
