@@ -16,7 +16,7 @@ set -euo pipefail
 
 REPO="${REPO:-hUwUtao/Lure}"
 RELEASE="${RELEASE:-latest}"             # latest or a tag like v5.0
-ASSET="${ASSET:-minitun}"                # latest flat release asset name
+ASSET="${ASSET:-minitun-linux-x86_64}"   # default Linux x86_64 release asset
 SCOPE="${SCOPE:-system}"                 # user | system
 SERVICE_NAME="${SERVICE_NAME:-}"         # blank => auto
 BIN_PATH="${BIN_PATH:-}"                 # blank => minitun decides

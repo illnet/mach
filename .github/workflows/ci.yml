@@ -129,7 +129,18 @@ jobs:
           mkdir -p artifacts/linux-amd64
           cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/lure artifacts/linux-amd64/lure
           cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/minitun artifacts/linux-amd64/minitun
-          cp README.md LICENSE settings.toml artifacts/linux-amd64/
+          cp README.md LICENSE artifacts/linux-amd64/
+          if [[ -f settings.toml ]]; then
+            cp settings.toml artifacts/linux-amd64/settings.toml
+          else
+            printf '%s\n' \
+              'inst = "main"' \
+              'bind = "0.0.0.0:25577"' \
+              'max_conn = 65535' \
+              'cooldown = 3' \
+              'rate_limit_by_ip = 10' \
+              > artifacts/linux-amd64/settings.toml
+          fi
           chmod +x artifacts/linux-amd64/lure artifacts/linux-amd64/minitun
           (
             cd artifacts/linux-amd64
@@ -183,7 +194,17 @@ jobs:
           Copy-Item -Force $env:CARGO_TARGET_DIR\release\minitun.exe artifacts/windows-amd64/minitun.exe
           Copy-Item -Force README.md artifacts/windows-amd64/README.md
           Copy-Item -Force LICENSE artifacts/windows-amd64/LICENSE
-          Copy-Item -Force settings.toml artifacts/windows-amd64/settings.toml
+          if (Test-Path settings.toml) {
+            Copy-Item -Force settings.toml artifacts/windows-amd64/settings.toml
+          } else {
+            @(
+              'inst = "main"'
+              'bind = "0.0.0.0:25577"'
+              'max_conn = 65535'
+              'cooldown = 3'
+              'rate_limit_by_ip = 10'
+            ) | Out-File -Encoding ascii artifacts/windows-amd64/settings.toml
+          }
           $hashLines = @(
             (Get-FileHash -Algorithm SHA256 artifacts/windows-amd64/lure.exe).Hash.ToLower() + "  lure.exe"
             (Get-FileHash -Algorithm SHA256 artifacts/windows-amd64/minitun.exe).Hash.ToLower() + "  minitun.exe"
@@ -234,7 +255,6 @@ jobs:
             mkdir -p release-assets
             cp ../bundle/linux-amd64/lure release-assets/lure-linux-x86_64
             cp ../bundle/linux-amd64/minitun release-assets/minitun-linux-x86_64
-            cp ../bundle/linux-amd64/minitun release-assets/minitun
             cp ../bundle/windows-amd64/lure.exe release-assets/lure-windows-x86_64.exe
             cp ../bundle/windows-amd64/minitun.exe release-assets/minitun-windows-x86_64.exe
 
