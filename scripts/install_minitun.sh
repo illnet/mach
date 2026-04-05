@@ -17,7 +17,7 @@ set -euo pipefail
 REPO="${REPO:-hUwUtao/Lure}"
 RELEASE="${RELEASE:-latest}"             # latest or a tag like v5.0
 ASSET="${ASSET:-minitun}"                # latest flat release asset name
-SCOPE="${SCOPE:-user}"                   # user | system
+SCOPE="${SCOPE:-system}"                 # user | system
 SERVICE_NAME="${SERVICE_NAME:-}"         # blank => auto
 BIN_PATH="${BIN_PATH:-}"                 # blank => minitun decides
 RUST_LOG="${RUST_LOG:-info}"
@@ -26,6 +26,7 @@ TOKENS_TEXT="${TOKENS_TEXT:-}"           # comma/newline/semicolon-separated key
 ENABLE_NOW="${ENABLE_NOW:-1}"            # 1 to enable+start, 0 to just write unit
 MIGRATE_TUNURE="${MIGRATE_TUNURE:-1}"    # 1 to auto-discover/migrate old tunure services
 KEEP_LEGACY_BIN="${KEEP_LEGACY_BIN:-0}"  # 1 to keep old tunure binary after migration
+MIGRATE_MINITUN_USER="${MIGRATE_MINITUN_USER:-1}"  # 1 to migrate old user-scope minitun service
 DOWNLOAD_URL="${DOWNLOAD_URL:-}"         # blank => latest-release URL from REPO/ASSET
 
 declare -a TOKENS=()
@@ -300,6 +301,32 @@ if is_true "$MIGRATE_TUNURE"; then
 
         echo "==> migrated legacy tunure installation(s) to minitun" >&2
         exit 0
+    fi
+fi
+
+if [[ "$SCOPE" == "system" ]] && is_true "$MIGRATE_MINITUN_USER"; then
+    # Detect and migrate old user-scope minitun service(s) to system scope
+    local user_unit_dir="${XDG_CONFIG_HOME:-${HOME:-}/.config}/systemd/user"
+    shopt -s nullglob
+    user_units=("${user_unit_dir}"/minitun*.service)
+    shopt -u nullglob
+
+    if [[ ${#user_units[@]} -gt 0 ]]; then
+        echo "==> found ${#user_units[@]} user-scope minitun unit(s); migrating to system" >&2
+        for unit_path in "${user_units[@]}"; do
+            svc="$(basename "${unit_path%.service}")"
+            systemctl --user disable --now "${svc}.service" >/dev/null 2>&1 || true
+            rm -f "$unit_path"
+            echo "==> removed user unit: $unit_path" >&2
+        done
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+    fi
+
+    # Migrate user config to /etc/minitun.toml (if /etc version doesn't exist)
+    user_cfg="${XDG_CONFIG_HOME:-${HOME:-}/.config}/minitun.toml"
+    if [[ -f "$user_cfg" && ! -f /etc/minitun.toml ]]; then
+        echo "==> copying user config $user_cfg → /etc/minitun.toml" >&2
+        cp "$user_cfg" /etc/minitun.toml
     fi
 fi
 

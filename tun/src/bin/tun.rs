@@ -27,7 +27,7 @@ struct Cli {
 enum Command {
     /// Start the tunnel agent using ~/.config/minitun.toml
     Run,
-    /// Install binary to ~/.local/bin/minitun and manage config
+    /// Install binary and manage config (user: ~/.local/bin, system: /usr/local/bin)
     Install(InstallArgs),
     /// Send SIGHUP to the running minitun process to reload config
     Reload,
@@ -68,6 +68,10 @@ struct InstallArgs {
     /// Set reconnect backoff duration (e.g. "1s", "500ms", "2m").
     #[arg(long)]
     reconnect: Option<String>,
+
+    /// Install system-wide: binary → /usr/local/bin/minitun, config → /etc/minitun.toml.
+    #[arg(long)]
+    system: bool,
 }
 
 #[derive(Args)]
@@ -110,10 +114,10 @@ struct SystemdArgs {
 enum SystemdCommand {
     /// Generate a systemd unit file template for the current config.
     Gensys {
-        /// Install as a per-user service (default).
+        /// Install as a per-user service.
         #[arg(long)]
         user: bool,
-        /// Install as a system-wide service.
+        /// Install as a system-wide service (default).
         #[arg(long)]
         system: bool,
         /// Service name (default: minitun).
@@ -328,6 +332,10 @@ fn find_config_path() -> Option<PathBuf> {
             return Some(p);
         }
     }
+    let etc = PathBuf::from("/etc/minitun.toml");
+    if etc.exists() {
+        return Some(etc);
+    }
     let local = PathBuf::from("minitun.toml");
     if local.exists() {
         return Some(local);
@@ -336,15 +344,17 @@ fn find_config_path() -> Option<PathBuf> {
 }
 
 fn default_config_path() -> anyhow::Result<PathBuf> {
-    xdg_config_home()
-        .map(|h| h.join("minitun.toml"))
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve $HOME or $XDG_CONFIG_HOME"))
+    if let Some(h) = xdg_config_home() {
+        return Ok(h.join("minitun.toml"));
+    }
+    Ok(PathBuf::from("/etc/minitun.toml"))
 }
 
 fn pid_file_path() -> anyhow::Result<PathBuf> {
-    xdg_config_home()
-        .map(|h| h.join("minitun.pid"))
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve $HOME or $XDG_CONFIG_HOME"))
+    if let Some(h) = xdg_config_home() {
+        return Ok(h.join("minitun.pid"));
+    }
+    Ok(PathBuf::from("/run/minitun.pid"))
 }
 
 // =============================================================================
@@ -1027,14 +1037,17 @@ async fn run_orchestrator(
 // =============================================================================
 
 fn run_install(args: InstallArgs) -> anyhow::Result<()> {
-    // Copy binary to ~/.local/bin/minitun
-    if let Err(err) = copy_self_to(
-        &home_dir()
+    // Copy binary to ~/.local/bin/minitun (user) or /usr/local/bin/minitun (system)
+    let bin_dest = if args.system {
+        PathBuf::from("/usr/local/bin/minitun")
+    } else {
+        home_dir()
             .ok_or_else(|| anyhow::anyhow!("HOME not set"))?
             .join(".local")
             .join("bin")
-            .join("minitun"),
-    ) {
+            .join("minitun")
+    };
+    if let Err(err) = copy_self_to(&bin_dest) {
         error!("failed to install binary: {err}");
     }
 
@@ -1250,7 +1263,7 @@ fn run_config(args: ConfigArgs) -> anyhow::Result<()> {
 }
 
 fn run_systemd_gensys(user: bool, system: bool, name: Option<String>) -> anyhow::Result<()> {
-    let scope_user = if system { false } else { true };
+    let scope_user = user && !system;
     if system && user {
         anyhow::bail!("choose one: --user or --system");
     }
@@ -1289,6 +1302,8 @@ fn run_systemd_gensys(user: bool, system: bool, name: Option<String>) -> anyhow:
         format!("{normalized_service}.service")
     };
 
+    let working_dir = if scope_user { "~" } else { "/etc" };
+
     // Generate unit file content.
     let unit_content = format!(
         r#"[Unit]
@@ -1299,7 +1314,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart={exe} run
-WorkingDirectory=~
+WorkingDirectory={working_dir}
 Restart=always
 RestartSec=2
 
@@ -1307,6 +1322,7 @@ RestartSec=2
 WantedBy={wanted_by}
 "#,
         exe = exe.display(),
+        working_dir = working_dir,
         wanted_by = if scope_user {
             "default.target"
         } else {
