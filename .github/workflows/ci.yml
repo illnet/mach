@@ -17,10 +17,14 @@ on:
         default: false
         type: boolean
       publish_release:
-        description: "Publish a GitHub release for a tag ref"
+        description: "Publish a GitHub release"
         required: false
         default: false
         type: boolean
+      release_tag:
+        description: "Tag name for manual releases, for example v0.5.3"
+        required: false
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -35,6 +39,7 @@ jobs:
       pack_base: ${{ steps.meta.outputs.pack_base }}
       publish_docker: ${{ steps.meta.outputs.publish_docker }}
       publish_release: ${{ steps.meta.outputs.publish_release }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,6 +64,7 @@ jobs:
 
           publish_docker=false
           publish_release=false
+          release_tag=""
 
           if [[ "${{ github.event_name }}" == "push" ]]; then
             if [[ "${{ github.ref }}" == "refs/heads/main" || "${{ github.ref }}" == refs/tags/* ]]; then
@@ -66,19 +72,30 @@ jobs:
             fi
             if [[ "${{ github.ref }}" == refs/tags/* ]]; then
               publish_release=true
+              release_tag="${{ github.ref_name }}"
             fi
           elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             if [[ "${{ inputs.publish_docker }}" == "true" ]]; then
               publish_docker=true
             fi
-            if [[ "${{ inputs.publish_release }}" == "true" && "${{ github.ref }}" == refs/tags/* ]]; then
-              publish_release=true
+            if [[ "${{ inputs.publish_release }}" == "true" ]]; then
+              if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+                publish_release=true
+                release_tag="${{ github.ref_name }}"
+              elif [[ -n "${{ inputs.release_tag }}" ]]; then
+                publish_release=true
+                release_tag="${{ inputs.release_tag }}"
+              else
+                echo "publish_release requested without a tag context or release_tag input" >&2
+                exit 1
+              fi
             fi
           fi
 
           echo "pack_base=${pack_base}" >> "$GITHUB_OUTPUT"
           echo "publish_docker=${publish_docker}" >> "$GITHUB_OUTPUT"
           echo "publish_release=${publish_release}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
 
   linux_build:
     runs-on: ubuntu-latest
@@ -339,6 +356,8 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.prep.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
           files: |
             dist/*.zip
