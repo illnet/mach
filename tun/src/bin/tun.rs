@@ -567,8 +567,7 @@ async fn handle_session(
     };
     info!(
         "session forwarded: key_id={} session={session_prefix} (connecting back to edge, wire_version={})",
-        config.label,
-        connect_version
+        config.label, connect_version
     );
     let mut agent_conn = tun::connect_agent(ingress).await?;
     tune_socket(&agent_conn);

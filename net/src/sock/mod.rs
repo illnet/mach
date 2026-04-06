@@ -679,6 +679,14 @@ pub trait Sock: Send + 'static {
     /// Returns a [`ProxyHandle`] immediately; drive `handle.future` to run the
     /// proxy to completion.
     fn into_proxy(self: Box<Self>, peer: Box<dyn Sock>) -> io::Result<ProxyHandle>;
+
+    /// App/session-oriented variant of [`Sock::into_proxy`].
+    ///
+    /// Backends may use a more aggressive teardown policy once either side
+    /// closes. The default keeps generic proxy semantics.
+    fn into_proxy_session(self: Box<Self>, peer: Box<dyn Sock>) -> io::Result<ProxyHandle> {
+        self.into_proxy(peer)
+    }
 }
 
 impl Sock for Connection {
@@ -736,6 +744,19 @@ impl Sock for Connection {
             #[cfg(target_os = "linux")]
             Connection::Epoll(conn) => {
                 <epoll::Connection as Sock>::into_proxy(Box::new(conn), peer)
+            }
+            #[cfg(not(target_os = "linux"))]
+            Connection::Epoll(conn) => conn.into_proxy_inner(peer),
+            Connection::Uring(conn) => conn.into_proxy_inner(peer),
+        }
+    }
+
+    fn into_proxy_session(self: Box<Self>, peer: Box<dyn Sock>) -> io::Result<ProxyHandle> {
+        match *self {
+            Connection::Tokio(conn) => conn.into_proxy(peer),
+            #[cfg(target_os = "linux")]
+            Connection::Epoll(conn) => {
+                <epoll::Connection as Sock>::into_proxy_session(Box::new(conn), peer)
             }
             #[cfg(not(target_os = "linux"))]
             Connection::Epoll(conn) => conn.into_proxy_inner(peer),
@@ -918,5 +939,11 @@ impl LureConnection {
     /// completion to run the proxy.
     pub fn into_proxy(self, peer: LureConnection) -> io::Result<ProxyHandle> {
         self.inner.into_proxy(peer.inner)
+    }
+
+    /// Session-oriented passthrough for application protocols that treat
+    /// one-sided closure as terminal for the whole stream pair.
+    pub fn into_proxy_session(self, peer: LureConnection) -> io::Result<ProxyHandle> {
+        self.inner.into_proxy_session(peer.inner)
     }
 }

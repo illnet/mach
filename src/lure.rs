@@ -1032,6 +1032,7 @@ impl Lure {
                         );
                         re
                     });
+                let _ = session.terminate().await;
                 return Ok(());
             }
 
@@ -1045,6 +1046,7 @@ impl Lure {
                         )
                     })
                     .await;
+                let _ = session.terminate().await;
                 return Ok(());
             }
         }
@@ -1061,6 +1063,7 @@ impl Lure {
                     re
                 });
         }
+        let _ = session.terminate().await;
 
         Ok(())
     }

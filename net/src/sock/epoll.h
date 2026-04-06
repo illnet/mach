@@ -70,6 +70,10 @@ typedef struct __attribute__((aligned(64))) {
 
 typedef struct LureEpollWorker LureEpollWorker;
 
+enum {
+    LURE_EPOLL_SUBMIT_CLOSE_ON_HALF_CLOSE = 1u << 0,
+};
+
 /*
  * Create a new worker thread.  done_pipe_write_fd is the write end of a pipe
  * shared with the Rust drain task; the worker writes LureEpollDone frames to
@@ -86,7 +90,8 @@ LureEpollWorker* lure_epoll_worker_new(int done_pipe_write_fd);
  * (in which case fd_a/fd_b are closed by this function before returning).
  */
 int lure_epoll_worker_submit(LureEpollWorker* w, int fd_a, int fd_b,
-                             uint64_t conn_id, LureEpollLiveBytes* live);
+                             uint64_t conn_id, LureEpollLiveBytes* live,
+                             uint32_t flags);
 
 /* Request abort of the connection identified by conn_id. No-op if not found. */
 void lure_epoll_worker_abort(LureEpollWorker* w, uint64_t conn_id);

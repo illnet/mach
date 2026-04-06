@@ -168,52 +168,43 @@ impl Connection {
                     copy_tracked(b_read, a_write, &prog_s2c.s2c_bytes, &prog_s2c.s2c_chunks).await
                 });
 
-                let mut c2s_done = false;
-                let mut s2c_done = false;
+                let first = tokio::select! {
+                    result = &mut c2s_task => ("c2s", result),
+                    result = &mut s2c_task => ("s2c", result),
+                };
 
-                while !c2s_done || !s2c_done {
-                    tokio::select! {
-                        result = &mut c2s_task, if !c2s_done => {
-                            match result {
-                                Ok(Ok(())) => c2s_done = true,
-                                Ok(Err(err)) => {
-                                    if !s2c_done {
-                                        s2c_task.abort();
-                                        let _ = (&mut s2c_task).await;
-                                    }
-                                    return Err(io::Error::other(err));
-                                }
-                                Err(err) => {
-                                    log::error!("c2s task join failed: {err:?}");
-                                    if !s2c_done {
-                                        s2c_task.abort();
-                                        let _ = (&mut s2c_task).await;
-                                    }
-                                    return Err(io::Error::other(err.to_string()));
-                                }
-                            }
-                        }
-                        result = &mut s2c_task, if !s2c_done => {
-                            match result {
-                                Ok(Ok(())) => s2c_done = true,
-                                Ok(Err(err)) => {
-                                    if !c2s_done {
-                                        c2s_task.abort();
-                                        let _ = (&mut c2s_task).await;
-                                    }
-                                    return Err(io::Error::other(err));
-                                }
-                                Err(err) => {
-                                    log::error!("s2c task join failed: {err:?}");
-                                    if !c2s_done {
-                                        c2s_task.abort();
-                                        let _ = (&mut c2s_task).await;
-                                    }
-                                    return Err(io::Error::other(err.to_string()));
-                                }
-                            }
-                        }
+                match first {
+                    ("c2s", Ok(Ok(()))) => {
+                        s2c_task.abort();
+                        let _ = (&mut s2c_task).await;
                     }
+                    ("s2c", Ok(Ok(()))) => {
+                        c2s_task.abort();
+                        let _ = (&mut c2s_task).await;
+                    }
+                    ("c2s", Ok(Err(err))) => {
+                        s2c_task.abort();
+                        let _ = (&mut s2c_task).await;
+                        return Err(io::Error::other(err));
+                    }
+                    ("s2c", Ok(Err(err))) => {
+                        c2s_task.abort();
+                        let _ = (&mut c2s_task).await;
+                        return Err(io::Error::other(err));
+                    }
+                    ("c2s", Err(err)) => {
+                        log::error!("c2s task join failed: {err:?}");
+                        s2c_task.abort();
+                        let _ = (&mut s2c_task).await;
+                        return Err(io::Error::other(err.to_string()));
+                    }
+                    ("s2c", Err(err)) => {
+                        log::error!("s2c task join failed: {err:?}");
+                        c2s_task.abort();
+                        let _ = (&mut c2s_task).await;
+                        return Err(io::Error::other(err.to_string()));
+                    }
+                    _ => unreachable!(),
                 }
 
                 Ok(prog_final.snapshot())

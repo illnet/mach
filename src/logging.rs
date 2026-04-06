@@ -76,6 +76,56 @@ impl LureLogger {
         debug!("Connection {addr} closed: {}", format_anyhow_chain(err));
     }
 
+    pub fn passthrough_unexpected_termination(
+        session_id: u64,
+        client: &SocketAddr,
+        backend: &SocketAddr,
+        tunnel: bool,
+        err: &std::io::Error,
+    ) {
+        warn!(
+            "Passthrough terminated abnormally: session_id={session_id} client={client} backend={backend} tunnel={tunnel} err={err}"
+        );
+        sentry::with_scope(
+            |scope| {
+                scope.set_tag("event", "passthrough_unexpected_termination");
+                scope.set_tag("session_id", session_id.to_string());
+                scope.set_tag("client_addr", client.to_string());
+                scope.set_tag("backend_addr", backend.to_string());
+                scope.set_tag("tunnel", tunnel.to_string());
+                scope.set_tag("io_error_kind", format!("{:?}", err.kind()));
+            },
+            || {
+                sentry::capture_message(
+                    &format!("Passthrough terminated abnormally for session {session_id}: {err}"),
+                    sentry::Level::Warning,
+                );
+            },
+        );
+    }
+
+    pub fn session_replaced(client: &SocketAddr, old_session_id: u64, new_session_id: u64) {
+        warn!(
+            "Session map entry replaced for {client}: old_session_id={old_session_id} new_session_id={new_session_id}"
+        );
+        sentry::with_scope(
+            |scope| {
+                scope.set_tag("event", "session_replaced");
+                scope.set_tag("client_addr", client.to_string());
+                scope.set_tag("old_session_id", old_session_id.to_string());
+                scope.set_tag("new_session_id", new_session_id.to_string());
+            },
+            || {
+                sentry::capture_message(
+                    &format!(
+                        "Session map entry replaced for {client}: old={old_session_id} new={new_session_id}"
+                    ),
+                    sentry::Level::Warning,
+                );
+            },
+        );
+    }
+
     pub(crate) fn connection_error(
         client: &SocketAddr,
         server: Option<&SocketAddr>,

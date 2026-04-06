@@ -16,6 +16,8 @@ use tokio::{
     time::{Duration, sleep},
 };
 
+const SUBMIT_FLAG_CLOSE_ON_HALF_CLOSE: u32 = 1u32 << 0;
+
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EpollDone {
@@ -568,6 +570,7 @@ unsafe extern "C" {
         fd_b: c_int,
         conn_id: u64,
         live: *mut LureEpollLiveBytes,
+        flags: u32,
     ) -> c_int;
     fn lure_epoll_worker_abort(w: *mut LureEpollWorkerC, conn_id: u64);
     fn lure_epoll_worker_shutdown(w: *mut LureEpollWorkerC);
@@ -676,6 +679,18 @@ impl EpollManager {
         tokio::sync::oneshot::Receiver<EpollDone>,
         Arc<LureEpollLiveBytes>,
     )> {
+        self.submit_with_flags(fd_a, fd_b, 0)
+    }
+
+    pub fn submit_with_flags(
+        &self,
+        fd_a: RawFd,
+        fd_b: RawFd,
+        flags: u32,
+    ) -> io::Result<(
+        tokio::sync::oneshot::Receiver<EpollDone>,
+        Arc<LureEpollLiveBytes>,
+    )> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
@@ -697,6 +712,7 @@ impl EpollManager {
                 fd_b,
                 id,
                 Arc::as_ptr(&live) as *mut _,
+                flags,
             )
         };
         if rc < 0 {
@@ -810,6 +826,21 @@ impl Connection {
         self,
         peer: Box<dyn crate::sock::Sock>,
     ) -> io::Result<crate::sock::ProxyHandle> {
+        self.into_proxy_with_flags(peer, SUBMIT_FLAG_CLOSE_ON_HALF_CLOSE)
+    }
+
+    pub(crate) fn into_proxy_session(
+        self,
+        peer: Box<dyn crate::sock::Sock>,
+    ) -> io::Result<crate::sock::ProxyHandle> {
+        self.into_proxy(peer)
+    }
+
+    fn into_proxy_with_flags(
+        self,
+        peer: Box<dyn crate::sock::Sock>,
+        submit_flags: u32,
+    ) -> io::Result<crate::sock::ProxyHandle> {
         let self_fd = self.as_ref().as_raw_fd();
         let peer_fd = peer
             .raw_fd()
@@ -828,7 +859,7 @@ impl Connection {
         })?;
 
         // After submit, C owns fd_a/fd_b — do not close on error here.
-        let (rx, live) = mgr.submit(fd_a, fd_b)?;
+        let (rx, live) = mgr.submit_with_flags(fd_a, fd_b, submit_flags)?;
 
         // ProxyProgress backed directly by C's volatile counters; no observer task needed.
         let progress = Arc::new(crate::sock::ProxyProgress::from_live(live));
@@ -928,6 +959,13 @@ impl crate::sock::Sock for Connection {
     ) -> io::Result<crate::sock::ProxyHandle> {
         (*self).into_proxy(peer)
     }
+
+    fn into_proxy_session(
+        self: Box<Self>,
+        peer: Box<dyn crate::sock::Sock>,
+    ) -> io::Result<crate::sock::ProxyHandle> {
+        (*self).into_proxy_session(peer)
+    }
 }
 
 #[cfg(test)]
@@ -943,34 +981,18 @@ mod tests {
 
     use super::{Connection, Listener};
 
-    async fn run_echo_server(listener: TcpListener) {
-        loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                break;
-            };
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 16 * 1024];
-                loop {
-                    match socket.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            sleep(Duration::from_millis(1)).await;
-                            if socket.write_all(&buf[..n]).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-        }
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn proxy_counts_match_full_duplex_payload() {
+        let payload_len = 2 * 1024 * 1024usize;
         let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_addr = backend_listener.local_addr().unwrap();
-        let backend_task = tokio::spawn(run_echo_server(backend_listener));
+        let backend_task = tokio::spawn(async move {
+            let (mut socket, _) = backend_listener.accept().await.unwrap();
+            let mut received = vec![0u8; payload_len];
+            socket.read_exact(&mut received).await.unwrap();
+            sleep(Duration::from_millis(1)).await;
+            socket.write_all(&received).await.unwrap();
+        });
 
         let ingress_listener = Listener::bind("127.0.0.1:0".parse().unwrap())
             .await
@@ -994,7 +1016,6 @@ mod tests {
         let client = tokio::net::TcpStream::connect(ingress_addr).await.unwrap();
         client.set_nodelay(true).unwrap();
         let (mut client_read, mut client_write) = client.into_split();
-        let payload_len = 2 * 1024 * 1024usize;
         let payload = vec![0x42u8; payload_len];
 
         let reader = tokio::spawn(async move {
@@ -1013,7 +1034,6 @@ mod tests {
             client_write.write_all(chunk).await.unwrap();
             sleep(Duration::from_millis(1)).await;
         }
-        client_write.shutdown().await.unwrap();
 
         let progress = progress_rx.await.unwrap();
         let live = timeout(Duration::from_secs(2), async {
@@ -1033,19 +1053,76 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        let stats = timeout(Duration::from_secs(5), proxy_task)
-            .await
-            .unwrap()
-            .unwrap();
+        let final_live = timeout(Duration::from_secs(2), async {
+            loop {
+                let snap = progress.snapshot();
+                if snap.c2s_bytes >= payload_len as u64 && snap.s2c_bytes >= payload_len as u64 {
+                    break snap;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        drop(client_write);
+        backend_task.await.unwrap();
+        proxy_task.abort();
+        let _ = proxy_task.await;
 
         assert!(live.c2s_chunks > 0);
         assert!(live.s2c_chunks > 0);
         assert_eq!(echoed, payload_len);
-        assert_eq!(stats.c2s_bytes, payload_len as u64);
-        assert_eq!(stats.s2c_bytes, payload_len as u64);
-        assert!(stats.c2s_chunks > 0);
-        assert!(stats.s2c_chunks > 0);
+        assert_eq!(final_live.c2s_bytes, payload_len as u64);
+        assert_eq!(final_live.s2c_bytes, payload_len as u64);
+        assert!(final_live.c2s_chunks > 0);
+        assert!(final_live.s2c_chunks > 0);
+    }
 
-        backend_task.abort();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxy_completes_when_client_disconnects_without_peer_fin() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend_task = tokio::spawn(async move {
+            let (mut socket, _) = backend_listener.accept().await.unwrap();
+            let copied = timeout(
+                Duration::from_secs(2),
+                tokio::io::copy(&mut socket, &mut tokio::io::sink()),
+            )
+            .await
+            .expect("backend should observe full close from proxy")
+            .unwrap();
+            copied
+        });
+
+        let ingress_listener = Listener::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let ingress_addr = ingress_listener.local_addr().unwrap();
+
+        let proxy_task = tokio::spawn(async move {
+            let (incoming, _) = ingress_listener.accept().await.unwrap();
+            let upstream = Connection::connect(backend_addr).await.unwrap();
+            let handle = <Connection as crate::sock::Sock>::into_proxy(
+                Box::new(incoming),
+                Box::new(upstream),
+            )
+            .unwrap();
+            handle.future.await.unwrap()
+        });
+
+        let mut client = tokio::net::TcpStream::connect(ingress_addr).await.unwrap();
+        client.shutdown().await.unwrap();
+        drop(client);
+
+        let stats = timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .expect("proxy should complete once one side closes")
+            .unwrap();
+        let backend_copied = backend_task.await.unwrap();
+
+        assert_eq!(stats.c2s_bytes, 0);
+        assert_eq!(stats.s2c_bytes, 0);
+        assert_eq!(backend_copied, 0);
     }
 }

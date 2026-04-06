@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -69,6 +70,14 @@ static inline int conn_abort_requested(const struct LureEpollConnection* conn) {
 
 static inline uint64_t live_progress_bytes(const LureEpollLiveBytes *live) {
     return live ? (live->c2s_bytes + live->s2c_bytes) : 0;
+}
+
+static inline uint64_t monotonic_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return ((uint64_t)ts.tv_sec * 1000u) + ((uint64_t)ts.tv_nsec / 1000000u);
 }
 
 static inline int set_nonblocking(int fd) {
@@ -194,7 +203,7 @@ static int refresh_interest(struct LureEpollConnection* conn) {
 }
 
 static inline int is_complete(const struct LureEpollConnection* conn) {
-    // Complete when both sides closed and pipes are empty
+    // Complete when both sides closed and pipes are empty.
     return conn->eof_a && conn->eof_b &&
            conn->a2b_pipe_len == 0 &&
            conn->b2a_pipe_len == 0;
@@ -319,7 +328,20 @@ static void* io_main(void* arg) {
             }
         }
 
-        // Shutdown when one side closes and its outgoing pipe is empty
+        // Shutdown when one side closes and its outgoing pipe is empty.
+        {
+            int rc = probe_hup_side_conn(conn, SIDE_A);
+            if (rc < 0) {
+                conn->result = rc;
+                goto done;
+            }
+            rc = probe_hup_side_conn(conn, SIDE_B);
+            if (rc < 0) {
+                conn->result = rc;
+                goto done;
+            }
+        }
+
         if (conn->eof_a && !conn->shut_wr_b && conn->a2b_pipe_len == 0) {
             (void)shutdown(conn->shared->fd_b, SHUT_WR);
             conn->shut_wr_b = 1;
@@ -577,7 +599,7 @@ void lure_epoll_connection_free(LureEpollConnection* conn) {
 enum {
     WORKER_MAX_SLOTS        = 4096,
     WORKER_EPOLL_BATCH      = 64,
-    WORKER_STALL_TICKS_MAX  = 12,   /* 12 × 5 s ≈ 60 s stall timeout */
+    WORKER_STALL_TIMEOUT_MS = 60 * 1000,
 };
 
 /* Slot key encoding in epoll_event.data.u64:
@@ -602,10 +624,11 @@ typedef struct {
     size_t b2a_pipe_len;
 
     LureEpollLiveBytes *live;  /* Rust-allocated live counter region (may be NULL) */
+    uint32_t flags;            /* per-submit behavior flags */
 
-    uint32_t abort_flag;   /* set atomically from other threads */
-    uint32_t stall_ticks;  /* watchdog: ticks with no delivered-byte progress */
-    uint64_t prev_progress;  /* byte-progress snapshot at last watchdog pass */
+    uint32_t abort_flag;       /* set atomically from other threads */
+    uint64_t prev_progress;    /* byte-progress snapshot at last watchdog pass */
+    uint64_t last_progress_ms; /* last monotonic ms with delivered-byte progress */
 
     int32_t next_free;     /* free-list linkage; -1 == end of list */
     int     active;        /* 1 while slot is occupied */
@@ -617,6 +640,7 @@ typedef struct PendingSubmit {
     int fd_a, fd_b;
     uint64_t conn_id;
     LureEpollLiveBytes *live;
+    uint32_t flags;
     struct PendingSubmit *next;
 } PendingSubmit;
 
@@ -714,10 +738,18 @@ static void wslot_release(LureEpollWorker *w, uint32_t idx, int32_t result) {
     w->active_count--;
 }
 
+static inline int wslot_should_complete(const LureEpollSlot *s) {
+    int close_seen = (s->flags & LURE_EPOLL_SUBMIT_CLOSE_ON_HALF_CLOSE)
+        ? (s->eof_a || s->eof_b)
+        : (s->eof_a && s->eof_b);
+
+    return close_seen && s->a2b_pipe_len == 0 && s->b2a_pipe_len == 0;
+}
+
 /* ---- wsubmit_now: allocate slot and register with epoll ------------------- */
 
 static void wsubmit_now(LureEpollWorker *w, int fd_a, int fd_b, uint64_t conn_id,
-                        LureEpollLiveBytes *live) {
+                        LureEpollLiveBytes *live, uint32_t flags) {
     /* No free slots — signal error and close fds. */
     if (w->free_head < 0) {
         LureEpollDone done;
@@ -740,6 +772,9 @@ static void wsubmit_now(LureEpollWorker *w, int fd_a, int fd_b, uint64_t conn_id
     s->fd_b      = fd_b;
     s->conn_id   = conn_id;
     s->live      = live;
+    s->flags     = flags;
+    s->prev_progress = live_progress_bytes(live);
+    s->last_progress_ms = monotonic_ms();
     s->active    = 1;
     s->next_free = -1;
     s->a2b_pipe[0] = s->a2b_pipe[1] = -1;
@@ -895,6 +930,33 @@ static void wslot_process_event(LureEpollWorker *w, uint32_t idx,
         }
     }
 
+    /* Re-probe HUP sides after any drain so a peer that closed after writing
+     * its final bytes is observed as EOF as soon as the pipe empties. */
+    if (s->hup_a && !s->eof_a && s->a2b_pipe_len == 0) {
+        int rc = splice_forward(
+            s->fd_a, s->a2b_pipe[1], s->a2b_pipe[0],
+            s->fd_b, &s->a2b_pipe_len, &s->eof_a,
+            s->live ? &s->live->c2s_bytes : NULL,
+            s->live ? &s->live->c2s_chunks : NULL
+        );
+        if (rc < 0) {
+            wslot_release(w, idx, rc);
+            return;
+        }
+    }
+    if (s->hup_b && !s->eof_b && s->b2a_pipe_len == 0) {
+        int rc = splice_forward(
+            s->fd_b, s->b2a_pipe[1], s->b2a_pipe[0],
+            s->fd_a, &s->b2a_pipe_len, &s->eof_b,
+            s->live ? &s->live->s2c_bytes : NULL,
+            s->live ? &s->live->s2c_chunks : NULL
+        );
+        if (rc < 0) {
+            wslot_release(w, idx, rc);
+            return;
+        }
+    }
+
     /* Shutdown the write-side once EOF is received and its pipe is drained. */
     if (s->eof_a && !s->shut_wr_b && s->a2b_pipe_len == 0) {
         (void)shutdown(s->fd_b, SHUT_WR);
@@ -905,7 +967,7 @@ static void wslot_process_event(LureEpollWorker *w, uint32_t idx,
         s->shut_wr_a = 1;
     }
 
-    if (s->eof_a && s->eof_b && s->a2b_pipe_len == 0 && s->b2a_pipe_len == 0) {
+    if (wslot_should_complete(s)) {
         wslot_release(w, idx, 0);
     } else {
         wslot_refresh_interest(w, idx);
@@ -924,7 +986,7 @@ static void process_submits(LureEpollWorker *w) {
     while (head) {
         PendingSubmit *cur = head;
         head = head->next;
-        wsubmit_now(w, cur->fd_a, cur->fd_b, cur->conn_id, cur->live);
+        wsubmit_now(w, cur->fd_a, cur->fd_b, cur->conn_id, cur->live, cur->flags);
         free(cur);
     }
 }
@@ -952,6 +1014,7 @@ static void process_aborts(LureEpollWorker *w) {
 /* ---- watchdog: abort connections stalled for ~60 s ----------------------- */
 
 static void scan_stale_slots(LureEpollWorker *w) {
+    uint64_t now_ms = monotonic_ms();
     for (uint32_t i = 0; i < w->n_slots; i++) {
         LureEpollSlot *s = &w->slots[i];
         if (!s->active) continue;
@@ -964,14 +1027,16 @@ static void scan_stale_slots(LureEpollWorker *w) {
 
         uint64_t progress = live_progress_bytes(s->live);
         if (progress == s->prev_progress) {
-            s->stall_ticks++;
-            if (s->stall_ticks >= WORKER_STALL_TICKS_MAX) {
+            if (now_ms > 0 &&
+                s->last_progress_ms > 0 &&
+                now_ms >= s->last_progress_ms &&
+                (now_ms - s->last_progress_ms) >= WORKER_STALL_TIMEOUT_MS) {
                 wslot_release(w, i, -ETIMEDOUT);
                 continue;
             }
         } else {
-            s->stall_ticks = 0;
             s->prev_progress = progress;
+            s->last_progress_ms = now_ms;
         }
     }
 }
@@ -1013,10 +1078,7 @@ static void *worker_thread_main(void *arg) {
             }
         }
 
-        /* On timeout (n==0) run the stale-connection watchdog. */
-        if (n == 0) {
-            scan_stale_slots(w);
-        }
+        scan_stale_slots(w);
     }
 
     return NULL;
@@ -1088,7 +1150,8 @@ LureEpollWorker *lure_epoll_worker_new(int done_pipe_write_fd) {
 }
 
 int lure_epoll_worker_submit(LureEpollWorker *w, int fd_a, int fd_b,
-                             uint64_t conn_id, LureEpollLiveBytes *live) {
+                             uint64_t conn_id, LureEpollLiveBytes *live,
+                             uint32_t flags) {
     PendingSubmit *node = (PendingSubmit *)malloc(sizeof(PendingSubmit));
     if (!node) {
         /* C closes the fds since caller relinquished ownership. */
@@ -1100,6 +1163,7 @@ int lure_epoll_worker_submit(LureEpollWorker *w, int fd_a, int fd_b,
     node->fd_b    = fd_b;
     node->conn_id = conn_id;
     node->live    = live;
+    node->flags   = flags;
     node->next    = NULL;
 
     pthread_mutex_lock(&w->queue_lock);

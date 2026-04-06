@@ -19,6 +19,7 @@ use tokio::{
 };
 
 use crate::{
+    logging::LureLogger,
     metrics::RouterMetrics,
     telemetry::{EventEnvelope, EventServiceInstance, NonObj, get_meter},
     utils::spawn_named,
@@ -183,15 +184,22 @@ impl Serialize for Session {
 /// RAII handle that terminates the session when dropped
 pub struct SessionHandle {
     router: &'static RouterInstance,
-    inner: Arc<Session>,
+    inner: Option<Arc<Session>>,
 }
 
 impl SessionHandle {
     pub const fn new(router: &'static RouterInstance, session: Arc<Session>) -> Self {
         Self {
             router,
-            inner: session,
+            inner: Some(session),
         }
+    }
+
+    pub async fn terminate(mut self) -> anyhow::Result<()> {
+        if let Some(session) = self.inner.take() {
+            self.router.terminate_session(&session.client_addr).await?;
+        }
+        Ok(())
     }
 }
 
@@ -199,14 +207,19 @@ impl std::ops::Deref for SessionHandle {
     type Target = Session;
 
     fn deref(&self) -> &Self::Target {
-        &self.inner
+        self.inner
+            .as_deref()
+            .expect("SessionHandle dereferenced after termination")
     }
 }
 
 impl Drop for SessionHandle {
     fn drop(&mut self) {
         let router = self.router;
-        let addr = self.inner.client_addr;
+        let Some(session) = self.inner.take() else {
+            return;
+        };
+        let addr = session.client_addr;
         // Drop can run outside a Tokio runtime during shutdown/teardown; don't panic.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
@@ -591,7 +604,9 @@ impl RouterInstance {
         // Store session
         let total = {
             let mut sessions = self.active_sessions.write().await;
-            sessions.insert(client_addr, session.clone());
+            if let Some(replaced) = sessions.insert(client_addr, session.clone()) {
+                LureLogger::session_replaced(&client_addr, replaced.id, session.id);
+            }
             sessions.len() as u64
         };
         self.publish_sessions_active(total);
@@ -601,15 +616,19 @@ impl RouterInstance {
 
     /// Terminate a session
     pub async fn terminate_session(&self, addr: &SocketAddr) -> anyhow::Result<()> {
-        self.metrics.record_session_destroy();
         let mut sessions = self.active_sessions.write().await;
+        let mut removed = false;
         if let Some(session) = sessions.remove(addr) {
+            removed = true;
             session.inspect.route.dec_active();
             session.inspect.tenant.dec_active();
         }
         let total = sessions.len() as u64;
         drop(sessions);
         self.publish_sessions_active(total);
+        if removed {
+            self.metrics.record_session_destroy();
+        }
         Ok(())
     }
 

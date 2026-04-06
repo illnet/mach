@@ -5,7 +5,7 @@ pub use net::sock::{
     backend_selection,
 };
 
-use crate::inspect::pump_proxy_progress;
+use crate::{inspect::pump_proxy_progress, logging::LureLogger};
 
 /// Start bidirectional passthrough between `client` and `server`, driving
 /// live OTEL metrics from [`net::ProxyHandle::progress`].
@@ -23,7 +23,19 @@ pub(crate) async fn passthrough_now(
     let stats = handle.future.await;
     let _ = metrics_shutdown_tx.send(true);
     let _ = metrics_task.await;
-    let stats = stats?;
+    let stats = match stats {
+        Ok(stats) => stats,
+        Err(err) => {
+            LureLogger::passthrough_unexpected_termination(
+                session.id,
+                &session.client_addr,
+                &session.destination_addr,
+                session.inspect.tunnel.load(Ordering::Relaxed),
+                &err,
+            );
+            return Err(err.into());
+        }
+    };
     // Reconcile any remaining bytes not yet reported by the pump.
     // The pump has already recorded bytes continuously via record_proxy_progress_delta.
     // Here we record only the delta (bytes the pump may have missed in the final window).

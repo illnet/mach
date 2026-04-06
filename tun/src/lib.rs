@@ -256,7 +256,10 @@ pub fn encode_agent_hello(hello: &AgentHello, out: &mut Vec<u8>) -> Result<(), T
             encode_socket_addr_payload(forward.request.from, out);
             encode_socket_addr_payload(forward.request.to, out);
             if hello.version >= VERSION {
-                encode_socket_addr_payload(forward_client_addr_wire_value(forward.client_addr), out);
+                encode_socket_addr_payload(
+                    forward_client_addr_wire_value(forward.client_addr),
+                    out,
+                );
             }
         }
     }

@@ -95,6 +95,79 @@ scope_flag() {
     fi
 }
 
+run_minitun() {
+    if [[ "$SCOPE" == "system" ]]; then
+        env -u HOME -u XDG_CONFIG_HOME "$@"
+    else
+        "$@"
+    fi
+}
+
+default_installed_bin() {
+    if [[ -n "$BIN_PATH" ]]; then
+        printf '%s' "$BIN_PATH"
+    elif [[ "$SCOPE" == "system" ]]; then
+        printf '%s' "/usr/local/bin/minitun"
+    else
+        printf '%s' "${HOME}/.local/bin/minitun"
+    fi
+}
+
+extract_unit_content() {
+    sed -n '/^\[Unit\]/,/^# To install:/p' | sed '$d'
+}
+
+inject_rust_log() {
+    local rust_log="$1"
+    if [[ -z "$rust_log" ]]; then
+        cat
+        return
+    fi
+
+    awk -v rust_log="$rust_log" '
+        /^\[Service\]$/ {
+            print
+            print "Environment=RUST_LOG=" rust_log
+            next
+        }
+        { print }
+    '
+}
+
+install_downloaded_binary() {
+    local installed_bin
+    installed_bin="$(default_installed_bin)"
+    install -Dm0755 "$TMP_DIR/minitun" "$installed_bin"
+    printf '%s' "$installed_bin"
+}
+
+write_systemd_unit() {
+    local service_name="$1"
+    local rust_log="$2"
+    local installed_bin="$3"
+    local unit_name
+    local unit_path
+    local generated_unit
+    local unit_content
+
+    unit_name="${service_name:-minitun}"
+    unit_name="${unit_name%.service}"
+    unit_path="${UNIT_DIR}/${unit_name}.service"
+
+    generated_unit="$(
+        run_minitun "$installed_bin" systemd gensys "$(scope_flag)" --name "$unit_name"
+    )"
+    unit_content="$(
+        printf '%s\n' "$generated_unit" |
+            extract_unit_content |
+            inject_rust_log "$rust_log"
+    )"
+
+    install -d "$UNIT_DIR"
+    printf '%s\n' "$unit_content" > "$unit_path"
+    printf '%s' "${unit_name}.service"
+}
+
 resolve_dirs() {
     if [[ "$SCOPE" == "system" ]]; then
         UNIT_DIR="/etc/systemd/system"
@@ -127,6 +200,10 @@ parse_legacy_unit_endpoint() {
 }
 
 prompt_for_endpoint() {
+    if [[ -n "$ENDPOINT" ]]; then
+        ENDPOINT="$(trim "$ENDPOINT")"
+        return
+    fi
     [[ -t 0 ]] || die "ENDPOINT is required when no legacy tunure services are found"
     while [[ -z "$ENDPOINT" ]]; do
         read -r -p "Tunnel endpoint (host:port): " ENDPOINT
@@ -135,6 +212,9 @@ prompt_for_endpoint() {
 }
 
 prompt_for_tokens() {
+    if [[ ${#TOKENS[@]} -gt 0 ]]; then
+        return
+    fi
     [[ -t 0 ]] || die "TOKENS_TEXT is required when no legacy tunure services are found"
     echo "Enter one or more tunnel tokens (key_id:secret). Empty line finishes." >&2
     while true; do
@@ -171,30 +251,33 @@ install_group() {
     local rust_log="$3"
     shift 3
     local -a group_tokens=("$@")
-    local -a cmd=(
+    local installed_bin
+    local unit_file
+    local -a install_cmd=(
         "$TMP_DIR/minitun"
-        systemd
         install
-        "$(scope_flag)"
-        --endpoint "$endpoint"
-        --rust-log "$rust_log"
     )
 
-    if [[ -n "$service_name" ]]; then
-        cmd+=(--name "$service_name")
+    if [[ "$SCOPE" == "system" ]]; then
+        install_cmd+=(--system)
     fi
-    if [[ -n "$BIN_PATH" ]]; then
-        cmd+=(--bin-path "$BIN_PATH")
-    fi
-    if ! is_true "$ENABLE_NOW"; then
-        cmd+=(--enable-now=false)
-    fi
+    install_cmd+=(--endpoints "$endpoint")
     for token in "${group_tokens[@]}"; do
-        cmd+=(--token "$token")
+        install_cmd+=(--token "$token")
     done
 
     echo "==> installing ${service_name:-minitun} for ${endpoint} (${#group_tokens[@]} key(s))" >&2
-    "${cmd[@]}"
+    run_minitun "${install_cmd[@]}"
+
+    installed_bin="$(install_downloaded_binary)"
+    unit_file="$(write_systemd_unit "$service_name" "$rust_log" "$installed_bin")"
+
+    systemctl "${SYSTEMCTL_ARGS[@]}" daemon-reload >/dev/null
+    if is_true "$ENABLE_NOW"; then
+        systemctl "${SYSTEMCTL_ARGS[@]}" enable --now "$unit_file"
+    else
+        systemctl "${SYSTEMCTL_ARGS[@]}" enable "$unit_file"
+    fi
 }
 
 cleanup_legacy_unit() {
@@ -306,13 +389,43 @@ fi
 
 if [[ "$SCOPE" == "system" ]] && is_true "$MIGRATE_MINITUN_USER"; then
     # Detect and migrate old user-scope minitun service(s) to system scope
-    local user_unit_dir="${XDG_CONFIG_HOME:-${HOME:-}/.config}/systemd/user"
+    user_unit_dir="${XDG_CONFIG_HOME:-${HOME:-}/.config}/systemd/user"
     shopt -s nullglob
     user_units=("${user_unit_dir}"/minitun*.service)
     shopt -u nullglob
+    user_cfg="${XDG_CONFIG_HOME:-${HOME:-}/.config}/minitun.toml"
 
-    if [[ ${#user_units[@]} -gt 0 ]]; then
-        echo "==> found ${#user_units[@]} user-scope minitun unit(s); migrating to system" >&2
+    if [[ ${#user_units[@]} -gt 0 || -f "$user_cfg" ]]; then
+        local_target="${SERVICE_NAME:-}"
+        if [[ -z "$local_target" ]]; then
+            if [[ ${#user_units[@]} -le 1 ]]; then
+                local_target="minitun"
+            else
+                die "SERVICE_NAME is required when migrating multiple user-scope minitun units"
+            fi
+        fi
+
+        echo "==> found root user-scope minitun install; migrating to system" >&2
+
+        if [[ -f "$user_cfg" && ! -f /etc/minitun.toml ]]; then
+            echo "==> copying user config $user_cfg -> /etc/minitun.toml" >&2
+            install -Dm0644 "$user_cfg" /etc/minitun.toml
+        fi
+
+        [[ -f /etc/minitun.toml ]] || die "no /etc/minitun.toml and no user config to migrate"
+
+        installed_bin="$(install_downloaded_binary)"
+        unit_file="$(write_systemd_unit "$local_target" "$RUST_LOG" "$installed_bin")"
+
+        systemctl daemon-reload >/dev/null
+        if is_true "$ENABLE_NOW"; then
+            systemctl enable --now "$unit_file"
+            systemctl is-active --quiet "$unit_file" ||
+                die "new system service $unit_file failed to start; leaving user service untouched"
+        else
+            systemctl enable "$unit_file"
+        fi
+
         for unit_path in "${user_units[@]}"; do
             svc="$(basename "${unit_path%.service}")"
             systemctl --user disable --now "${svc}.service" >/dev/null 2>&1 || true
@@ -320,13 +433,9 @@ if [[ "$SCOPE" == "system" ]] && is_true "$MIGRATE_MINITUN_USER"; then
             echo "==> removed user unit: $unit_path" >&2
         done
         systemctl --user daemon-reload >/dev/null 2>&1 || true
-    fi
 
-    # Migrate user config to /etc/minitun.toml (if /etc version doesn't exist)
-    user_cfg="${XDG_CONFIG_HOME:-${HOME:-}/.config}/minitun.toml"
-    if [[ -f "$user_cfg" && ! -f /etc/minitun.toml ]]; then
-        echo "==> copying user config $user_cfg → /etc/minitun.toml" >&2
-        cp "$user_cfg" /etc/minitun.toml
+        echo "==> migrated user-scope minitun to system service ${unit_file}" >&2
+        exit 0
     fi
 fi
 
