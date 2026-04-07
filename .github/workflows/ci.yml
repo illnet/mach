@@ -30,12 +30,15 @@ env:
   CARGO_TERM_COLOR: always
   TOOLCHAIN: nightly-2026-02-06
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   prep:
     runs-on: ubuntu-latest
     outputs:
+      image_name: ${{ steps.meta.outputs.image_name }}
+      docker_ref_tag: ${{ steps.meta.outputs.docker_ref_tag }}
+      docker_canary_tag: ${{ steps.meta.outputs.docker_canary_tag }}
+      docker_stable_tag: ${{ steps.meta.outputs.docker_stable_tag }}
       pack_base: ${{ steps.meta.outputs.pack_base }}
       publish_docker: ${{ steps.meta.outputs.publish_docker }}
       publish_release: ${{ steps.meta.outputs.publish_release }}
@@ -61,6 +64,20 @@ jobs:
           )"
           gitsha="$(git rev-parse --short=12 HEAD)"
           pack_base="lure_${version}+${gitsha}"
+          image_name="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          ref_name="${{ github.ref_name }}"
+          ref_tag="$(printf '%s' "${ref_name}" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g')"
+          docker_ref_tag="${ref_tag}"
+          if [[ "${ref_tag}" == "main" ]]; then
+            docker_canary_tag="canary"
+          else
+            docker_canary_tag="canary-${ref_tag}"
+          fi
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            docker_stable_tag="stable-${ref_tag}"
+          else
+            docker_stable_tag="stable"
+          fi
 
           publish_docker=false
           publish_release=false
@@ -92,6 +109,10 @@ jobs:
             fi
           fi
 
+          echo "image_name=${image_name}" >> "$GITHUB_OUTPUT"
+          echo "docker_ref_tag=${docker_ref_tag}" >> "$GITHUB_OUTPUT"
+          echo "docker_canary_tag=${docker_canary_tag}" >> "$GITHUB_OUTPUT"
+          echo "docker_stable_tag=${docker_stable_tag}" >> "$GITHUB_OUTPUT"
           echo "pack_base=${pack_base}" >> "$GITHUB_OUTPUT"
           echo "publish_docker=${publish_docker}" >> "$GITHUB_OUTPUT"
           echo "publish_release=${publish_release}" >> "$GITHUB_OUTPUT"
@@ -585,7 +606,7 @@ jobs:
       - prep
       - linux_build
       - linux_arm64_build
-    if: needs.prep.outputs.publish_docker == 'true' && github.ref == 'refs/heads/main'
+    if: needs.prep.outputs.publish_docker == 'true' && github.event_name != 'pull_request'
     permissions:
       contents: read
       packages: write
@@ -628,8 +649,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ needs.prep.outputs.image_name }}:${{ needs.prep.outputs.docker_ref_tag }}
+            ${{ env.REGISTRY }}/${{ needs.prep.outputs.image_name }}:sha-${{ github.sha }}
 
   docker_canary:
     runs-on: ubuntu-latest
@@ -639,7 +660,7 @@ jobs:
       - linux_arm64_build
       - linux_check
       - linux_test
-    if: needs.prep.outputs.publish_docker == 'true' && github.ref == 'refs/heads/main'
+    if: needs.prep.outputs.publish_docker == 'true' && github.event_name != 'pull_request'
     permissions:
       contents: read
       packages: write
@@ -682,7 +703,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:canary
+            ${{ env.REGISTRY }}/${{ needs.prep.outputs.image_name }}:${{ needs.prep.outputs.docker_canary_tag }}
 
   release:
     runs-on: ubuntu-latest
@@ -760,5 +781,5 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:stable
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prep.outputs.release_tag }}
+            ${{ env.REGISTRY }}/${{ needs.prep.outputs.image_name }}:${{ needs.prep.outputs.docker_stable_tag }}
+            ${{ env.REGISTRY }}/${{ needs.prep.outputs.image_name }}:latest
