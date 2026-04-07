@@ -18,7 +18,7 @@ libc = "0.2"
 net = { path = "net" }
 tun = { path = "tun" }
 opentelemetry = { version = "0.31", default-features = false, features = ["metrics", "trace"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-rustls-webpki-roots", "metrics", "trace"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-client", "reqwest-rustls-webpki-roots", "metrics", "trace"] }
 dotenvy = "0.15"
 opentelemetry-stdout = { version = "0.31", default-features = false, features = ["metrics"], optional = true }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["metrics", "trace", "rt-tokio"] }
