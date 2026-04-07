@@ -266,20 +266,143 @@ jobs:
       - name: Run checks
         run: cargo +${{ env.TOOLCHAIN }} check --release --target ${{ env.TARGET }} --verbose
 
-  windows_build:
-    runs-on: windows-latest
+  linux_arm64_build:
+    runs-on: ubuntu-24.04-arm
     needs: prep
     env:
-      CARGO_TARGET_DIR: target-windows
+      CARGO_TARGET_DIR: target-linux-arm64
+      TARGET: aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install nightly toolchain
-        shell: pwsh
+      - name: Install build deps
         run: |
-          rustup toolchain install ${{ env.TOOLCHAIN }} --profile minimal --component clippy --component rustfmt
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools pkg-config
+          sudo rm -rf /var/lib/apt/lists/*
 
       - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ runner.os }}-linux-arm64-${{ env.TOOLCHAIN }}-${{ env.TARGET }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-linux-arm64-${{ env.TOOLCHAIN }}-${{ env.TARGET }}-
+
+      - name: Install nightly toolchain
+        run: |
+          rustup toolchain install ${{ env.TOOLCHAIN }} --profile minimal --component clippy --component rustfmt
+          rustup target add ${{ env.TARGET }} --toolchain ${{ env.TOOLCHAIN }}
+
+      - name: Build release binaries
+        run: |
+          cargo +${{ env.TOOLCHAIN }} build -p lure --bin lure --release --target ${{ env.TARGET }} --verbose
+          cargo +${{ env.TOOLCHAIN }} build -p tun --bin minitun --release --target ${{ env.TARGET }} --verbose
+
+      - name: Prepare Linux arm64 artifact
+        shell: bash
+        run: |
+          mkdir -p artifacts/linux-arm64
+          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/lure artifacts/linux-arm64/lure
+          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/minitun artifacts/linux-arm64/minitun
+          cp README.md LICENSE artifacts/linux-arm64/
+          if [[ -f settings.toml ]]; then
+            cp settings.toml artifacts/linux-arm64/settings.toml
+          else
+            printf '%s\n' \
+              'inst = "main"' \
+              'bind = "0.0.0.0:25577"' \
+              'max_conn = 65535' \
+              'cooldown = 3' \
+              'rate_limit_by_ip = 10' \
+              > artifacts/linux-arm64/settings.toml
+          fi
+          chmod +x artifacts/linux-arm64/lure artifacts/linux-arm64/minitun
+          (
+            cd artifacts/linux-arm64
+            sha256sum lure minitun README.md LICENSE settings.toml > SHA256SUMS
+          )
+
+      - name: Upload Linux arm64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: artifacts/linux-arm64
+          if-no-files-found: error
+          overwrite: true
+
+  artifact_builds:
+    runs-on: ${{ matrix.runner }}
+    needs: prep
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_name: macos-amd64
+            runner: macos-13
+            target: x86_64-apple-darwin
+            cargo_target_dir: target-macos-amd64
+            family: unix
+            bin_ext: ""
+            release_name: x86_64
+          - artifact_name: macos-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            cargo_target_dir: target-macos-arm64
+            family: unix
+            bin_ext: ""
+            release_name: aarch64
+          - artifact_name: windows-amd64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            cargo_target_dir: target-windows-amd64
+            family: windows
+            bin_ext: .exe
+            release_name: x86_64.exe
+          - artifact_name: windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            cargo_target_dir: target-windows-arm64
+            family: windows
+            bin_ext: .exe
+            release_name: aarch64.exe
+    env:
+      CARGO_TARGET_DIR: ${{ matrix.cargo_target_dir }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install nightly toolchain
+        shell: bash
+        run: |
+          rustup toolchain install ${{ env.TOOLCHAIN }} --profile minimal --component clippy --component rustfmt
+          rustup target add ${{ env.TARGET }} --toolchain ${{ env.TOOLCHAIN }}
+
+      - name: Cache cargo artifacts
+        if: matrix.family != 'windows'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ${{ env.CARGO_TARGET_DIR }}
+          key: ${{ runner.os }}-${{ matrix.artifact_name }}-${{ env.TOOLCHAIN }}-${{ env.TARGET }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.artifact_name }}-${{ env.TOOLCHAIN }}-${{ env.TARGET }}-
+
+      - name: Cache cargo artifacts
+        if: matrix.family == 'windows'
         uses: actions/cache@v4
         with:
           path: |
@@ -287,26 +410,60 @@ jobs:
             ~\.cargo\registry\cache\
             ~\.cargo\git\db\
             ${{ env.CARGO_TARGET_DIR }}
-          key: ${{ runner.os }}-windows-${{ env.TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.artifact_name }}-${{ env.TOOLCHAIN }}-${{ env.TARGET }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-windows-${{ env.TOOLCHAIN }}-
+            ${{ runner.os }}-${{ matrix.artifact_name }}-${{ env.TOOLCHAIN }}-${{ env.TARGET }}-
 
       - name: Build release binaries
+        if: matrix.family != 'windows'
+        shell: bash
+        run: |
+          cargo +${{ env.TOOLCHAIN }} build -p lure --bin lure --release --target ${{ env.TARGET }} --verbose
+          cargo +${{ env.TOOLCHAIN }} build -p tun --bin minitun --release --target ${{ env.TARGET }} --verbose
+
+      - name: Build release binaries
+        if: matrix.family == 'windows'
         shell: pwsh
         run: |
-          cargo +${{ env.TOOLCHAIN }} build -p lure --bin lure --release --verbose
-          cargo +${{ env.TOOLCHAIN }} build -p tun --bin minitun --release --verbose
+          cargo +${{ env.TOOLCHAIN }} build -p lure --bin lure --release --target ${{ env.TARGET }} --verbose
+          cargo +${{ env.TOOLCHAIN }} build -p tun --bin minitun --release --target ${{ env.TARGET }} --verbose
+
+      - name: Prepare Unix artifact
+        if: matrix.family != 'windows'
+        shell: bash
+        run: |
+          mkdir -p artifacts/${{ matrix.artifact_name }}
+          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/lure artifacts/${{ matrix.artifact_name }}/lure
+          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/minitun artifacts/${{ matrix.artifact_name }}/minitun
+          cp README.md LICENSE artifacts/${{ matrix.artifact_name }}/
+          if [[ -f settings.toml ]]; then
+            cp settings.toml artifacts/${{ matrix.artifact_name }}/settings.toml
+          else
+            printf '%s\n' \
+              'inst = "main"' \
+              'bind = "0.0.0.0:25577"' \
+              'max_conn = 65535' \
+              'cooldown = 3' \
+              'rate_limit_by_ip = 10' \
+              > artifacts/${{ matrix.artifact_name }}/settings.toml
+          fi
+          chmod +x artifacts/${{ matrix.artifact_name }}/lure artifacts/${{ matrix.artifact_name }}/minitun
+          (
+            cd artifacts/${{ matrix.artifact_name }}
+            shasum -a 256 lure minitun README.md LICENSE settings.toml > SHA256SUMS
+          )
 
       - name: Prepare Windows artifact
+        if: matrix.family == 'windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path artifacts/windows-amd64 | Out-Null
-          Copy-Item -Force $env:CARGO_TARGET_DIR\release\lure.exe artifacts/windows-amd64/lure.exe
-          Copy-Item -Force $env:CARGO_TARGET_DIR\release\minitun.exe artifacts/windows-amd64/minitun.exe
-          Copy-Item -Force README.md artifacts/windows-amd64/README.md
-          Copy-Item -Force LICENSE artifacts/windows-amd64/LICENSE
+          New-Item -ItemType Directory -Force -Path artifacts/${{ matrix.artifact_name }} | Out-Null
+          Copy-Item -Force $env:CARGO_TARGET_DIR\${{ env.TARGET }}\release\lure.exe artifacts/${{ matrix.artifact_name }}/lure.exe
+          Copy-Item -Force $env:CARGO_TARGET_DIR\${{ env.TARGET }}\release\minitun.exe artifacts/${{ matrix.artifact_name }}/minitun.exe
+          Copy-Item -Force README.md artifacts/${{ matrix.artifact_name }}/README.md
+          Copy-Item -Force LICENSE artifacts/${{ matrix.artifact_name }}/LICENSE
           if (Test-Path settings.toml) {
-            Copy-Item -Force settings.toml artifacts/windows-amd64/settings.toml
+            Copy-Item -Force settings.toml artifacts/${{ matrix.artifact_name }}/settings.toml
           } else {
             @(
               'inst = "main"'
@@ -314,22 +471,22 @@ jobs:
               'max_conn = 65535'
               'cooldown = 3'
               'rate_limit_by_ip = 10'
-            ) | Out-File -Encoding ascii artifacts/windows-amd64/settings.toml
+            ) | Out-File -Encoding ascii artifacts/${{ matrix.artifact_name }}/settings.toml
           }
           $hashLines = @(
-            (Get-FileHash -Algorithm SHA256 artifacts/windows-amd64/lure.exe).Hash.ToLower() + "  lure.exe"
-            (Get-FileHash -Algorithm SHA256 artifacts/windows-amd64/minitun.exe).Hash.ToLower() + "  minitun.exe"
-            (Get-FileHash -Algorithm SHA256 artifacts/windows-amd64/README.md).Hash.ToLower() + "  README.md"
-            (Get-FileHash -Algorithm SHA256 artifacts/windows-amd64/LICENSE).Hash.ToLower() + "  LICENSE"
-            (Get-FileHash -Algorithm SHA256 artifacts/windows-amd64/settings.toml).Hash.ToLower() + "  settings.toml"
+            (Get-FileHash -Algorithm SHA256 artifacts/${{ matrix.artifact_name }}/lure.exe).Hash.ToLower() + "  lure.exe"
+            (Get-FileHash -Algorithm SHA256 artifacts/${{ matrix.artifact_name }}/minitun.exe).Hash.ToLower() + "  minitun.exe"
+            (Get-FileHash -Algorithm SHA256 artifacts/${{ matrix.artifact_name }}/README.md).Hash.ToLower() + "  README.md"
+            (Get-FileHash -Algorithm SHA256 artifacts/${{ matrix.artifact_name }}/LICENSE).Hash.ToLower() + "  LICENSE"
+            (Get-FileHash -Algorithm SHA256 artifacts/${{ matrix.artifact_name }}/settings.toml).Hash.ToLower() + "  settings.toml"
           )
-          $hashLines | Out-File -Encoding ascii artifacts/windows-amd64/SHA256SUMS
+          $hashLines | Out-File -Encoding ascii artifacts/${{ matrix.artifact_name }}/SHA256SUMS
 
-      - name: Upload Windows artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: windows-amd64
-          path: artifacts/windows-amd64
+          name: ${{ matrix.artifact_name }}
+          path: artifacts/${{ matrix.artifact_name }}
           if-no-files-found: error
           overwrite: true
 
@@ -338,7 +495,8 @@ jobs:
     needs:
       - prep
       - linux_build
-      - windows_build
+      - linux_arm64_build
+      - artifact_builds
     steps:
       - name: Download Linux artifact
         uses: actions/download-artifact@v4
@@ -346,11 +504,35 @@ jobs:
           name: linux-amd64
           path: bundle/linux-amd64
 
-      - name: Download Windows artifact
+      - name: Download Linux arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-arm64
+          path: bundle/linux-arm64
+
+      - name: Download macOS amd64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-amd64
+          path: bundle/macos-amd64
+
+      - name: Download macOS arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64
+          path: bundle/macos-arm64
+
+      - name: Download Windows amd64 artifact
         uses: actions/download-artifact@v4
         with:
           name: windows-amd64
           path: bundle/windows-amd64
+
+      - name: Download Windows arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-arm64
+          path: bundle/windows-arm64
 
       - name: Create combined bundle
         shell: bash
@@ -359,15 +541,29 @@ jobs:
           bundle_name="${{ needs.prep.outputs.pack_base }}_bundle.zip"
           (
             cd bundle
-            zip -r "../dist/${bundle_name}" linux-amd64 windows-amd64
+            zip -r "../dist/${bundle_name}" \
+              linux-amd64 \
+              linux-arm64 \
+              macos-amd64 \
+              macos-arm64 \
+              windows-amd64 \
+              windows-arm64
           )
           (
             cd dist
             mkdir -p release-assets
             cp ../bundle/linux-amd64/lure release-assets/lure-linux-x86_64
             cp ../bundle/linux-amd64/minitun release-assets/minitun-linux-x86_64
+            cp ../bundle/linux-arm64/lure release-assets/lure-linux-aarch64
+            cp ../bundle/linux-arm64/minitun release-assets/minitun-linux-aarch64
+            cp ../bundle/macos-amd64/lure release-assets/lure-macos-x86_64
+            cp ../bundle/macos-amd64/minitun release-assets/minitun-macos-x86_64
+            cp ../bundle/macos-arm64/lure release-assets/lure-macos-aarch64
+            cp ../bundle/macos-arm64/minitun release-assets/minitun-macos-aarch64
             cp ../bundle/windows-amd64/lure.exe release-assets/lure-windows-x86_64.exe
             cp ../bundle/windows-amd64/minitun.exe release-assets/minitun-windows-x86_64.exe
+            cp ../bundle/windows-arm64/lure.exe release-assets/lure-windows-aarch64.exe
+            cp ../bundle/windows-arm64/minitun.exe release-assets/minitun-windows-aarch64.exe
 
             sha256sum "${bundle_name}" release-assets/* > SHA256SUMS
           )
@@ -383,12 +579,13 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
-  docker:
+  docker_main:
     runs-on: ubuntu-latest
     needs:
       - prep
       - linux_build
-    if: needs.prep.outputs.publish_docker == 'true'
+      - linux_arm64_build
+    if: needs.prep.outputs.publish_docker == 'true' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
       packages: write
@@ -396,15 +593,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download Linux artifact
+      - name: Download Linux amd64 artifact
         uses: actions/download-artifact@v4
         with:
           name: linux-amd64
           path: artifacts/linux-amd64
 
-      - name: Stage Docker payload
-        run: cp artifacts/linux-amd64/lure ./lure
+      - name: Download Linux arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-arm64
+          path: artifacts/linux-arm64
 
+      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -413,24 +614,75 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=sha,format=long
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+      - name: Stage Docker payload
+        run: |
+          mkdir -p docker/linux-amd64 docker/linux-arm64
+          cp artifacts/linux-amd64/lure docker/linux-amd64/lure
+          cp artifacts/linux-arm64/lure docker/linux-arm64/lure
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile.copy
+          platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+
+  docker_canary:
+    runs-on: ubuntu-latest
+    needs:
+      - prep
+      - linux_build
+      - linux_arm64_build
+      - linux_check
+      - linux_test
+    if: needs.prep.outputs.publish_docker == 'true' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux amd64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64
+          path: artifacts/linux-amd64
+
+      - name: Download Linux arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-arm64
+          path: artifacts/linux-arm64
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stage Docker payload
+        run: |
+          mkdir -p docker/linux-amd64 docker/linux-arm64
+          cp artifacts/linux-amd64/lure docker/linux-amd64/lure
+          cp artifacts/linux-arm64/lure docker/linux-arm64/lure
+
+      - name: Build and push canary Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.copy
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:canary
 
   release:
     runs-on: ubuntu-latest
@@ -457,3 +709,56 @@ jobs:
             dist/*.zip
             dist/SHA256SUMS
             dist/release-assets/*
+
+  docker_stable:
+    runs-on: ubuntu-latest
+    needs:
+      - prep
+      - linux_build
+      - linux_arm64_build
+      - release
+    if: needs.prep.outputs.publish_release == 'true'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux amd64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64
+          path: artifacts/linux-amd64
+
+      - name: Download Linux arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-arm64
+          path: artifacts/linux-arm64
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stage Docker payload
+        run: |
+          mkdir -p docker/linux-amd64 docker/linux-arm64
+          cp artifacts/linux-amd64/lure docker/linux-amd64/lure
+          cp artifacts/linux-arm64/lure docker/linux-arm64/lure
+
+      - name: Build and push stable Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.copy
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:stable
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prep.outputs.release_tag }}
