@@ -3,7 +3,7 @@
 /// After the fix: session.traffic shows live byte/chunk counts as data flows
 use std::{
     io::{Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::TcpStream,
     sync::{Arc, atomic::AtomicBool, atomic::Ordering},
     thread,
     time::Duration,
@@ -13,7 +13,6 @@ use anyhow::Context;
 use lure::{
     config::{LureConfig, RouteConfig},
     lure::Lure,
-    sock,
     utils::leak,
 };
 use net::{HandshakeC2s, HandshakeNextState, LoginStartC2s, encode_packet, encode_raw_packet};
@@ -127,7 +126,7 @@ async fn run() -> anyhow::Result<()> {
         // Write 1MB in 64KB chunks, then read back.
         let chunk_size = 65536;
         let total = 1024 * 1024;
-        let mut buf = vec![0x42u8; chunk_size];
+        let buf = vec![0x42u8; chunk_size];
         let mut chunks_sent = 0;
 
         while chunks_sent * chunk_size < total && !load_stop_thread.load(Ordering::Relaxed) {

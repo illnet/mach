@@ -17,7 +17,6 @@ use lure::{
     sock,
     utils::leak,
 };
-use net::{HandshakeC2s, HandshakeNextState, LoginStartC2s, encode_packet, encode_raw_packet};
 use tokio::sync::oneshot;
 
 const DEFAULT_DURATION_SECS: u64 = 15;

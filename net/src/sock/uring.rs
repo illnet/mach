@@ -1,42 +1,34 @@
-use std::{io, net::SocketAddr, rc::Rc};
+use std::{future::Future, io, net::SocketAddr};
 
 use io_uring::IoUring;
-use tokio_uring::{
-    Submit,
-    buf::Buffer,
-    net::{TcpListener, TcpStream},
-    runtime::Runtime,
-};
-
-pub type StreamHandle = Rc<TcpStream>;
+use tokio::net::{TcpListener, TcpStream};
 
 pub(crate) fn probe() -> io::Result<()> {
-    IoUring::new(1).map(|_| ()).map_err(|err| {
-        io::Error::new(err.kind(), format!("io_uring syscall unavailable: {err}"))
-    })?;
-    Runtime::new(&tokio_uring::builder())
+    IoUring::new(1)
         .map(|_| ())
-        .map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!("tokio-uring runtime init failed: {err}"),
-            )
-        })
+        .map_err(|err| io::Error::new(err.kind(), format!("io_uring syscall unavailable: {err}")))
 }
 
 pub fn spawn<F>(future: F) -> tokio::task::JoinHandle<F::Output>
 where
-    F: std::future::Future + 'static,
+    // Keep the uring surface area compatible with callers that may hand us
+    // !Send tasks. The transport layer below is currently a Tokio fallback.
+    F: Future + 'static,
     F::Output: 'static,
 {
-    tokio_uring::spawn(future)
+    tokio::task::spawn_local(future)
 }
 
 pub fn start<F>(future: F) -> F::Output
 where
-    F: std::future::Future,
+    F: Future + 'static,
+    F::Output: 'static,
 {
-    tokio_uring::start(future)
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime")
+        .block_on(future)
 }
 
 pub struct Listener {
@@ -45,7 +37,9 @@ pub struct Listener {
 
 impl Listener {
     pub(crate) fn bind(addr: SocketAddr) -> io::Result<Self> {
-        let inner = TcpListener::bind(addr)?;
+        let std_listener = std::net::TcpListener::bind(addr)?;
+        std_listener.set_nonblocking(true)?;
+        let inner = TcpListener::from_std(std_listener)?;
         Ok(Self { inner })
     }
 
@@ -60,7 +54,7 @@ impl Listener {
 }
 
 pub struct Connection {
-    stream: Rc<TcpStream>,
+    pub(crate) stream: TcpStream,
     addr: SocketAddr,
 }
 
@@ -68,18 +62,14 @@ impl Connection {
     pub(crate) async fn connect(addr: SocketAddr) -> io::Result<Self> {
         let stream = TcpStream::connect(addr).await?;
         let addr = stream.peer_addr()?;
-        Ok(Self::new(stream, addr))
+        Ok(Self { stream, addr })
     }
 
     pub(crate) fn new(stream: TcpStream, addr: SocketAddr) -> Self {
-        Self {
-            stream: Rc::new(stream),
-            addr,
-        }
+        Self { stream, addr }
     }
 
-    #[must_use]
-    pub const fn addr(&self) -> &SocketAddr {
+    pub fn addr(&self) -> &SocketAddr {
         &self.addr
     }
 
@@ -95,115 +85,61 @@ impl Connection {
         self.stream.set_nodelay(nodelay)
     }
 
-    #[must_use]
-    pub fn stream_handle(&self) -> StreamHandle {
-        Rc::clone(&self.stream)
-    }
-
-    pub(crate) async fn read_chunk(&mut self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
-        match self.stream.read(Buffer::from(buf)).await {
-            Ok((n, buf)) => match buf.try_into::<Vec<u8>>() {
-                Ok(out) => Ok((n, out)),
-                Err(_) => Err(io::Error::other("failed to convert io_uring buffer")),
-            },
-            Err(err) => {
-                let _ = err.1;
-                Err(err.0)
-            }
-        }
+    pub(crate) async fn read_chunk(&mut self, mut buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
+        use tokio::io::AsyncReadExt;
+        let n = self.stream.read(&mut buf).await?;
+        Ok((n, buf))
     }
 
     pub(crate) async fn write_all(&mut self, buf: Vec<u8>) -> io::Result<Vec<u8>> {
-        write_all_stream_handle(&self.stream, buf).await
+        use tokio::io::AsyncWriteExt;
+        self.stream.write_all(buf.as_slice()).await?;
+        Ok(buf)
     }
 
     pub(crate) async fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        use tokio::io::AsyncWriteExt;
+        self.stream.flush().await
     }
 
-    pub(crate) fn try_read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "try_read is not supported for io_uring backend",
-        ))
+    pub(crate) fn try_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.try_read(buf)
     }
 
     pub(crate) async fn shutdown(&mut self) -> io::Result<()> {
-        self.stream.shutdown(std::net::Shutdown::Both)
+        use tokio::io::AsyncWriteExt;
+        self.stream.shutdown().await
     }
-}
 
-pub async fn read_into_handle(stream: &StreamHandle, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
-    match stream.read(Buffer::from(buf)).await {
-        Ok((n, buf)) => match buf.try_into::<Vec<u8>>() {
-            Ok(out) => Ok((n, out)),
-            Err(_) => Err(io::Error::other("failed to convert io_uring buffer")),
-        },
-        Err(err) => {
-            let _ = err.1;
-            Err(err.0)
+    pub(crate) fn raw_fd(&self) -> Option<i32> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            Some(self.stream.as_raw_fd())
+        }
+        #[cfg(not(unix))]
+        {
+            None
         }
     }
-}
 
-pub async fn write_all_handle(stream: &StreamHandle, buf: Vec<u8>) -> io::Result<Vec<u8>> {
-    write_all_stream_handle(stream, buf).await
+    pub(crate) fn into_proxy_inner(
+        self,
+        peer: Box<dyn crate::sock::Sock>,
+    ) -> io::Result<crate::sock::ProxyHandle> {
+        // Until the io_uring transport is made Send-compatible with the
+        // object-safe Sock trait, proxy through the Tokio implementation.
+        let conn = crate::sock::tokio::Connection::new(self.stream, self.addr);
+        conn.into_proxy(peer)
+    }
 }
 
 pub async fn passthrough_basic(a: &mut Connection, b: &mut Connection) -> io::Result<()> {
-    let a_stream = a.stream_handle();
-    let b_stream = b.stream_handle();
-    let left = spawn(async move { relay(a_stream, b_stream).await });
-    let b_stream = b.stream_handle();
-    let a_stream = a.stream_handle();
-    let right = spawn(async move { relay(b_stream, a_stream).await });
-    let left_res = left.await?;
-    left_res?;
-    let right_res = right.await?;
-    right_res?;
+    let (mut a_read, mut a_write) = a.stream.split();
+    let (mut b_read, mut b_write) = b.stream.split();
+
+    let a_to_b = tokio::io::copy(&mut a_read, &mut b_write);
+    let b_to_a = tokio::io::copy(&mut b_read, &mut a_write);
+    let _ = tokio::try_join!(a_to_b, b_to_a)?;
     Ok(())
-}
-
-async fn relay(from: StreamHandle, to: StreamHandle) -> io::Result<()> {
-    const BUF_CAP: usize = 64 * 1024; /* Increased from 16KB to reduce syscalls on high throughput */
-    let mut buf = vec![0u8; BUF_CAP];
-    loop {
-        let (n, out) = read_into_handle(&from, buf).await?;
-        buf = out;
-        if n == 0 {
-            return Ok(());
-        }
-        /* Optimize: pass only needed data to write, reuse buffer on next iteration */
-        buf.truncate(n);
-        buf = write_all_handle(&to, buf).await?;
-        /* Resize buffer back to capacity for next read operation */
-        buf.resize(BUF_CAP, 0);
-    }
-}
-
-async fn write_all_stream_handle(stream: &TcpStream, buf: Vec<u8>) -> io::Result<Vec<u8>> {
-    let mut pending = buf;
-    loop {
-        let buffer = Buffer::from(pending);
-        let (written, buffer): (usize, Buffer) = match stream.write(buffer).submit().await {
-            Ok((n, buffer)) => (n, buffer),
-            Err(err) => {
-                let _ = err.1;
-                return Err(err.0);
-            }
-        };
-        if written == 0 {
-            return Err(io::Error::from(io::ErrorKind::WriteZero));
-        }
-        let out = match buffer.try_into::<Vec<u8>>() {
-            Ok(out) => out,
-            Err(_) => {
-                return Err(io::Error::other("failed to convert io_uring buffer"));
-            }
-        };
-        if written >= out.len() {
-            return Ok(out);
-        }
-        pending = out[written..].to_vec();
-    }
 }
