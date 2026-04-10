@@ -1422,7 +1422,7 @@ fn main() {
     let sentry = init_sentry("minitun");
 
     if let Err(err) = try_main() {
-        sentry::capture_message(&err.to_string(), sentry::Level::Error);
+        capture_sentry_error("minitun_fatal", "tunnel_client", &err);
         error!("{err}");
         drop(sentry);
         std::process::exit(1);
@@ -1513,24 +1513,43 @@ fn try_main() -> anyhow::Result<()> {
 }
 
 fn init_sentry(service: &'static str) -> Option<sentry::ClientInitGuard> {
-    if std::env::var_os("NOSENTRY").is_some() {
+    if std::env::var_os("MINITUN_NOSENTRY").is_some() || std::env::var_os("NOSENTRY").is_some() {
         return None;
     }
 
+    let sentry_environment = std::env::var("MINITUN_SENTRY_ENV")
+        .ok()
+        .or_else(|| std::env::var("SENTRY_ENVIRONMENT").ok())
+        .map(Into::into);
     let guard = sentry::init((
         SENTRY_DSN,
         sentry::ClientOptions {
             release: sentry::release_name!(),
             send_default_pii: false,
             server_name: None,
+            environment: sentry_environment,
             ..Default::default()
         },
     ));
     sentry::configure_scope(|scope| {
         scope.set_tag("service", service);
         scope.set_tag("binary", "minitun");
+        scope.set_tag("default_error_origin", "tunnel_client");
     });
     Some(guard)
+}
+
+fn capture_sentry_error(event: &str, origin: &str, _err: &anyhow::Error) {
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("event", event);
+            scope.set_tag("error_origin", origin);
+            scope.set_tag("error_type", "anyhow::Error");
+        },
+        || {
+            sentry::capture_message("Tunnel client runtime failure", sentry::Level::Error);
+        },
+    );
 }
 
 fn backend_kind_name(kind: net::sock::BackendKind) -> &'static str {

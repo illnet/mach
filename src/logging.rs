@@ -11,6 +11,10 @@ use crate::error::ReportableError;
 
 pub struct LureLogger;
 
+fn sentry_origin_label(tunnel: bool) -> &'static str {
+    if tunnel { "tunnel_client" } else { "proxy" }
+}
+
 fn format_std_error_chain(err: &(dyn StdError + 'static)) -> String {
     let mut rendered = err.to_string();
     let mut sources = Vec::new();
@@ -90,14 +94,15 @@ impl LureLogger {
             |scope| {
                 scope.set_tag("event", "passthrough_unexpected_termination");
                 scope.set_tag("session_id", session_id.to_string());
-                scope.set_tag("client_addr", client.to_string());
-                scope.set_tag("backend_addr", backend.to_string());
-                scope.set_tag("tunnel", tunnel.to_string());
+                scope.set_tag("error_origin", sentry_origin_label(tunnel));
                 scope.set_tag("io_error_kind", format!("{:?}", err.kind()));
             },
             || {
                 sentry::capture_message(
-                    &format!("Passthrough terminated abnormally for session {session_id}: {err}"),
+                    &format!(
+                        "Passthrough terminated abnormally for session {session_id} [{}]",
+                        sentry_origin_label(tunnel)
+                    ),
                     sentry::Level::Warning,
                 );
             },
@@ -111,14 +116,14 @@ impl LureLogger {
         sentry::with_scope(
             |scope| {
                 scope.set_tag("event", "session_replaced");
-                scope.set_tag("client_addr", client.to_string());
+                scope.set_tag("error_origin", "proxy");
                 scope.set_tag("old_session_id", old_session_id.to_string());
                 scope.set_tag("new_session_id", new_session_id.to_string());
             },
             || {
                 sentry::capture_message(
                     &format!(
-                        "Session map entry replaced for {client}: old={old_session_id} new={new_session_id}"
+                        "Session map entry replaced: old={old_session_id} new={new_session_id}"
                     ),
                     sentry::Level::Warning,
                 );
@@ -177,14 +182,14 @@ impl LureLogger {
         sentry::with_scope(
             |scope| {
                 scope.set_tag("event", "tunnel_protocol_rejected");
-                scope.set_tag("peer_addr", addr.to_string());
+                scope.set_tag("error_origin", "tunnel_client");
                 scope.set_tag("tunnel_version", version.to_string());
                 scope.set_tag("tunnel_current_version", current.to_string());
             },
             || {
                 sentry::capture_message(
                     &format!(
-                        "Rejected tunnel protocol version {version} from {addr}; current version {current}"
+                        "Rejected tunnel protocol version {version}; current version {current}"
                     ),
                     sentry::Level::Warning,
                 );
@@ -204,7 +209,7 @@ impl LureLogger {
         sentry::with_scope(
             |scope| {
                 scope.set_tag("event", "tunnel_protocol_legacy");
-                scope.set_tag("peer_addr", addr.to_string());
+                scope.set_tag("error_origin", "tunnel_client");
                 scope.set_tag("tunnel_version", version.to_string());
                 scope.set_tag("tunnel_current_version", current.to_string());
                 scope.set_tag("tunnel_intent", format!("{intent:?}"));
@@ -212,7 +217,7 @@ impl LureLogger {
             || {
                 sentry::capture_message(
                     &format!(
-                        "Accepted legacy tunnel protocol version {version} from {addr} (current {current}, intent {intent:?})"
+                        "Accepted legacy tunnel protocol version {version} (current {current}, intent {intent:?})"
                     ),
                     sentry::Level::Warning,
                 );

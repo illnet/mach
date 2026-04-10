@@ -15,7 +15,7 @@ const SENTRY_DSN: &str =
 fn main() {
     let sentry = init_sentry("lure");
     if let Err(err) = try_main() {
-        capture_sentry_error(&*err);
+        capture_sentry_error("lure_fatal", "proxy", &*err);
         eprintln!("lure failed: {err}");
         drop(sentry);
         std::process::exit(1);
@@ -83,22 +83,28 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 }
 
 fn init_sentry(service: &'static str) -> Option<sentry::ClientInitGuard> {
-    if env::var_os("NOSENTRY").is_some() {
+    if env::var_os("LURE_NOSENTRY").is_some() || env::var_os("NOSENTRY").is_some() {
         return None;
     }
 
+    let sentry_environment = env::var("LURE_SENTRY_ENV")
+        .ok()
+        .or_else(|| env::var("SENTRY_ENVIRONMENT").ok())
+        .map(Into::into);
     let guard = sentry::init((
         SENTRY_DSN,
         sentry::ClientOptions {
             release: sentry::release_name!(),
             send_default_pii: false,
             server_name: None,
+            environment: sentry_environment,
             ..Default::default()
         },
     ));
     sentry::configure_scope(|scope| {
         scope.set_tag("service", service);
         scope.set_tag("binary", env!("CARGO_PKG_NAME"));
+        scope.set_tag("default_error_origin", "proxy");
     });
     Some(guard)
 }
@@ -111,8 +117,17 @@ fn backend_kind_name(kind: BackendKind) -> &'static str {
     }
 }
 
-fn capture_sentry_error(err: &dyn Error) {
-    sentry::capture_message(&err.to_string(), sentry::Level::Error);
+fn capture_sentry_error(event: &str, origin: &str, err: &dyn Error) {
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("event", event);
+            scope.set_tag("error_origin", origin);
+            scope.set_tag("error_type", std::any::type_name_of_val(err));
+        },
+        || {
+            sentry::capture_message("Lure runtime failure", sentry::Level::Error);
+        },
+    );
 }
 
 async fn run() -> Result<(), Box<dyn Error>> {
@@ -215,7 +230,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     spawn_named("Main thread", async move {
         if let Err(e) = lure.start().await {
-            sentry::capture_message(&e.to_string(), sentry::Level::Error);
+            capture_sentry_error("lure_start_failed", "proxy", &*e);
             log::error!("{e}");
         }
         if let Some(providers) = providers {
