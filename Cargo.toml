@@ -1,6 +1,6 @@
 [package]
 name = "lure"
-version = "0.5.5"
+version = "0.5.6"
 edition = "2024"
 default-run = "lure"
 
@@ -18,12 +18,32 @@ libc = "0.2"
 net = { path = "net" }
 tun = { path = "tun" }
 opentelemetry = { version = "0.31", default-features = false, features = ["metrics", "trace"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots", "metrics", "trace"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = [
+	"http-proto",
+	"reqwest-blocking-client",
+	"reqwest-rustls-webpki-roots",
+	"metrics",
+	"trace",
+] }
 dotenvy = "0.15"
-opentelemetry-stdout = { version = "0.31", default-features = false, features = ["metrics"], optional = true }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["metrics", "trace", "rt-tokio"] }
+opentelemetry-stdout = { version = "0.31", default-features = false, features = [
+	"metrics",
+], optional = true }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = [
+	"metrics",
+	"trace",
+	"rt-tokio",
+] }
 serde = { version = "1.0", features = ["derive", "rc"] }
-tokio = { version = "1.48", default-features = false, features = ["io-util", "macros", "rt-multi-thread", "signal", "sync", "time", "tracing"] }
+tokio = { version = "1.48", default-features = false, features = [
+	"io-util",
+	"macros",
+	"rt-multi-thread",
+	"signal",
+	"sync",
+	"time",
+	"tracing",
+] }
 toml = "1.1"
 async-trait = "0.1"
 futures = "0.3"
@@ -42,7 +62,12 @@ mimalloc = { version = "0.1", optional = true }
 tokio-metrics = "0.4"
 env_logger = "0.11"
 fake_serialize = "0.1"
-sentry = { version = "0.47.0", default-features = false, features = ["contexts", "panic", "rustls", "ureq"] }
+sentry = { version = "0.47.0", default-features = false, features = [
+	"contexts",
+	"panic",
+	"rustls",
+	"ureq",
+] }
 
 [features]
 # by default we build HTTP-only
