@@ -8,6 +8,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::{sync::RwLock, time::sleep};
 
 #[async_trait]
+/// Consumer interface for stream events produced by control-plane endpoint.
 pub trait EventHook<In, Out>
 where
     In: DeserializeOwned + Send + Sync,
@@ -26,6 +27,7 @@ where
     ) -> anyhow::Result<()>;
 }
 
+/// Long-lived event stream client with pluggable hook consumers.
 pub struct EventService<In, Out>
 where
     In: DeserializeOwned + Send,

@@ -12,9 +12,8 @@ use opentelemetry::{KeyValue, metrics::Counter};
 
 use crate::{
     router::{RouterInstance, inspect::SessionInspectState},
+    rpc::{EventEnvelope, EventServiceInstance, event::EventHook},
     telemetry::{
-        EventEnvelope, EventServiceInstance,
-        event::EventHook,
         get_meter,
         inspect::{InspectRequest, ListSessionsResponse, ListStatsResponse},
     },

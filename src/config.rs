@@ -15,6 +15,7 @@ use crate::router::{AuthMode, Endpoint, Route, RouteAttr, RouteFlags};
 const DEFAULT_ROUTE_ID_BASE: u64 = u64::MAX - u32::MAX as u64;
 
 #[derive(Debug, Clone)]
+/// Raw proxy signing key bytes used for signed proxy headers.
 pub struct ProxySigningKey(Vec<u8>);
 
 impl ProxySigningKey {
@@ -122,6 +123,7 @@ pub struct LureConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(default)]
+/// Declarative route entry loaded from config.
 pub struct RouteConfig {
     /// Optional single matcher helper.
     pub matcher: Option<String>,
@@ -151,6 +153,7 @@ pub struct RouteConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(default)]
+/// Expanded route flag configuration.
 pub struct RouteFlagsConfig {
     pub disabled: bool,
     pub proxy_protocol: bool,
@@ -186,6 +189,7 @@ pub struct TunnelConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
+/// Tunnel endpoint metadata fetched from control plane bootstrap.
 pub struct EndpointInfo {
     pub uniqname: String,
     pub city: String,

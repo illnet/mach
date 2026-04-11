@@ -9,6 +9,7 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Address part of a route destination.
 pub enum Address {
     Ipv4(Ipv4Addr),
     Ipv6(Ipv6Addr),
@@ -16,6 +17,7 @@ pub enum Address {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Resolved destination target (host/address + port).
 pub struct Destination(Address, u16);
 
 impl Destination {
@@ -99,6 +101,7 @@ impl Default for Destination {
 }
 
 #[derive(Debug)]
+/// Errors returned while parsing or resolving destinations.
 pub enum ParseDestinationError {
     Empty,
     MissingPort,

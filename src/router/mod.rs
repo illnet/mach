@@ -19,10 +19,9 @@ use tokio::{
 };
 
 use crate::{
-    logging::LureLogger,
-    metrics::RouterMetrics,
-    telemetry::{EventEnvelope, EventServiceInstance, NonObj, get_meter},
-    utils::spawn_named,
+    rpc::{EventEnvelope, EventServiceInstance, NonObj},
+    telemetry::{get_meter, metrics::RouterMetrics},
+    utils::{logging::LureLogger, spawn_named},
 };
 
 mod attr;
@@ -38,6 +37,7 @@ pub use profile::Profile;
 pub use query::QueryCache;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Copy)]
+/// Bit positions used by [`RouteAttr`] to encode route behavior flags.
 pub enum RouteFlags {
     Disabled = 0,
     CacheQuery = 1,
@@ -188,6 +188,7 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// Creates a scoped session handle bound to a router instance.
     pub const fn new(router: &'static RouterInstance, session: Arc<Session>) -> Self {
         Self {
             router,
@@ -195,6 +196,7 @@ impl SessionHandle {
         }
     }
 
+    /// Explicitly terminates session early instead of waiting for `Drop`.
     pub async fn terminate(mut self) -> anyhow::Result<()> {
         if let Some(session) = self.inner.take() {
             self.router.terminate_session(&session.client_addr).await?;
@@ -230,6 +232,7 @@ impl Drop for SessionHandle {
 }
 
 #[derive(Debug, Clone)]
+/// Endpoint selection result paired with matched route metadata.
 pub struct ResolvedRoute {
     pub endpoint: SocketAddr,
     pub endpoint_host: String,
@@ -779,7 +782,7 @@ pub struct RouteReport {
 }
 
 #[async_trait]
-impl crate::telemetry::event::EventHook<EventEnvelope, EventEnvelope> for RouterInstance {
+impl crate::rpc::event::EventHook<EventEnvelope, EventEnvelope> for RouterInstance {
     async fn on_handshake(&self) -> Option<EventEnvelope> {
         self.session_count()
             .await

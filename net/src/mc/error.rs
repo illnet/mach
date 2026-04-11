@@ -19,8 +19,10 @@ pub enum ProtoError {
     InvalidHandshakeState(i32),
 }
 
+/// Convenience result alias for protocol encode/decode operations.
 pub type Result<T> = std::result::Result<T, ProtoError>;
 
+/// Emits debug-only protocol error logs with context string.
 pub fn debug_log_error(context: &str, error: &ProtoError) {
     #[cfg(debug_assertions)]
     {

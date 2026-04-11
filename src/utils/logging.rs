@@ -9,6 +9,7 @@ use log::{debug, error, info, warn};
 
 use crate::error::ReportableError;
 
+/// Centralized structured logging helpers for proxy runtime.
 pub struct LureLogger;
 
 fn sentry_origin_label(tunnel: bool) -> &'static str {

@@ -30,12 +30,14 @@ pub(crate) struct EncodedConnection {
     intent: KeyValue,
 }
 
+/// Decoded Login Start packet with original wire payload.
 pub struct LoginStartFrame<'a> {
     pub packet: LoginStartC2s<'a>,
     pub raw: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
+/// Traffic direction labels used for connection metrics.
 pub enum SocketIntent {
     GreetToProxy,
     GreetToBackend,

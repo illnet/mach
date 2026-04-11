@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use anyhow::Result;
 
-use crate::{connection::EncodedConnection, logging::LureLogger, threat::ClientFail};
+use crate::{connection::EncodedConnection, threat::ClientFail, utils::logging::LureLogger};
 
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum ReportableError {

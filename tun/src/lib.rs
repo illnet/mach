@@ -1,8 +1,10 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub use net::sock;
+pub mod client;
 
 #[derive(Debug, thiserror::Error)]
+/// Errors produced while encoding/decoding tunnel protocol frames.
 pub enum TunnelError {
     #[error("buffer too short")]
     ShortBuffer,
@@ -20,18 +22,24 @@ pub enum TunnelError {
     InvalidAddrFamily(u8),
 }
 
+/// Fixed protocol magic prefix.
 pub const MAGIC: [u8; 4] = *b"LTUN";
+/// Current tunnel wire protocol version.
 pub const VERSION: u8 = 4;
+/// Previous wire format version with forward intent support.
 pub const V3_VERSION: u8 = 3;
+/// Legacy wire format version.
 pub const LEGACY_VERSION: u8 = 2;
 const MAX_SOCKET_ADDR_PAYLOAD_LEN: usize = 19;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+/// Agent hello intent kinds.
 pub enum Intent {
     Listen = 1,
     Connect = 2,
     Forward = 3,
+    Beacon = 4,
 }
 
 impl Intent {
@@ -40,18 +48,21 @@ impl Intent {
             1 => Ok(Self::Listen),
             2 => Ok(Self::Connect),
             3 => Ok(Self::Forward),
+            4 => Ok(Self::Beacon),
             other => Err(TunnelError::InvalidIntent(other)),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Tunnel forwarding request addresses.
 pub struct TunnelAgentRequest {
     pub from: SocketAddr,
     pub to: SocketAddr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Initial hello frame sent by tunnel agent.
 pub struct AgentHello {
     pub version: u8,
     pub intent: Intent,
@@ -63,6 +74,7 @@ pub struct AgentHello {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Forward intent payload embedded in [`AgentHello`].
 pub struct ForwardHello {
     pub session: [u8; 32],
     pub ttl: u8,
@@ -71,6 +83,7 @@ pub struct ForwardHello {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// V3 forward request server message.
 pub struct ForwardRequestMsg {
     pub session: [u8; 32],
     pub ttl: u8,
@@ -89,6 +102,7 @@ pub struct ForwardRequestV4Msg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+/// Server-to-agent message discriminants.
 pub enum ServerMsgKind {
     SessionOffer = 1,
     TargetAddr = 2,
@@ -98,6 +112,7 @@ pub enum ServerMsgKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Decoded server-to-agent messages.
 pub enum ServerMsg {
     SessionOffer([u8; 32]),
     TargetAddr(SocketAddr),
@@ -106,14 +121,17 @@ pub enum ServerMsg {
     ForwardRequestV4(ForwardRequestV4Msg),
 }
 
+/// Connects to tunnel server as agent.
 pub async fn connect_agent(addr: SocketAddr) -> std::io::Result<sock::LureConnection> {
     sock::LureConnection::connect(addr).await
 }
 
+/// Starts tunnel agent listener.
 pub async fn listen_agent(addr: SocketAddr) -> std::io::Result<sock::LureListener> {
     sock::LureListener::bind(addr).await
 }
 
+/// Decodes one `AgentHello` from input buffer.
 pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, TunnelError> {
     if buf.len() < 4 {
         return Ok(None);
@@ -139,6 +157,9 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
 
     let intent = Intent::from_u8(buf[5])?;
     if version < V3_VERSION && matches!(intent, Intent::Forward) {
+        return Err(TunnelError::UnsupportedVersion(version));
+    }
+    if version < VERSION && matches!(intent, Intent::Beacon) {
         return Err(TunnelError::UnsupportedVersion(version));
     }
 
@@ -202,6 +223,7 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
                 }),
             )
         }
+        Intent::Beacon => (None, None),
     };
 
     Ok(Some((
@@ -218,6 +240,7 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
     )))
 }
 
+/// Encodes `AgentHello` into output buffer.
 pub fn encode_agent_hello(hello: &AgentHello, out: &mut Vec<u8>) -> Result<(), TunnelError> {
     // Validate intent/session invariant: only Connect may have a session, others must not
     match hello.intent {
@@ -233,6 +256,11 @@ pub fn encode_agent_hello(hello: &AgentHello, out: &mut Vec<u8>) -> Result<(), T
         }
         Intent::Forward => {
             if hello.session.is_some() || hello.forward.is_none() {
+                return Err(TunnelError::InvalidIntent(hello.intent as u8));
+            }
+        }
+        Intent::Beacon => {
+            if hello.session.is_some() || hello.forward.is_some() {
                 return Err(TunnelError::InvalidIntent(hello.intent as u8));
             }
         }
@@ -262,10 +290,12 @@ pub fn encode_agent_hello(hello: &AgentHello, out: &mut Vec<u8>) -> Result<(), T
                 );
             }
         }
+        Intent::Beacon => {}
     }
     Ok(())
 }
 
+/// Encodes server message frame.
 pub fn encode_server_msg(msg: &ServerMsg, out: &mut Vec<u8>) {
     match msg {
         ServerMsg::SessionOffer(token) => {
@@ -298,6 +328,7 @@ pub fn encode_server_msg(msg: &ServerMsg, out: &mut Vec<u8>) {
     }
 }
 
+/// Decodes one server message from input buffer.
 pub fn decode_server_msg(buf: &[u8]) -> Result<Option<(ServerMsg, usize)>, TunnelError> {
     if buf.is_empty() {
         return Ok(None);
@@ -439,6 +470,7 @@ fn decode_socket_addr_payload(buf: &[u8]) -> Result<Option<(SocketAddr, usize)>,
 
 /// Compute HMAC-SHA256 for agent authentication
 #[must_use]
+/// Computes HMAC used in agent hello authentication.
 pub fn compute_agent_hmac(
     secret: &[u8; 32],
     key_id: &[u8; 8],

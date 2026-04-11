@@ -5,6 +5,7 @@ use super::{
 };
 
 #[inline]
+/// Splits `len` bytes from front of input and advances cursor.
 pub const fn take<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8]> {
     if input.len() < len {
         return Err(ProtoError::UnexpectedEof);
@@ -16,11 +17,13 @@ pub const fn take<'a>(input: &mut &'a [u8], len: usize) -> Result<&'a [u8]> {
 }
 
 #[inline]
+/// Reads one `u8`.
 pub fn read_u8(input: &mut &[u8]) -> Result<u8> {
     Ok(take(input, 1)?[0])
 }
 
 #[inline]
+/// Reads boolean encoded as `0` or `1`.
 pub fn read_bool(input: &mut &[u8]) -> Result<bool> {
     let value = read_u8(input)?;
     match value {
@@ -31,44 +34,52 @@ pub fn read_bool(input: &mut &[u8]) -> Result<bool> {
 }
 
 #[inline]
+/// Writes boolean as `0` or `1`.
 pub fn write_bool(out: &mut Vec<u8>, value: bool) {
     out.push(u8::from(value));
 }
 
 #[inline]
+/// Reads big-endian `u16`.
 pub fn read_u16_be(input: &mut &[u8]) -> Result<u16> {
     let bytes: [u8; 2] = take(input, 2)?.try_into().unwrap();
     Ok(u16::from_be_bytes(bytes))
 }
 
 #[inline]
+/// Writes big-endian `u16`.
 pub fn write_u16_be(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
 #[inline]
+/// Reads big-endian `i64`.
 pub fn read_i64_be(input: &mut &[u8]) -> Result<i64> {
     let bytes: [u8; 8] = take(input, 8)?.try_into().unwrap();
     Ok(i64::from_be_bytes(bytes))
 }
 
 #[inline]
+/// Writes big-endian `i64`.
 pub fn write_i64_be(out: &mut Vec<u8>, value: i64) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
 #[inline]
+/// Reads big-endian `u64`.
 pub fn read_u64_be(input: &mut &[u8]) -> Result<u64> {
     let bytes: [u8; 8] = take(input, 8)?.try_into().unwrap();
     Ok(u64::from_be_bytes(bytes))
 }
 
 #[inline]
+/// Writes big-endian `u64`.
 pub fn write_u64_be(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
 #[inline]
+/// Reads UUID from two big-endian `u64` words.
 pub fn read_uuid(input: &mut &[u8]) -> Result<Uuid> {
     let msb = read_u64_be(input)?;
     let lsb = read_u64_be(input)?;
@@ -76,12 +87,14 @@ pub fn read_uuid(input: &mut &[u8]) -> Result<Uuid> {
 }
 
 #[inline]
+/// Writes UUID as two big-endian `u64` words.
 pub fn write_uuid(out: &mut Vec<u8>, value: &Uuid) {
     let (msb, lsb) = value.as_u64s();
     write_u64_be(out, msb);
     write_u64_be(out, lsb);
 }
 
+/// Reads VarInt-length UTF-8 string with character bound checks.
 pub fn read_string_bounded<'a>(input: &mut &'a [u8], max_chars: usize) -> Result<&'a str> {
     let byte_len = read_varint(input)?;
     if byte_len < 0 {
@@ -111,6 +124,7 @@ pub fn read_string_bounded<'a>(input: &mut &'a [u8], max_chars: usize) -> Result
     Ok(s)
 }
 
+/// Writes UTF-8 string as VarInt-length payload with character bound checks.
 pub fn write_string_bounded(out: &mut Vec<u8>, value: &str, max_chars: usize) -> Result<()> {
     let char_count = value.encode_utf16().count();
     if char_count > max_chars {

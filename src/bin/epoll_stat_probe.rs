@@ -13,7 +13,7 @@ use std::{
 use anyhow::Context;
 use lure::{
     config::{LureConfig, RouteConfig},
-    lure::Lure,
+    proxy::Lure,
     sock,
     utils::leak,
 };

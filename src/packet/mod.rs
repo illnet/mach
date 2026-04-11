@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use net::{HandshakeC2s, HandshakeNextState, LoginStartC2s, LoginStartSigData, PacketEncode, Uuid};
 
+/// Adapter trait that stores packet fields in owned form.
 pub trait OwnedPacket<'a, P> {
     fn from_packet(packet: P) -> Self;
     fn as_packet(&'a self) -> P;
@@ -17,6 +18,7 @@ pub struct OwnedHandshake {
 }
 
 #[derive(Debug, Clone)]
+/// Owned version of `LoginStartC2s`.
 pub struct OwnedLoginStart {
     pub username: Arc<str>,
     pub profile_id: Option<Uuid>,
@@ -24,6 +26,7 @@ pub struct OwnedLoginStart {
 }
 
 #[derive(Debug, Clone)]
+/// Owned copy of login signature payload.
 pub struct OwnedLoginSigData {
     pub timestamp: i64,
     pub public_key: Vec<u8>,
@@ -99,6 +102,7 @@ impl<'a> OwnedPacket<'a, LoginStartC2s<'a>> for OwnedLoginStart {
     }
 }
 
+/// Encodes packet without compression frame.
 pub fn encode_uncompressed_packet<P: PacketEncode>(packet: &P) -> anyhow::Result<Vec<u8>> {
     let mut buf = Vec::new();
     net::encode_packet(&mut buf, packet)?;

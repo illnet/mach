@@ -1,6 +1,7 @@
 use super::error::{ProtoError, Result};
 
 #[inline]
+/// Reads one VarInt and advances input slice.
 pub fn read_varint(input: &mut &[u8]) -> Result<i32> {
     let Some((value, len)) = read_varint_partial(input)? else {
         return Err(ProtoError::UnexpectedEof);
@@ -10,6 +11,7 @@ pub fn read_varint(input: &mut &[u8]) -> Result<i32> {
 }
 
 #[inline]
+/// Reads one VarInt if enough bytes available; otherwise returns `Ok(None)`.
 pub fn read_varint_partial(input: &[u8]) -> Result<Option<(i32, usize)>> {
     let mut value: u32 = 0;
     for i in 0..5 {
@@ -28,6 +30,7 @@ pub fn read_varint_partial(input: &[u8]) -> Result<Option<(i32, usize)>> {
 }
 
 #[inline]
+/// Writes VarInt-encoded integer into output buffer.
 pub fn write_varint(out: &mut Vec<u8>, value: i32) {
     let mut val = value as u32;
     loop {
@@ -41,6 +44,7 @@ pub fn write_varint(out: &mut Vec<u8>, value: i32) {
 }
 
 #[inline]
+/// Returns encoded byte length of VarInt value.
 pub const fn varint_len(value: i32) -> usize {
     let mut val = value as u32;
     let mut count = 1;

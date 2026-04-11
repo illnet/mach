@@ -8,12 +8,14 @@ use tokio::time::{error::Elapsed, timeout};
 use crate::threat::ratelimit::RateLimitResult;
 
 #[derive(Debug)]
+/// Client action categories used by threat wrappers.
 pub enum IntentTag {
     Handshake,
     Query,
 }
 
 #[derive(Debug, thiserror::Error)]
+/// High-level client guard failures.
 pub enum ClientFail {
     #[error("Timeout (cf::nt:{elapsed:?})")]
     Timeout {
@@ -25,12 +27,14 @@ pub enum ClientFail {
 }
 
 #[derive(Debug)]
+/// Timeout policy attached to guarded client operation.
 pub struct ClientIntent {
     pub tag: IntentTag,
     pub duration: Duration,
 }
 
 #[derive(Debug)]
+/// Central threat/abuse guard helpers.
 pub struct ThreatControlService;
 
 impl Default for ThreatControlService {
