@@ -37,6 +37,7 @@ pub use profile::Profile;
 pub use query::QueryCache;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Copy)]
+/// Bit positions used by [`RouteAttr`] to encode route behavior flags.
 pub enum RouteFlags {
     Disabled = 0,
     CacheQuery = 1,
@@ -187,6 +188,7 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// Creates a scoped session handle bound to a router instance.
     pub const fn new(router: &'static RouterInstance, session: Arc<Session>) -> Self {
         Self {
             router,
@@ -194,6 +196,7 @@ impl SessionHandle {
         }
     }
 
+    /// Explicitly terminates session early instead of waiting for `Drop`.
     pub async fn terminate(mut self) -> anyhow::Result<()> {
         if let Some(session) = self.inner.take() {
             self.router.terminate_session(&session.client_addr).await?;
@@ -229,6 +232,7 @@ impl Drop for SessionHandle {
 }
 
 #[derive(Debug, Clone)]
+/// Endpoint selection result paired with matched route metadata.
 pub struct ResolvedRoute {
     pub endpoint: SocketAddr,
     pub endpoint_host: String,

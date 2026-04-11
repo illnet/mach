@@ -4,6 +4,7 @@ use net::Uuid;
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 
 #[derive(Debug, Clone)]
+/// Player profile extracted from login packets.
 pub struct Profile {
     pub name: Arc<str>,
     pub uuid: Option<Uuid>,

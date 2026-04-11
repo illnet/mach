@@ -14,6 +14,7 @@ use crate::{
 mod headers;
 use headers::create_proxy_protocol_header;
 #[derive(Debug, thiserror::Error)]
+/// Backend connection lifecycle errors.
 pub enum BackendConnectError {
     #[error("backend connect failed")]
     Connect(#[source] anyhow::Error),
@@ -21,6 +22,7 @@ pub enum BackendConnectError {
     Handshake(#[source] anyhow::Error),
 }
 
+/// Opens backend TCP stream and forwards initial handshake.
 pub async fn connect(
     address: SocketAddr,
     handshake: &OwnedHandshake,

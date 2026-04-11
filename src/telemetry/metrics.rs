@@ -3,6 +3,7 @@ use opentelemetry::{
     metrics::{Counter, Gauge, Histogram, Meter},
 };
 
+/// Handshake pipeline telemetry instruments.
 pub struct HandshakeMetrics {
     open: Counter<u64>,
     attempts: Counter<u64>,
@@ -54,6 +55,7 @@ impl HandshakeMetrics {
 }
 
 #[derive(Debug)]
+/// Router lifecycle telemetry instruments.
 pub struct RouterMetrics {
     routes_active: Gauge<u64>,
     routes_resolve: Counter<u64>,

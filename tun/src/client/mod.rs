@@ -16,6 +16,7 @@ use self::{
     runtime::run_orchestrator,
 };
 
+/// CLI entrypoint for `minitun` client.
 pub fn run_cli() -> anyhow::Result<()> {
     let cli = Cli::parse();
     sentry::configure_scope(|scope| {

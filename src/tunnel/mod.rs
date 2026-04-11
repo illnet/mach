@@ -26,6 +26,7 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_BEACON_STALE_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug)]
+/// Internal message envelope for tunnel inspection snapshots.
 pub enum TunnelInspectMsg {
     Snapshot {
         req: u64,
@@ -33,6 +34,7 @@ pub enum TunnelInspectMsg {
     },
 }
 
+/// RPC event hook that serves tunnel snapshot requests.
 pub struct TunnelInspectHook {
     tx: UnboundedSender<TunnelInspectMsg>,
     is_master: bool,
@@ -94,11 +96,13 @@ impl crate::rpc::event::EventHook<EventEnvelope, EventEnvelope> for TunnelInspec
 }
 
 #[derive(Debug)]
+/// Internal control-plane synchronization messages for tunnel tokens.
 pub enum TunnelControlMsg {
     Flush,
     Upsert(TokenEntry),
 }
 
+/// RPC event hook that applies control-plane tunnel token updates.
 pub struct TunnelControlHook {
     tx: UnboundedSender<TunnelControlMsg>,
 }
@@ -145,11 +149,14 @@ fn key_id_prefix(key_id: &[u8; 8]) -> String {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Stable 8-byte tunnel token identifier.
 pub struct TokenKeyId(pub [u8; 8]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Per-session random tunnel correlation token.
 pub struct SessionToken(pub [u8; 32]);
 
+/// Runtime metadata stored per registered tunnel token.
 pub struct TokenInfo {
     /// Full 32-byte secret for HMAC
     pub secret: [u8; 32],
@@ -162,18 +169,21 @@ pub struct TokenInfo {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Tunnel dispatch operating mode for this Lure instance.
 pub enum TunnelAgentMode {
     Master,
     Slave,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Where tunnel offer should be dispatched.
 pub enum TunnelAgentDispatch {
     LocalAgent,
     Master(SocketAddr),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Forward-request payload sent from slave to master tunnel registry.
 pub struct MasterForwardTunnelRequest {
     pub tunnel_id: TokenKeyId,
     pub session: SessionToken,
@@ -182,15 +192,18 @@ pub struct MasterForwardTunnelRequest {
     pub client_addr: Option<SocketAddr>,
 }
 
+/// High-level API for accepting and dispatching tunnel connections.
 pub struct TunnelAgentController {
     registry: Arc<TunnelRegistry>,
 }
 
+/// Successful accepted tunnel connection envelope.
 pub struct AcceptedTunnelConnection {
     pub connection: LureConnection,
     pub agent_version: u8,
 }
 
+/// Shared runtime registry for tunnel tokens, agents, and pending sessions.
 pub struct TunnelRegistry {
     /// Token registry by `key_id`
     tokens: RwLock<HashMap<TokenKeyId, Arc<TokenInfo>>>,

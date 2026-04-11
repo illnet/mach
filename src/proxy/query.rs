@@ -18,6 +18,7 @@ fn string_or_fallback(config: &LureConfig, key: &str, fallback: &str) -> String 
     }
 }
 
+/// Builds minimal Status response JSON body.
 pub fn placeholder_status_response(brand: &str, message: &str) -> String {
     json!({
         "version": {
@@ -31,10 +32,12 @@ pub fn placeholder_status_response(brand: &str, message: &str) -> String {
     .to_string()
 }
 
+/// Builds configured fallback Status response JSON.
 pub fn placeholder_status_json(config: &LureConfig, label: &str) -> String {
     placeholder_status_json_with_fallback(config, label, "Gateway error")
 }
 
+/// Builds configured Status response JSON with explicit fallback message.
 pub fn placeholder_status_json_with_fallback(
     config: &LureConfig,
     label: &str,
@@ -45,6 +48,7 @@ pub fn placeholder_status_json_with_fallback(
     placeholder_status_response(&brand, &target_label)
 }
 
+/// Sends placeholder Status response for failure cases.
 pub async fn send_status_failure(
     client: &mut EncodedConnection,
     config: &LureConfig,
@@ -57,6 +61,7 @@ pub async fn send_status_failure(
     Ok(())
 }
 
+/// Sends placeholder Status response with caller-provided fallback text.
 pub async fn send_status_failure_with_fallback(
     client: &mut EncodedConnection,
     config: &LureConfig,

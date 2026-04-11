@@ -8,11 +8,13 @@ use governor::{
 use log::warn;
 
 #[derive(Debug)]
+/// Outcome of a rate-limit check.
 pub enum RateLimitResult {
     Allowed,
     Disallowed { retry_after: Duration },
 }
 
+/// Keyed rate limiter wrapper used by proxy threat controls.
 pub struct RateLimiterController<K: Hash + Eq + Clone> {
     limiter: RateLimiter<K, DashMapStateStore<K>, DefaultClock>,
     retry_time: Duration,

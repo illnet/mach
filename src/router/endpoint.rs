@@ -5,6 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use super::Destination;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Tunnel selection encoded in endpoint strings.
 pub enum TunnelOpt {
     None,
     /// Explicit tunnel `key_id` in hex (8 bytes / 16 hex chars).
@@ -14,6 +15,7 @@ pub enum TunnelOpt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Route endpoint destination plus optional tunnel selector.
 pub struct Endpoint {
     destination: Destination,
     tunnel: TunnelOpt,
@@ -90,6 +92,7 @@ impl<'de> Deserialize<'de> for Endpoint {
 }
 
 #[derive(Debug)]
+/// Errors returned while parsing endpoint declarations.
 pub enum ParseEndpointError {
     Empty,
     Destination(super::dest::ParseDestinationError),

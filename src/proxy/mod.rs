@@ -45,6 +45,7 @@ use helpers::{
     socket_backend_label, unsupported_tunnel_version,
 };
 
+/// Main proxy runtime service orchestrating routing, tunnels, and telemetry.
 pub struct Lure {
     config: RwLock<LureConfig>,
     router: &'static RouterInstance,

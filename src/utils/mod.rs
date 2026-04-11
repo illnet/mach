@@ -14,6 +14,7 @@ mod mimalloc {
     static GLOBAL: MiMalloc = MiMalloc;
 }
 
+/// Adapter that wraps a `'static` reference as owned hook object.
 pub struct OwnedStatic<T: 'static>(&'static T);
 
 impl<T> From<&'static T> for OwnedStatic<T> {
@@ -40,10 +41,12 @@ impl<H: EventHook<EventEnvelope, EventEnvelope> + Send + Sync>
     }
 }
 
+/// Leaks value and returns process-lifetime static reference.
 pub fn leak<T>(inner: T) -> &'static T {
     Box::leak(Box::new(inner))
 }
 
+/// Spawns named local task on current Tokio local runtime.
 pub fn spawn_named<F>(
     name: &str,
     future: F,
@@ -57,6 +60,7 @@ where
 
 #[derive(Default, Debug)]
 /// Warning: This implementation only assumes that single sync-inc
+/// Fast non-atomic counter for single-writer runtime paths.
 pub struct UnsafeCounterU64 {
     v: UnsafeCell<u64>,
 }
