@@ -19,10 +19,9 @@ use tokio::{
 };
 
 use crate::{
-    logging::LureLogger,
-    metrics::RouterMetrics,
-    telemetry::{EventEnvelope, EventServiceInstance, NonObj, get_meter},
-    utils::spawn_named,
+    rpc::{EventEnvelope, EventServiceInstance, NonObj},
+    telemetry::{get_meter, metrics::RouterMetrics},
+    utils::{logging::LureLogger, spawn_named},
 };
 
 mod attr;
@@ -779,7 +778,7 @@ pub struct RouteReport {
 }
 
 #[async_trait]
-impl crate::telemetry::event::EventHook<EventEnvelope, EventEnvelope> for RouterInstance {
+impl crate::rpc::event::EventHook<EventEnvelope, EventEnvelope> for RouterInstance {
     async fn on_handshake(&self) -> Option<EventEnvelope> {
         self.session_count()
             .await

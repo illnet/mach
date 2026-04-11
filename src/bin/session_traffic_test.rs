@@ -12,7 +12,7 @@ use std::{
 use anyhow::Context;
 use lure::{
     config::{LureConfig, RouteConfig},
-    lure::Lure,
+    proxy::Lure,
     utils::leak,
 };
 use net::{HandshakeC2s, HandshakeNextState, LoginStartC2s, encode_packet, encode_raw_packet};

@@ -6,9 +6,9 @@ use tokio::time::timeout;
 use crate::{
     config::LureConfig,
     connection::{EncodedConnection, SocketIntent},
-    logging::LureLogger,
     packet::{OwnedHandshake, encode_uncompressed_packet},
     sock::LureConnection,
+    utils::logging::LureLogger,
 };
 
 mod headers;

@@ -22,12 +22,11 @@ use crate::{
     config::LureConfig,
     connection::{EncodedConnection, SocketIntent},
     error::{ErrorResponder, ReportableError},
-    logging::LureLogger,
-    metrics::HandshakeMetrics,
     packet::{OwnedHandshake, OwnedLoginStart, OwnedPacket},
     router::{Profile, ResolvedRoute, Route, RouterInstance, Session, SessionHandle},
+    rpc::{EventEnvelope, EventServiceInstance, event::EventHook, init_event},
     sock::{BackendKind, LureListener, backend_kind, passthrough_now},
-    telemetry::{EventEnvelope, EventServiceInstance, event::EventHook, get_meter, init_event},
+    telemetry::{get_meter, metrics::HandshakeMetrics},
     threat::{
         ClientFail, ClientIntent, IntentTag, ThreatControlService, ratelimit::RateLimiterController,
     },
@@ -35,7 +34,7 @@ use crate::{
         MasterForwardTunnelRequest, SessionToken, TokenKeyId, TunnelAgentController,
         TunnelAgentDispatch, TunnelAgentMode, TunnelRegistry,
     },
-    utils::{OwnedStatic, leak, spawn_named},
+    utils::{OwnedStatic, leak, logging::LureLogger, spawn_named},
 };
 mod backend;
 mod query;
@@ -319,7 +318,10 @@ impl Lure {
                 .await;
             event.hook(OwnedStatic::from(self.router)).await;
             event
-                .hook(crate::inspect::InspectHook::new(self.router, inst.clone()))
+                .hook(crate::rpc::inspect::InspectHook::new(
+                    self.router,
+                    inst.clone(),
+                ))
                 .await;
             event
                 .hook(crate::tunnel::TunnelControlHook::new(tun_tx))
@@ -468,7 +470,10 @@ impl Lure {
                 .await;
             event.hook(OwnedStatic::from(self.router)).await;
             event
-                .hook(crate::inspect::InspectHook::new(self.router, inst.clone()))
+                .hook(crate::rpc::inspect::InspectHook::new(
+                    self.router,
+                    inst.clone(),
+                ))
                 .await;
             event
                 .hook(crate::tunnel::TunnelControlHook::new(tun_tx))

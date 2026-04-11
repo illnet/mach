@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub use net::sock;
+pub mod client;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TunnelError {

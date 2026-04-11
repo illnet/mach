@@ -1,6 +1,9 @@
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+use std::{
+    hint::black_box,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
+};
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use net::ha::{AddressInfo, Command, Family, Header, Protocol, Tlv, parse};
 
 fn header_ipv4() -> Header {
@@ -57,7 +60,7 @@ fn header_with_tlv() -> Header {
 }
 
 fn bench_parse_header(c: &mut Criterion, name: &str, header: Header) {
-    let bytes = header.serialize();
+    let bytes = header.serialize().expect("bench fixture must serialize");
     c.bench_function(name, |b| {
         b.iter(|| {
             let parsed = parse(black_box(&bytes)).unwrap();
@@ -79,7 +82,9 @@ fn bench_parse_with_tlv(c: &mut Criterion) {
 }
 
 fn bench_parse_truncated(c: &mut Criterion) {
-    let bytes = header_with_tlv().serialize();
+    let bytes = header_with_tlv()
+        .serialize()
+        .expect("bench fixture must serialize");
     let truncated_len = bytes.len().saturating_sub(1);
     let truncated = &bytes[..truncated_len];
     c.bench_function("ha_parse_truncated", |b| {

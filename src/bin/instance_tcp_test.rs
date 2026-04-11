@@ -15,7 +15,7 @@ use anyhow::Context;
 use log::error;
 use lure::{
     config::{LureConfig, RouteConfig, RouteFlagsConfig, TokenEntry, TunnelConfig},
-    lure::Lure,
+    proxy::Lure,
     sock,
     utils::leak,
 };

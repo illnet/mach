@@ -2,8 +2,8 @@ use std::{env, error::Error, io::ErrorKind, time::Duration};
 
 use lure::{
     config::{LureConfig, LureConfigLoadError, ProxySigningKey},
-    inspect,
-    lure::Lure,
+    proxy::Lure,
+    rpc,
     sock::{BackendKind, backend_selection},
     telemetry::{oltp::init_meter, process::ProcessMetricsService},
     utils::{leak, spawn_named},
@@ -171,7 +171,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         loop {
             interval.tick().await;
             let (c2s_bytes, s2c_bytes, c2s_chunks, s2c_chunks) =
-                inspect::take_global_traffic_snapshot();
+                rpc::inspect::take_global_traffic_snapshot();
             if c2s_bytes > 0 || s2c_bytes > 0 {
                 let c2s_mb = c2s_bytes as f64 / 1_000_000.0;
                 let s2c_mb = s2c_bytes as f64 / 1_000_000.0;

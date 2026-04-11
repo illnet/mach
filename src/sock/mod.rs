@@ -5,7 +5,7 @@ pub use net::sock::{
     backend_selection,
 };
 
-use crate::{inspect::pump_proxy_progress, logging::LureLogger};
+use crate::{rpc::inspect::pump_proxy_progress, utils::logging::LureLogger};
 
 /// Start bidirectional passthrough between `client` and `server`, driving
 /// live OTEL metrics from [`net::ProxyHandle::progress`].
@@ -56,14 +56,14 @@ pub(crate) async fn passthrough_now(
         session.inspect.route.record_c2s(leftover_c2s, 0);
         session.inspect.tenant.record_c2s(leftover_c2s, 0);
         session.inspect.instance.record_c2s(leftover_c2s, 0);
-        crate::inspect::GLOBAL_C2S_BYTES.fetch_add(leftover_c2s, Ordering::Relaxed);
+        crate::rpc::inspect::GLOBAL_C2S_BYTES.fetch_add(leftover_c2s, Ordering::Relaxed);
     }
     if leftover_s2c > 0 {
         session.inspect.record_s2c_delta(leftover_s2c, 0);
         session.inspect.route.record_s2c(leftover_s2c, 0);
         session.inspect.tenant.record_s2c(leftover_s2c, 0);
         session.inspect.instance.record_s2c(leftover_s2c, 0);
-        crate::inspect::GLOBAL_S2C_BYTES.fetch_add(leftover_s2c, Ordering::Relaxed);
+        crate::rpc::inspect::GLOBAL_S2C_BYTES.fetch_add(leftover_s2c, Ordering::Relaxed);
     }
 
     Ok(())
