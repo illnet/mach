@@ -161,6 +161,7 @@ impl Lure {
             loop {
                 cleanup_interval.tick().await;
                 tunnels_clone.cleanup_expired_sessions().await;
+                tunnels_clone.cleanup_stale_agents().await;
             }
         })
         .ok(); // Ignore spawn errors during initialization
@@ -1225,6 +1226,11 @@ impl Lure {
                 tun::encode_server_msg(&tun::ServerMsg::ForwardAck(forward.session), &mut buf);
                 let mut connection = connection;
                 connection.write_all(buf).await?;
+            }
+            tun::Intent::Beacon => {
+                self.tunnels
+                    .record_beacon(key_id, hello.timestamp, hello.hmac)
+                    .await?;
             }
         }
         Ok(())

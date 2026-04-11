@@ -21,6 +21,8 @@ use crate::{
 
 /// Timeout duration for waiting for ForwardAck from master
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Agent is considered stale if no health beacon arrives within this window.
+const AGENT_BEACON_STALE_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[derive(Debug)]
 pub enum TunnelInspectMsg {
@@ -203,6 +205,7 @@ struct AgentRecord {
     tx: mpsc::Sender<TunnelCommand>,
     task: tokio::task::JoinHandle<()>,
     connected_at: Instant,
+    last_beacon_at: Instant,
     offers_sent: u64,
 }
 
@@ -652,6 +655,7 @@ impl TunnelRegistry {
                     tx: tx.clone(),
                     task,
                     connected_at: Instant::now(),
+                    last_beacon_at: Instant::now(),
                     offers_sent: 0,
                 },
             )
@@ -855,6 +859,32 @@ impl TunnelRegistry {
         Ok(())
     }
 
+    pub async fn record_beacon(
+        &self,
+        key_id: TokenKeyId,
+        timestamp: u64,
+        hmac: [u8; 32],
+    ) -> anyhow::Result<()> {
+        self.validate_hmac(
+            &key_id,
+            timestamp,
+            tun::Intent::Beacon,
+            None,
+            None,
+            0,
+            None,
+            &hmac,
+        )
+        .await?;
+
+        let now = Instant::now();
+        let mut agents = self.agents.write().await;
+        if let Some(agent) = agents.get_mut(&key_id) {
+            agent.last_beacon_at = now;
+        }
+        Ok(())
+    }
+
     pub async fn inspect_snapshot(&self) -> crate::telemetry::inspect::TunnelInspectSnapshot {
         use crate::telemetry::inspect::{
             TunnelAgentInspect, TunnelInspectSnapshot, TunnelPendingInspect, TunnelTokenInspect,
@@ -1001,6 +1031,42 @@ impl TunnelRegistry {
             self.expired_sessions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             debug!("Tunnel session expired: {:?}", token.0[..8].to_vec());
+        }
+    }
+
+    pub(crate) async fn cleanup_stale_agents(&self) {
+        let now = Instant::now();
+        let mut stale_tasks = Vec::new();
+        {
+            let mut agents = self.agents.write().await;
+            let stale_keys: Vec<TokenKeyId> = agents
+                .iter()
+                .filter_map(|(key_id, record)| {
+                    // Legacy listeners (pre-v4) do not emit beacons; keep prior behavior.
+                    if record.version < tun::VERSION {
+                        return None;
+                    }
+                    (now.duration_since(record.last_beacon_at) > AGENT_BEACON_STALE_TIMEOUT)
+                        .then_some(*key_id)
+                })
+                .collect();
+            for key_id in stale_keys {
+                if let Some(agent) = agents.remove(&key_id) {
+                    stale_tasks.push((key_id, agent.task));
+                }
+            }
+        }
+
+        if stale_tasks.is_empty() {
+            return;
+        }
+
+        for (key_id, task) in stale_tasks {
+            task.abort();
+            log::warn!(
+                "tunnel: agent evicted as stale (no beacon): key_id_prefix={}",
+                key_id_prefix(&key_id.0)
+            );
         }
     }
 }

@@ -495,6 +495,61 @@ async fn send_agent_hello(
     Ok(())
 }
 
+async fn send_health_beacon(ingress: SocketAddr, config: &TunConfig) -> anyhow::Result<()> {
+    let mut beacon = tun::connect_agent(ingress).await?;
+    tune_socket(&beacon);
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let hmac = tun::compute_agent_hmac(
+        &config.secret,
+        &config.key_id,
+        timestamp,
+        Intent::Beacon,
+        None,
+        None,
+        0,
+        None,
+    );
+
+    send_agent_hello(
+        &mut beacon,
+        AgentHello {
+            version: tun::VERSION,
+            intent: Intent::Beacon,
+            key_id: config.key_id,
+            timestamp,
+            hmac,
+            session: None,
+            forward: None,
+        },
+    )
+    .await
+}
+
+fn spawn_health_beacon_probe(
+    ingress: SocketAddr,
+    config: TunConfig,
+) -> tokio::sync::oneshot::Receiver<anyhow::Result<()>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    match net::sock::backend_kind() {
+        net::sock::BackendKind::Tokio | net::sock::BackendKind::Epoll => {
+            tokio::task::spawn_local(async move {
+                let result = send_health_beacon(ingress, &config).await;
+                let _ = tx.send(result);
+            });
+        }
+        net::sock::BackendKind::Uring => {
+            net::sock::uring::spawn(async move {
+                let result = send_health_beacon(ingress, &config).await;
+                let _ = tx.send(result);
+            });
+        }
+    }
+    rx
+}
+
 fn tune_socket(conn: &net::sock::LureConnection) {
     if std::env::var("NO_NODELAY").is_err()
         && let Err(err) = conn.set_nodelay(true)
@@ -513,6 +568,8 @@ struct SharedState {
 }
 
 const MAX_CONCURRENT_TUNNEL_SESSIONS: usize = 1000;
+const HEALTH_BEACON_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+const HEALTH_BEACON_WARN_EVERY: u8 = 3;
 
 // =============================================================================
 // Session and Tunnel Handling
@@ -720,8 +777,69 @@ async fn listen_once(
 
     let mut buf = Vec::new();
     let mut read_buf = vec![0u8; 1024];
+    let mut beacon_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + HEALTH_BEACON_INTERVAL,
+        HEALTH_BEACON_INTERVAL,
+    );
+    beacon_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut beacon_failures: u8 = 0;
+    let mut beacon_probe: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>> = None;
     loop {
-        let msg = read_server_msg(&mut listener, &mut buf, &mut read_buf).await?;
+        let msg = tokio::select! {
+            maybe_beacon_result = async {
+                if let Some(probe) = &mut beacon_probe {
+                    Some(probe.await)
+                } else {
+                    None
+                }
+            }, if beacon_probe.is_some() => {
+                match maybe_beacon_result {
+                    Some(Ok(Ok(()))) => {
+                        if beacon_failures > 0 {
+                            info!(
+                                "health beacon recovered: key_id={} endpoint={ingress}",
+                                config.label
+                            );
+                        }
+                        beacon_failures = 0;
+                    }
+                    Some(Ok(Err(err))) => {
+                        beacon_failures = beacon_failures.saturating_add(1);
+                        if beacon_failures == 1
+                            || beacon_failures.is_multiple_of(HEALTH_BEACON_WARN_EVERY)
+                        {
+                            warn!(
+                                "health beacon failed (non-fatal): key_id={} endpoint={ingress} failures={} err={err}",
+                                config.label,
+                                beacon_failures
+                            );
+                        }
+                    }
+                    Some(Err(_)) => {
+                        beacon_failures = beacon_failures.saturating_add(1);
+                        if beacon_failures == 1
+                            || beacon_failures.is_multiple_of(HEALTH_BEACON_WARN_EVERY)
+                        {
+                            warn!(
+                                "health beacon probe task dropped (non-fatal): key_id={} endpoint={ingress} failures={}",
+                                config.label,
+                                beacon_failures
+                            );
+                        }
+                    }
+                    None => {}
+                }
+                beacon_probe = None;
+                continue;
+            }
+            msg = read_server_msg(&mut listener, &mut buf, &mut read_buf) => msg?,
+            _ = beacon_interval.tick() => {
+                if beacon_probe.is_none() {
+                    beacon_probe = Some(spawn_health_beacon_probe(ingress, config.clone()));
+                }
+                continue;
+            }
+        };
         let (session, ingress, client_addr, target_override) = match msg {
             ServerMsg::ForwardRequest(forward) => {
                 // v3: agent must wait for TargetAddr from server; no client IP
@@ -1385,6 +1503,7 @@ fn run_sign(args: SignArgs) -> anyhow::Result<()> {
             Some(parse_hex_exact::<32>(&s).map_err(|e| anyhow::anyhow!("{e}"))?)
         }
         Intent::Forward => anyhow::bail!("forward intent is not supported by `sign`"),
+        Intent::Beacon => anyhow::bail!("beacon intent is not supported by `sign`"),
     };
 
     let hmac = tun::compute_agent_hmac(

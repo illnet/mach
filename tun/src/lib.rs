@@ -32,6 +32,7 @@ pub enum Intent {
     Listen = 1,
     Connect = 2,
     Forward = 3,
+    Beacon = 4,
 }
 
 impl Intent {
@@ -40,6 +41,7 @@ impl Intent {
             1 => Ok(Self::Listen),
             2 => Ok(Self::Connect),
             3 => Ok(Self::Forward),
+            4 => Ok(Self::Beacon),
             other => Err(TunnelError::InvalidIntent(other)),
         }
     }
@@ -141,6 +143,9 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
     if version < V3_VERSION && matches!(intent, Intent::Forward) {
         return Err(TunnelError::UnsupportedVersion(version));
     }
+    if version < VERSION && matches!(intent, Intent::Beacon) {
+        return Err(TunnelError::UnsupportedVersion(version));
+    }
 
     let mut key_id = [0u8; 8];
     key_id.copy_from_slice(&buf[6..14]);
@@ -202,6 +207,7 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
                 }),
             )
         }
+        Intent::Beacon => (None, None),
     };
 
     Ok(Some((
@@ -236,6 +242,11 @@ pub fn encode_agent_hello(hello: &AgentHello, out: &mut Vec<u8>) -> Result<(), T
                 return Err(TunnelError::InvalidIntent(hello.intent as u8));
             }
         }
+        Intent::Beacon => {
+            if hello.session.is_some() || hello.forward.is_some() {
+                return Err(TunnelError::InvalidIntent(hello.intent as u8));
+            }
+        }
     }
 
     out.extend_from_slice(&MAGIC);
@@ -262,6 +273,7 @@ pub fn encode_agent_hello(hello: &AgentHello, out: &mut Vec<u8>) -> Result<(), T
                 );
             }
         }
+        Intent::Beacon => {}
     }
     Ok(())
 }
