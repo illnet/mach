@@ -14,7 +14,10 @@ use crate::{
 pub(super) fn is_local_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+            None => v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local(),
+        },
     }
 }
 
@@ -29,13 +32,24 @@ pub(super) fn is_routable_forward_ip(ip: IpAddr) -> bool {
                 && !v4.is_documentation()
                 && !v4.is_multicast()
         }
-        IpAddr::V6(v6) => {
-            !v6.is_unspecified()
-                && !v6.is_loopback()
-                && !v6.is_unique_local()
-                && !v6.is_unicast_link_local()
-                && !v6.is_multicast()
-        }
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => {
+                !v4.is_unspecified()
+                    && !v4.is_loopback()
+                    && !v4.is_private()
+                    && !v4.is_link_local()
+                    && !v4.is_broadcast()
+                    && !v4.is_documentation()
+                    && !v4.is_multicast()
+            }
+            None => {
+                !v6.is_unspecified()
+                    && !v6.is_loopback()
+                    && !v6.is_unique_local()
+                    && !v6.is_unicast_link_local()
+                    && !v6.is_multicast()
+            }
+        },
     }
 }
 

@@ -39,11 +39,11 @@ pub(super) struct InstallArgs {
     pub(super) endpoints: Vec<String>,
 
     /// Add/update a map entry key (must be paired with --map-addr).
-    #[arg(long = "map-name")]
+    #[arg(long = "map-name", requires = "map_addr")]
     pub(super) map_name: Option<String>,
 
     /// Map entry local address (paired with --map-name).
-    #[arg(long = "map-addr")]
+    #[arg(long = "map-addr", requires = "map_name")]
     pub(super) map_addr: Option<String>,
 
     /// Enable strict mode in config.
@@ -118,7 +118,7 @@ pub(super) struct SignArgs {
     pub(super) token: String,
 
     /// Intent to sign for
-    #[arg(long, value_parser = ["listen", "connect"])]
+    #[arg(long, value_parser = ["listen", "connect", "beacon"])]
     pub(super) intent: String,
 
     /// Unix timestamp (seconds). If omitted, uses current time.

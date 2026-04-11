@@ -72,7 +72,22 @@ async fn send_health_beacon(ingress: SocketAddr, config: &TunConfig) -> anyhow::
             forward: None,
         },
     )
+    .await?;
+
+    let mut buf = Vec::new();
+    let mut read_buf = vec![0u8; 1024];
+    let ack = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        read_server_msg(&mut beacon, &mut buf, &mut read_buf),
+    )
     .await
+    .context("timed out waiting for beacon ack")??;
+
+    match ack {
+        ServerMsg::ForwardAck(token) if token == hmac => Ok(()),
+        ServerMsg::ForwardAck(_) => anyhow::bail!("beacon ack token mismatch"),
+        other => anyhow::bail!("unexpected beacon ack message: {other:?}"),
+    }
 }
 
 fn spawn_health_beacon_probe(
@@ -125,19 +140,22 @@ const HEALTH_BEACON_WARN_EVERY: u8 = 3;
 // Session and Tunnel Handling
 // =============================================================================
 
-/// Build a minimal PROXY protocol v2 binary header with the given client address.
+/// Build a minimal PROXY protocol v2 binary header with source and target addresses.
 /// No TLV extensions — just the proxy address block.
-fn build_proxy_protocol_v2_header(client_addr: SocketAddr) -> anyhow::Result<Vec<u8>> {
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
-    let (family, address) = match client_addr {
-        SocketAddr::V4(addr) => (
-            net::Family::Inet,
-            net::AddressInfo::Ipv4(addr, SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-        ),
-        SocketAddr::V6(addr) => (
-            net::Family::Inet6,
-            net::AddressInfo::Ipv6(addr, SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
-        ),
+fn build_proxy_protocol_v2_header(
+    client_addr: SocketAddr,
+    target_addr: SocketAddr,
+) -> anyhow::Result<Vec<u8>> {
+    let (family, address) = match (client_addr, target_addr) {
+        (SocketAddr::V4(src), SocketAddr::V4(dst)) => {
+            (net::Family::Inet, net::AddressInfo::Ipv4(src, dst))
+        }
+        (SocketAddr::V6(src), SocketAddr::V6(dst)) => {
+            (net::Family::Inet6, net::AddressInfo::Ipv6(src, dst))
+        }
+        (src, dst) => {
+            anyhow::bail!("cannot build PPv2 header for mixed families: src={src} dst={dst}")
+        }
     };
     let header = net::Header {
         command: net::Command::Proxy,
@@ -251,7 +269,8 @@ async fn handle_session(
     );
     // v4 request includes client_addr only when Lure wants early PP authoring.
     if let Some(caddr) = client_addr {
-        let pp = build_proxy_protocol_v2_header(caddr).context("failed to build PPv2 header")?;
+        let pp = build_proxy_protocol_v2_header(caddr, target)
+            .context("failed to build PPv2 header")?;
         target_conn
             .write_all(pp)
             .await
@@ -516,18 +535,9 @@ fn spawn_tunnel_task(tc: TunConfig, shared: Arc<SharedState>) -> tokio::task::Jo
                 run(tc, shared).await;
             })
         }
-        net::sock::BackendKind::Uring => {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
-            net::sock::uring::spawn(async move {
-                let _ = run(tc, shared).await;
-                let _ = tx.send(()).await;
-            });
-            // Return a join handle that waits on the channel.
-            // This is a simplified solution; for production, use CancellationToken.
-            tokio::task::spawn_local(async move {
-                let _ = rx.recv().await;
-            })
-        }
+        net::sock::BackendKind::Uring => net::sock::uring::spawn(async move {
+            run(tc, shared).await;
+        }),
     }
 }
 
@@ -594,6 +604,7 @@ async fn apply_reload(
             Some(new_config) => {
                 if old_config.endpoints != new_config.endpoints
                     || old_config.secret != new_config.secret
+                    || old_config.proxy_protocol != new_config.proxy_protocol
                 {
                     Some(*key_id)
                 } else {

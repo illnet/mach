@@ -5,7 +5,6 @@ use std::{
 };
 
 use anyhow::Context;
-use log::error;
 use serde::{Deserialize, Serialize};
 
 /// Human-readable duration: "1s", "500ms", "2m". Default: 1s.
@@ -127,6 +126,10 @@ pub(super) fn parse_hex_exact<const N: usize>(input: &str) -> Result<[u8; N], St
 
 impl TunConfig {
     pub(super) fn from_entry(entry: &TunnelEntry) -> Result<Self, String> {
+        if entry.endpoints.is_empty() {
+            return Err("tunnel must contain at least one endpoint".to_string());
+        }
+
         let parts: Vec<&str> = entry.token.split(':').collect();
         if parts.len() != 2 {
             return Err("token format: key_id:secret (both hex-encoded)".to_string());
@@ -256,14 +259,11 @@ pub(super) fn save_config(path: &Path, config: &MiniTunConfig) -> anyhow::Result
     Ok(())
 }
 
-pub(super) fn load_or_default_config(path: &Path) -> MiniTunConfig {
+pub(super) fn load_or_default_config(path: &Path) -> anyhow::Result<MiniTunConfig> {
     if path.exists() {
-        load_config(path).unwrap_or_else(|e| {
-            error!("failed to load config: {e}; starting fresh");
-            MiniTunConfig::default()
-        })
+        load_config(path)
     } else {
-        MiniTunConfig::default()
+        Ok(MiniTunConfig::default())
     }
 }
 

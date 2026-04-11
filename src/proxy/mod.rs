@@ -1166,6 +1166,10 @@ impl Lure {
                 self.tunnels
                     .record_beacon(key_id, hello.timestamp, hello.hmac)
                     .await?;
+                let mut buf = Vec::new();
+                tun::encode_server_msg(&tun::ServerMsg::ForwardAck(hello.hmac), &mut buf);
+                let mut connection = connection;
+                connection.write_all(buf).await?;
             }
         }
         Ok(())

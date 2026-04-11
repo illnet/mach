@@ -23,7 +23,15 @@ impl EventHook<EventEnvelope, EventEnvelope> for EventIdent {
     ) -> anyhow::Result<()> {
         #[cfg(debug_assertions)]
         {
-            debug!("RPC-S2C: {event:?}");
+            match event {
+                EventEnvelope::SetTunnelToken(entry) => {
+                    debug!(
+                        "RPC-S2C: SetTunnelToken {{ key_id: {}, zone: {:?}, name: {:?}, secret: <redacted> }}",
+                        entry.key_id, entry.zone, entry.name
+                    );
+                }
+                _ => debug!("RPC-S2C: {event:?}"),
+            }
         }
         if let EventEnvelope::Hello(_) = event {
             info!("RPC: Hello");

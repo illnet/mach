@@ -30,7 +30,7 @@ pub(super) fn run_install(args: InstallArgs) -> anyhow::Result<()> {
     }
 
     let path = default_config_path()?;
-    let mut config = load_or_default_config(&path);
+    let mut config = load_or_default_config(&path)?;
 
     // Parse endpoints
     let all_endpoints: Vec<String> = args
@@ -195,7 +195,7 @@ pub(super) fn run_config(args: ConfigArgs) -> anyhow::Result<()> {
         }
         ConfigCommand::AddTunnel(a) => {
             let path = default_config_path()?;
-            let mut cfg = load_or_default_config(&path);
+            let mut cfg = load_or_default_config(&path)?;
             let endpoints = a
                 .endpoints
                 .iter()
@@ -218,7 +218,7 @@ pub(super) fn run_config(args: ConfigArgs) -> anyhow::Result<()> {
         }
         ConfigCommand::RemoveTunnel { index_or_key } => {
             let path = default_config_path()?;
-            let mut cfg = load_or_default_config(&path);
+            let mut cfg = load_or_default_config(&path)?;
             if let Ok(idx) = index_or_key.parse::<usize>() {
                 if idx >= cfg.tunnels.len() {
                     anyhow::bail!("index {idx} out of range (have {})", cfg.tunnels.len());
@@ -242,13 +242,13 @@ pub(super) fn run_config(args: ConfigArgs) -> anyhow::Result<()> {
         }
         ConfigCommand::AddMap { name, addr } => {
             let path = default_config_path()?;
-            let mut cfg = load_or_default_config(&path);
+            let mut cfg = load_or_default_config(&path)?;
             cfg.map.insert(name, addr);
             save_config(&path, &cfg)?;
         }
         ConfigCommand::RemoveMap { name } => {
             let path = default_config_path()?;
-            let mut cfg = load_or_default_config(&path);
+            let mut cfg = load_or_default_config(&path)?;
             if cfg.map.remove(&name).is_none() {
                 anyhow::bail!("map entry '{name}' not found");
             }
@@ -360,6 +360,7 @@ pub(super) fn run_sign(args: SignArgs) -> anyhow::Result<()> {
     let intent = match args.intent.as_str() {
         "listen" => Intent::Listen,
         "connect" => Intent::Connect,
+        "beacon" => Intent::Beacon,
         other => anyhow::bail!("invalid intent {other}"),
     };
 
@@ -377,7 +378,7 @@ pub(super) fn run_sign(args: SignArgs) -> anyhow::Result<()> {
     });
 
     let session = match intent {
-        Intent::Listen => None,
+        Intent::Listen | Intent::Beacon => None,
         Intent::Connect => {
             let s = args
                 .session
@@ -385,7 +386,6 @@ pub(super) fn run_sign(args: SignArgs) -> anyhow::Result<()> {
             Some(parse_hex_exact::<32>(&s).map_err(|e| anyhow::anyhow!("{e}"))?)
         }
         Intent::Forward => anyhow::bail!("forward intent is not supported by `sign`"),
-        Intent::Beacon => anyhow::bail!("beacon intent is not supported by `sign`"),
     };
 
     let hmac = crate::compute_agent_hmac(
