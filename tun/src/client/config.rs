@@ -57,7 +57,7 @@ impl<'de> Deserialize<'de> for HumanDuration {
 impl Serialize for HumanDuration {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let ms = self.0.as_millis();
-        if ms % 1000 == 0 {
+        if ms.is_multiple_of(1000) {
             s.serialize_str(&format!("{}s", ms / 1000))
         } else {
             s.serialize_str(&format!("{ms}ms"))
@@ -160,6 +160,10 @@ pub(super) fn xdg_config_home() -> Option<PathBuf> {
     home_dir().map(|h| h.join(".config"))
 }
 
+pub(super) fn xdg_runtime_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
+}
+
 pub(super) fn ensure_dir(path: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(path)?;
     Ok(())
@@ -210,10 +214,24 @@ pub(super) fn default_config_path() -> anyhow::Result<PathBuf> {
 }
 
 pub(super) fn pid_file_path() -> anyhow::Result<PathBuf> {
-    if let Some(h) = xdg_config_home() {
-        return Ok(h.join("minitun.pid"));
+    if let Some(runtime) = xdg_runtime_dir() {
+        return Ok(runtime.join("minitun.pid"));
     }
-    Ok(PathBuf::from("/run/minitun.pid"))
+
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::getuid() };
+        if uid > 0 {
+            let runtime_uid = PathBuf::from(format!("/run/user/{uid}/minitun.pid"));
+            return Ok(runtime_uid);
+        }
+    }
+
+    if let Some(home) = home_dir() {
+        return Ok(home.join(".cache").join("minitun.pid"));
+    }
+
+    Ok(PathBuf::from("/tmp/minitun.pid"))
 }
 
 // =============================================================================
@@ -311,11 +329,16 @@ pub(super) fn parse_endpoints(raw: &str) -> Vec<String> {
         .collect()
 }
 
-pub(super) fn resolve_endpoint(endpoint: &str) -> anyhow::Result<SocketAddr> {
+pub(super) async fn resolve_endpoint(endpoint: &str) -> anyhow::Result<SocketAddr> {
     if let Ok(addr) = endpoint.parse::<SocketAddr>() {
         return Ok(addr);
     }
-    let mut addrs = endpoint.to_socket_addrs()?;
+
+    let endpoint = endpoint.to_string();
+    let endpoint_for_lookup = endpoint.clone();
+    let mut addrs = tokio::task::spawn_blocking(move || endpoint_for_lookup.to_socket_addrs())
+        .await
+        .context("endpoint DNS resolution task failed")??;
     addrs
         .next()
         .ok_or_else(|| anyhow::anyhow!("no addresses found for endpoint: {endpoint}"))

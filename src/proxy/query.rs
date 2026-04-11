@@ -98,7 +98,7 @@ pub async fn handle_ping_pong_local(
         .await
     {
         Ok(Ok(packet)) => packet,
-        Ok(Err(err)) => return Err(err.into()),
+        Ok(Err(err)) => return Err(err),
         Err(err) => {
             if err.downcast_ref::<ClientFail>().is_some() {
                 return Err(err);

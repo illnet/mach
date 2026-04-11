@@ -66,10 +66,16 @@ impl crate::rpc::event::EventHook<EventEnvelope, EventEnvelope> for TunnelInspec
                 return Ok(());
             }
             let (tx, rx) = oneshot::channel();
-            let _ = self.tx.send(TunnelInspectMsg::Snapshot {
+            if let Err(send_err) = self.tx.send(TunnelInspectMsg::Snapshot {
                 req: req.req,
                 respond: tx,
-            });
+            }) {
+                log::warn!(
+                    "failed to queue TunnelInspectMsg::Snapshot: req={} err={send_err}",
+                    req.req
+                );
+                return Ok(());
+            }
 
             if let Ok(snapshot) = rx.await {
                 service
@@ -132,7 +138,10 @@ impl crate::rpc::event::EventHook<EventEnvelope, EventEnvelope> for TunnelContro
 }
 
 fn key_id_prefix(key_id: &[u8; 8]) -> String {
-    format!("{:02x}", key_id[0])
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        key_id[0], key_id[1], key_id[2], key_id[3]
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -200,13 +209,21 @@ pub struct TunnelRegistry {
 }
 
 struct AgentRecord {
+    /// Monotonic generation id used to avoid removing newer replacements.
     id: u64,
+    /// Protocol version reported by the connected tunnel agent.
     version: u8,
+    /// Remote socket address of the connected tunnel agent.
     peer_addr: SocketAddr,
+    /// Channel used by the registry to send [`TunnelCommand`] offers to this agent task.
     tx: mpsc::Sender<TunnelCommand>,
+    /// Listener task that owns the agent socket; abort on replacement/eviction.
     task: tokio::task::JoinHandle<()>,
+    /// Instant when the current agent registration was created.
     connected_at: Instant,
+    /// Instant of the latest health beacon; expected to be >= `connected_at`.
     last_beacon_at: Instant,
+    /// Number of forward offers sent through `tx` for this registration lifetime.
     offers_sent: u64,
 }
 
@@ -382,12 +399,12 @@ impl TunnelAgentController {
         tun::encode_agent_hello(&hello, &mut buf)?;
         connection.write_all(buf).await?;
 
-        let mut buf = Vec::new();
+        let mut recv_bytes = Vec::new();
         let mut read_buf = vec![0u8; 1024];
         let ack_result = timeout(ACK_TIMEOUT, async {
             loop {
-                if let Some((msg, consumed)) = tun::decode_server_msg(&buf)? {
-                    buf.drain(..consumed);
+                if let Some((msg, consumed)) = tun::decode_server_msg(&recv_bytes)? {
+                    recv_bytes.drain(..consumed);
                     if let tun::ServerMsg::ForwardAck(session) = msg {
                         if session == request.session.0 {
                             return Ok::<(), anyhow::Error>(());
@@ -401,7 +418,7 @@ impl TunnelAgentController {
                 if n == 0 {
                     anyhow::bail!("master closed forwarded request connection");
                 }
-                buf.extend_from_slice(&read_buf[..n]);
+                recv_bytes.extend_from_slice(&read_buf[..n]);
             }
         })
         .await;

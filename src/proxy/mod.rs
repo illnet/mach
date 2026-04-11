@@ -1,17 +1,15 @@
 use std::{
-    net::{IpAddr, SocketAddr, ToSocketAddrs},
-    sync::{Arc, Mutex, OnceLock},
+    net::{IpAddr, SocketAddr},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use getrandom::fill as fill_random;
 use log::{debug, error, info};
 use net::{
-    HandshakeC2s, HandshakeNextState, PacketDecoder, ProtoError, StatusPingC2s, StatusPongS2c,
-    StatusRequestC2s, StatusResponseS2c, encode_raw_packet,
+    HandshakeNextState, PacketDecoder, StatusPingC2s, StatusPongS2c, StatusRequestC2s,
+    StatusResponseS2c, encode_raw_packet,
 };
-use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{RwLock, Semaphore},
     task::yield_now,
@@ -24,7 +22,7 @@ use crate::{
     error::{ErrorResponder, ReportableError},
     packet::{OwnedHandshake, OwnedLoginStart, OwnedPacket},
     router::{Profile, ResolvedRoute, Route, RouterInstance, Session, SessionHandle},
-    rpc::{EventEnvelope, EventServiceInstance, event::EventHook, init_event},
+    rpc::init_event,
     sock::{BackendKind, LureListener, backend_kind, passthrough_now},
     telemetry::{get_meter, metrics::HandshakeMetrics},
     threat::{
@@ -37,56 +35,15 @@ use crate::{
     utils::{OwnedStatic, leak, logging::LureLogger, spawn_named},
 };
 mod backend;
+mod event_ident;
+mod helpers;
 mod query;
-
-fn is_local_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
-        }
-    }
-}
-
-fn is_routable_forward_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            !v4.is_unspecified()
-                && !v4.is_loopback()
-                && !v4.is_private()
-                && !v4.is_link_local()
-                && !v4.is_broadcast()
-                && !v4.is_documentation()
-                && !v4.is_multicast()
-        }
-        IpAddr::V6(v6) => {
-            !v6.is_unspecified()
-                && !v6.is_loopback()
-                && !v6.is_unique_local()
-                && !v6.is_unicast_link_local()
-                && !v6.is_multicast()
-        }
-    }
-}
-
-fn enforce_local_ip_block() -> bool {
-    static ENFORCE: OnceLock<bool> = OnceLock::new();
-
-    *ENFORCE.get_or_init(|| {
-        std::env::var("LURE_ENFORCE_LOCAL_BLOCK")
-            .ok()
-            .as_deref()
-            .map(|value| matches!(value, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
-            .unwrap_or(false)
-    })
-}
-
-fn normalize_optional_url(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
+pub(crate) use event_ident::EventIdent;
+use helpers::{
+    IngressHello, decode_handshake_frame, enforce_local_ip_block, is_local_ip,
+    is_routable_forward_ip, normalize_optional_url, resolve_socket_addr, route_requests_tunnel,
+    socket_backend_label, unsupported_tunnel_version,
+};
 
 pub struct Lure {
     config: RwLock<LureConfig>,
@@ -97,34 +54,6 @@ pub struct Lure {
     tunnels: Arc<TunnelRegistry>,
     tunnel_agents: Arc<TunnelAgentController>,
     bootstrap_poller: Mutex<Option<tokio::task::JoinHandle<()>>>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub(crate) struct EventIdent {
-    id: String,
-    is_master: bool,
-}
-
-#[async_trait]
-impl EventHook<EventEnvelope, EventEnvelope> for EventIdent {
-    async fn on_handshake(&self) -> Option<EventEnvelope> {
-        Some(EventEnvelope::HandshakeIdent(self.clone()))
-    }
-
-    async fn on_event(
-        &self,
-        _: &EventServiceInstance,
-        event: &'_ EventEnvelope,
-    ) -> anyhow::Result<()> {
-        #[cfg(debug_assertions)]
-        {
-            debug!("RPC-S2C: {event:?}");
-        }
-        if let EventEnvelope::Hello(_) = event {
-            info!("RPC: Hello");
-        }
-        Ok(())
-    }
 }
 
 impl Lure {
@@ -1561,65 +1490,4 @@ impl Lure {
             .await?;
         Ok(err)
     }
-}
-
-fn resolve_socket_addr(value: &str) -> anyhow::Result<SocketAddr> {
-    if let Ok(addr) = value.parse::<SocketAddr>() {
-        return Ok(addr);
-    }
-
-    let mut addrs = value.to_socket_addrs()?;
-    addrs
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no addresses resolved for {value}"))
-}
-
-fn decode_handshake_frame(frame: &net::PacketFrame) -> anyhow::Result<HandshakeC2s<'_>> {
-    if frame.id != HandshakeC2s::ID {
-        return Err(anyhow::anyhow!(
-            "unexpected packet id {} (expected {})",
-            frame.id,
-            HandshakeC2s::ID
-        ));
-    }
-    let mut body = frame.body.as_slice();
-    let pkt = HandshakeC2s::decode_body(&mut body)?;
-    if !body.is_empty() {
-        return Err(ProtoError::TrailingBytes(body.len()).into());
-    }
-    Ok(pkt)
-}
-
-fn unsupported_tunnel_version(err: &anyhow::Error) -> Option<u8> {
-    match err.downcast_ref::<tun::TunnelError>() {
-        Some(tun::TunnelError::UnsupportedVersion(version)) => Some(*version),
-        _ => None,
-    }
-}
-
-fn route_requests_tunnel(route: &Route, tunnel: crate::router::TunnelOpt) -> bool {
-    match tunnel {
-        crate::router::TunnelOpt::KeyId(_) => true,
-        crate::router::TunnelOpt::ZoneDefault => true,
-        crate::router::TunnelOpt::None => route.tunnel(),
-    }
-}
-
-fn socket_backend_label(kind: BackendKind) -> &'static str {
-    match kind {
-        BackendKind::Tokio => "tokio",
-        BackendKind::Epoll => "epoll",
-        BackendKind::Uring => "uring",
-    }
-}
-
-enum IngressHello {
-    Minecraft {
-        handshake: OwnedHandshake,
-        buffered: Vec<u8>,
-        raw: Vec<u8>,
-    },
-    Tunnel {
-        hello: tun::AgentHello,
-    },
 }

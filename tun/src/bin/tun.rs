@@ -42,15 +42,19 @@ fn init_sentry(service: &'static str) -> Option<sentry::ClientInitGuard> {
     Some(guard)
 }
 
-fn capture_sentry_error(event: &str, origin: &str, _err: &anyhow::Error) {
+fn capture_sentry_error(event: &str, origin: &str, err: &anyhow::Error) {
     sentry::with_scope(
         |scope| {
             scope.set_tag("event", event);
             scope.set_tag("error_origin", origin);
             scope.set_tag("error_type", "anyhow::Error");
+            scope.set_extra("error", format!("{err:#}").into());
         },
         || {
-            sentry::capture_message("Tunnel client runtime failure", sentry::Level::Error);
+            sentry::capture_message(
+                &format!("Tunnel client runtime failure: {err:#}"),
+                sentry::Level::Error,
+            );
         },
     );
 }

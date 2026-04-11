@@ -142,32 +142,32 @@ mod tests {
     use super::extract_status_json;
 
     #[test]
-    fn test_extract_status_json_simple() {
+    fn parses_status_json_with_payload() {
         let packet = [0x00, 0x02, b'a', b'b'];
         assert_eq!(extract_status_json(&packet), Some(&b"ab"[..]));
     }
 
     #[test]
-    fn test_extract_status_json_empty() {
+    fn parses_status_json_with_empty_payload() {
         let packet = [0x00, 0x00];
         assert_eq!(extract_status_json(&packet), Some(&b""[..]));
     }
 
     #[test]
-    fn test_extract_status_json_multibye_length() {
+    fn parses_status_json_with_multibyte_length() {
         let mut packet = vec![0x00, 0x80, 0x01];
         packet.extend(vec![b'a'; 128]);
         assert_eq!(extract_status_json(&packet), Some(&packet[3..]));
     }
 
     #[test]
-    fn test_extract_status_json_truncated() {
+    fn returns_none_for_truncated_status_json() {
         let packet = [0x00, 0x05, b'a', b'b'];
         assert_eq!(extract_status_json(&packet), None);
     }
 
     #[test]
-    fn test_extract_status_json_empty_packet() {
+    fn returns_none_for_empty_packet() {
         assert_eq!(extract_status_json(&[]), None);
     }
 }

@@ -100,10 +100,10 @@ pub(super) enum SystemdCommand {
     /// Generate a systemd unit file template for the current config.
     Gensys {
         /// Install as a per-user service.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "system")]
         user: bool,
         /// Install as a system-wide service (default).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "user")]
         system: bool,
         /// Service name (default: minitun).
         #[arg(long)]

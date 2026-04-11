@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use log::{error, info};
+use log::{error, info, warn};
 
 use super::{
     cli::{ConfigArgs, ConfigCommand, InstallArgs, SignArgs},
@@ -26,6 +26,7 @@ pub(super) fn run_install(args: InstallArgs) -> anyhow::Result<()> {
     };
     if let Err(err) = copy_self_to(&bin_dest) {
         error!("failed to install binary: {err}");
+        return Err(err);
     }
 
     let path = default_config_path()?;
@@ -54,26 +55,44 @@ pub(super) fn run_install(args: InstallArgs) -> anyhow::Result<()> {
         for (token, endpoints) in parsed_tokens {
             // Find and update existing, or append
             let parts: Vec<&str> = token.split(':').collect();
-            if parts.len() == 2 {
-                if let Ok(key_id) = parse_hex_exact::<8>(parts[0]) {
-                    let mut found = false;
-                    for entry in &mut config.tunnels {
-                        if let Ok(tc) = TunConfig::from_entry(entry) {
-                            if tc.key_id == key_id {
-                                entry.endpoints = endpoints.clone();
-                                found = true;
-                                break;
-                            }
+            if parts.len() != 2 {
+                warn!("skipping token during install (invalid format): token={token}");
+                continue;
+            }
+            let key_id = match parse_hex_exact::<8>(parts[0]) {
+                Ok(key_id) => key_id,
+                Err(parse_err) => {
+                    warn!(
+                        "skipping token during install (invalid key_id): token={token} err={parse_err}"
+                    );
+                    continue;
+                }
+            };
+
+            let mut found = false;
+            for entry in &mut config.tunnels {
+                match TunConfig::from_entry(entry) {
+                    Ok(tc) => {
+                        if tc.key_id == key_id {
+                            entry.endpoints = endpoints.clone();
+                            found = true;
+                            break;
                         }
                     }
-                    if !found {
-                        config.tunnels.push(TunnelEntry {
-                            endpoints: endpoints.clone(),
-                            token: token.clone(),
-                            proxy_protocol: false,
-                        });
+                    Err(decode_err) => {
+                        warn!(
+                            "skipping existing tunnel entry during install merge: token={} err={decode_err}",
+                            entry.token
+                        );
                     }
                 }
+            }
+            if !found {
+                config.tunnels.push(TunnelEntry {
+                    endpoints: endpoints.clone(),
+                    token: token.clone(),
+                    proxy_protocol: false,
+                });
             }
         }
     }
@@ -244,10 +263,10 @@ pub(super) fn run_systemd_gensys(
     system: bool,
     name: Option<String>,
 ) -> anyhow::Result<()> {
-    let scope_user = user && !system;
     if system && user {
         anyhow::bail!("choose one: --user or --system");
     }
+    let scope_user = user;
 
     let normalized_service = name
         .as_deref()
@@ -354,8 +373,7 @@ pub(super) fn run_sign(args: SignArgs) -> anyhow::Result<()> {
     let timestamp = args.timestamp.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time before unix epoch")
-            .as_secs()
+            .map_or(0, |duration| duration.as_secs())
     });
 
     let session = match intent {

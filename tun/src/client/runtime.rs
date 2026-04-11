@@ -98,9 +98,12 @@ fn spawn_health_beacon_probe(
 }
 
 fn tune_socket(conn: &net::sock::LureConnection) {
-    if std::env::var("NO_NODELAY").is_err()
-        && let Err(err) = conn.set_nodelay(true)
-    {
+    if std::env::var("NO_NODELAY").is_ok() {
+        return;
+    }
+
+    let nodelay_result = conn.set_nodelay(true);
+    if let Err(err) = nodelay_result {
         debug!("failed to enable TCP_NODELAY: {err}");
     }
 }
@@ -267,7 +270,10 @@ async fn handle_session(
         config.label
     );
     let handle = agent_conn.into_proxy(target_conn)?;
-    handle.future.await?;
+    handle
+        .future
+        .await
+        .context("proxy handle failed while bridging agent connection to backend")?;
     info!(
         "tunnel passthrough end: key_id={} session={session_prefix}",
         config.label
@@ -470,7 +476,7 @@ async fn run(config: TunConfig, shared: Arc<SharedState>) {
         }
         let endpoint_str = &endpoints[endpoint_idx % endpoints.len()];
 
-        let ingress = match resolve_endpoint(endpoint_str) {
+        let ingress = match resolve_endpoint(endpoint_str).await {
             Ok(addr) => addr,
             Err(e) => {
                 error!(
@@ -677,7 +683,10 @@ pub(super) async fn run_orchestrator(
         }
         #[cfg(not(unix))]
         {
-            std::future::pending::<()>().await;
+            if let Err(err) = tokio::signal::ctrl_c().await {
+                error!("ctrl_c signal handler failed: {err}");
+                continue;
+            }
         }
 
         info!(
