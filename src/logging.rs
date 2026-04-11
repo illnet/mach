@@ -15,6 +15,15 @@ fn sentry_origin_label(tunnel: bool) -> &'static str {
     if tunnel { "tunnel_client" } else { "proxy" }
 }
 
+fn sentry_io_error_text(err: &std::io::Error) -> String {
+    let text = err.to_string();
+    if text.trim().is_empty() {
+        format!("{:?}", err.kind())
+    } else {
+        text
+    }
+}
+
 fn format_std_error_chain(err: &(dyn StdError + 'static)) -> String {
     let mut rendered = err.to_string();
     let mut sources = Vec::new();
@@ -93,15 +102,15 @@ impl LureLogger {
         sentry::with_scope(
             |scope| {
                 scope.set_tag("event", "passthrough_unexpected_termination");
-                scope.set_tag("session_id", session_id.to_string());
                 scope.set_tag("error_origin", sentry_origin_label(tunnel));
                 scope.set_tag("io_error_kind", format!("{:?}", err.kind()));
             },
             || {
                 sentry::capture_message(
                     &format!(
-                        "Passthrough terminated abnormally for session {session_id} [{}]",
-                        sentry_origin_label(tunnel)
+                        "Proxy tunnel abnormally terminated [{}]: {}",
+                        sentry_origin_label(tunnel),
+                        sentry_io_error_text(err)
                     ),
                     sentry::Level::Warning,
                 );
