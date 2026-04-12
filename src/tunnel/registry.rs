@@ -182,7 +182,28 @@ impl TunnelRegistry {
         // same key_id (restart), we abort the old task and replace it.
         let registry = Arc::clone(self);
         let task = spawn_named("tunnel-agent-listener", async move {
-            while let Some(cmd) = rx.recv().await {
+            // Keep listener socket active during idle periods so intermediate NAT/load-balancer
+            // state does not expire the long-lived listen channel.
+            const LISTENER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+            let mut keepalive_interval = tokio::time::interval(LISTENER_KEEPALIVE_INTERVAL);
+            keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                let maybe_cmd = tokio::select! {
+                    cmd = rx.recv() => cmd,
+                    _ = keepalive_interval.tick(), if agent_version >= tun::VERSION => {
+                        let mut keepalive = Vec::new();
+                        tun::encode_server_msg(&tun::ServerMsg::ForwardAck([0u8; 32]), &mut keepalive);
+                        if connection.write_all(keepalive).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                let Some(cmd) = maybe_cmd else {
+                    break;
+                };
+
                 let mut buf = Vec::new();
                 match cmd {
                     TunnelCommand::ForwardRequest {
@@ -622,39 +643,9 @@ impl TunnelRegistry {
     }
 
     pub(crate) async fn cleanup_stale_agents(&self) {
-        let now = Instant::now();
-        let mut stale_tasks = Vec::new();
-        {
-            let mut agents = self.agents.write().await;
-            let stale_keys: Vec<TokenKeyId> = agents
-                .iter()
-                .filter_map(|(key_id, record)| {
-                    // Legacy listeners (pre-v4) do not emit beacons; keep prior behavior.
-                    if record.version < tun::VERSION {
-                        return None;
-                    }
-                    (now.duration_since(record.last_beacon_at) > AGENT_BEACON_STALE_TIMEOUT)
-                        .then_some(*key_id)
-                })
-                .collect();
-            for key_id in stale_keys {
-                if let Some(agent) = agents.remove(&key_id) {
-                    stale_tasks.push((key_id, agent.task));
-                }
-            }
-        }
-
-        if stale_tasks.is_empty() {
-            return;
-        }
-
-        for (key_id, task) in stale_tasks {
-            task.abort();
-            log::warn!(
-                "tunnel: agent evicted as stale (no beacon): key_id_prefix={}",
-                key_id_prefix(&key_id.0)
-            );
-        }
+        // Intentionally disabled: do not evict registered listener agents when health beacons
+        // are missing. Some deployments use separate beacon probes and still require the listen
+        // socket to stay registered until actual disconnect/replacement happens.
     }
 }
 
