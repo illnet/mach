@@ -1,68 +1,62 @@
+mod encryption_request;
+mod encryption_response;
+mod handshake;
+mod join_game;
+mod login_disconnect;
+mod login_start;
+mod login_success;
+mod player_position;
+mod respawn;
+mod set_compression;
+mod status_ping;
+mod status_pong;
+mod status_request;
+mod status_response;
+mod transfer_config;
+
+pub use encryption_request::EncryptionRequestS2c;
+pub use encryption_response::EncryptionResponseC2s;
+pub use handshake::HandshakeC2s;
+pub use join_game::JoinGameS2c;
+pub use login_disconnect::LoginDisconnectS2c;
+pub use login_start::{LoginStartC2s, LoginStartSigData};
+pub use login_success::LoginSuccessS2c;
+pub use player_position::PlayerPositionS2c;
+pub use respawn::RespawnS2c;
+pub use set_compression::SetCompressionS2c;
+pub use status_ping::StatusPingC2s;
+pub use status_pong::StatusPongS2c;
+pub use status_request::StatusRequestC2s;
+pub use status_response::StatusResponseS2c;
+pub use transfer_config::TransferConfigS2c;
+
 use super::{
     error::{ProtoError, Result, debug_log_error},
-    io::{
-        read_bool, read_i64_be, read_string_bounded, read_u16_be, read_uuid, take, write_bool,
-        write_i64_be, write_string_bounded, write_u16_be, write_uuid,
-    },
-    state::{HandshakeNextState, PacketState},
-    types::{PacketDecode, PacketEncode, PacketFrame, Uuid},
-    varint::{read_varint, write_varint},
+    io::take,
+    state::{PacketDirection, PacketState},
+    types::PacketFrame,
+    varint::read_varint,
 };
 
-/// Handshake (C2S) packet.
+/// Packet kind labels stable enough for WAF rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HandshakeC2s<'a> {
-    pub protocol_version: i32,
-    pub server_address: &'a str,
-    pub server_port: u16,
-    pub next_state: HandshakeNextState,
+pub enum PacketKind {
+    Handshake,
+    LoginStart,
+    EncryptionRequest,
+    EncryptionResponse,
+    SetCompression,
+    LoginSuccess,
+    JoinGame,
+    Respawn,
+    PlayerPosition,
+    StatusRequest,
+    StatusPing,
+    StatusResponse,
+    StatusPong,
+    LoginDisconnect,
+    Unknown,
 }
-
-/// Status request (C2S) packet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StatusRequestC2s;
-
-/// Status ping (C2S) packet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StatusPingC2s {
-    pub payload: i64,
-}
-
-/// Status response (S2C) packet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StatusResponseS2c<'a> {
-    pub json: &'a str,
-}
-
-/// Status pong (S2C) packet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StatusPongS2c {
-    pub payload: i64,
-}
-
-/// Login disconnect (S2C) packet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LoginDisconnectS2c<'a> {
-    pub reason: &'a str,
-}
-
-/// Login start (C2S) packet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LoginStartC2s<'a> {
-    pub username: &'a str,
-    pub profile_id: Option<Uuid>,
-    pub sig_data: Option<LoginStartSigData<'a>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LoginStartSigData<'a> {
-    pub timestamp: i64,
-    pub public_key: &'a [u8],
-    pub signature: &'a [u8],
-}
-
-const LOGIN_START_SIGNATURE_DATA_PROTOCOL: i32 = 759;
-const LOGIN_START_UUID_PROTOCOL: i32 = 766;
 
 /// Any serverbound packet supported by this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +65,21 @@ pub enum ServerboundPacket<'a> {
     StatusRequest(StatusRequestC2s),
     StatusPing(StatusPingC2s),
     LoginStart(LoginStartC2s<'a>),
+    EncryptionResponse(EncryptionResponseC2s<'a>),
+}
+
+/// Any clientbound packet supported by this crate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ClientboundPacket<'a> {
+    StatusResponse(StatusResponseS2c<'a>),
+    StatusPong(StatusPongS2c),
+    LoginDisconnect(LoginDisconnectS2c<'a>),
+    EncryptionRequest(EncryptionRequestS2c<'a>),
+    SetCompression(SetCompressionS2c),
+    LoginSuccess(LoginSuccessS2c<'a>),
+    JoinGame(JoinGameS2c<'a>),
+    Respawn(RespawnS2c<'a>),
+    PlayerPosition(PlayerPositionS2c<'a>),
 }
 
 impl PacketFrame {
@@ -117,11 +126,17 @@ impl<'a> ServerboundPacket<'a> {
                     LoginStartC2s::decode_body_with_version(&mut input, protocol_version)
                         .map(ServerboundPacket::LoginStart)
                 }
+                EncryptionResponseC2s::ID => EncryptionResponseC2s::decode_body(&mut input)
+                    .map(ServerboundPacket::EncryptionResponse),
                 _ => Err(ProtoError::InvalidPacketId {
                     state,
                     id: frame.id,
                 }),
             },
+            PacketState::Configuration | PacketState::Play => Err(ProtoError::InvalidPacketId {
+                state,
+                id: frame.id,
+            }),
         };
 
         let packet = match packet {
@@ -140,322 +155,149 @@ impl<'a> ServerboundPacket<'a> {
 
         Ok(packet)
     }
+
+    pub fn decode_known(
+        state: PacketState,
+        protocol_version: i32,
+        kind: PacketKind,
+        frame: &'a PacketFrame,
+    ) -> Result<Option<Self>> {
+        if kind == PacketKind::Unknown {
+            return Ok(None);
+        }
+        match kind {
+            PacketKind::Handshake
+            | PacketKind::LoginStart
+            | PacketKind::EncryptionResponse
+            | PacketKind::StatusRequest
+            | PacketKind::StatusPing => Self::decode(state, protocol_version, frame).map(Some),
+            _ => Ok(None),
+        }
+    }
 }
 
-impl<'a> HandshakeC2s<'a> {
-    pub const ID: i32 = 0x00;
-
-    pub fn decode_body(input: &mut &'a [u8]) -> Result<Self> {
-        let protocol_version = read_varint(input)?;
-        let server_address = read_string_bounded(input, 255)?;
-        let server_port = read_u16_be(input)?;
-        let next_state_raw = read_varint(input)?;
-        let next_state = match next_state_raw {
-            1 => HandshakeNextState::Status,
-            2 => HandshakeNextState::Login,
-            other => return Err(ProtoError::InvalidHandshakeState(other)),
+impl<'a> ClientboundPacket<'a> {
+    pub fn decode_known(
+        state: PacketState,
+        protocol_version: i32,
+        kind: PacketKind,
+        frame: &'a PacketFrame,
+    ) -> Result<Option<Self>> {
+        let mut input = frame.body.as_slice();
+        let packet = match (state, kind) {
+            (PacketState::Status, PacketKind::StatusResponse) => {
+                Some(StatusResponseS2c::decode_body(&mut input).map(Self::StatusResponse)?)
+            }
+            (PacketState::Status, PacketKind::StatusPong) => {
+                Some(StatusPongS2c::decode_body(&mut input).map(Self::StatusPong)?)
+            }
+            (PacketState::Login, PacketKind::LoginDisconnect) => {
+                Some(LoginDisconnectS2c::decode_body(&mut input).map(Self::LoginDisconnect)?)
+            }
+            (PacketState::Login, PacketKind::EncryptionRequest) => Some(Self::EncryptionRequest(
+                EncryptionRequestS2c::decode_body_with_version(&mut input, protocol_version)?,
+            )),
+            (PacketState::Login, PacketKind::SetCompression) => {
+                Some(SetCompressionS2c::decode_body(&mut input).map(Self::SetCompression)?)
+            }
+            (PacketState::Login, PacketKind::LoginSuccess) => Some(Self::LoginSuccess(
+                LoginSuccessS2c::decode_body_with_version(&mut input, protocol_version)?,
+            )),
+            (PacketState::Play, PacketKind::JoinGame)
+            | (PacketState::Configuration, PacketKind::JoinGame) => {
+                Some(JoinGameS2c::decode_body(&mut input).map(Self::JoinGame)?)
+            }
+            (PacketState::Play, PacketKind::Respawn) => {
+                Some(Self::Respawn(RespawnS2c::decode_body(&mut input)))
+            }
+            (PacketState::Play, PacketKind::PlayerPosition) => {
+                Some(PlayerPositionS2c::decode_body(&mut input).map(Self::PlayerPosition)?)
+            }
+            _ => None,
         };
 
-        Ok(Self {
-            protocol_version,
-            server_address,
-            server_port,
-            next_state,
-        })
-    }
-}
-
-impl<'a> PacketDecode<'a> for HandshakeC2s<'a> {
-    const ID: i32 = HandshakeC2s::ID;
-
-    fn decode_body(input: &mut &'a [u8]) -> Result<Self> {
-        HandshakeC2s::decode_body(input)
-    }
-}
-
-impl PacketEncode for HandshakeC2s<'_> {
-    const ID: i32 = HandshakeC2s::ID;
-
-    fn encode_body(&self, out: &mut Vec<u8>) -> Result<()> {
-        write_varint(out, self.protocol_version);
-        write_string_bounded(out, self.server_address, 255)?;
-        write_u16_be(out, self.server_port);
-        let next = match self.next_state {
-            HandshakeNextState::Status => 1,
-            HandshakeNextState::Login => 2,
-        };
-        write_varint(out, next);
-        Ok(())
-    }
-}
-
-impl StatusRequestC2s {
-    pub const ID: i32 = 0x00;
-
-    pub const fn decode_body(_input: &mut &[u8]) -> Result<Self> {
-        Ok(Self)
-    }
-}
-
-impl<'a> PacketDecode<'a> for StatusRequestC2s {
-    const ID: i32 = Self::ID;
-
-    fn decode_body(input: &mut &'a [u8]) -> Result<Self> {
-        Self::decode_body(input)
-    }
-}
-
-impl PacketEncode for StatusRequestC2s {
-    const ID: i32 = Self::ID;
-
-    fn encode_body(&self, _out: &mut Vec<u8>) -> Result<()> {
-        Ok(())
-    }
-}
-
-impl StatusPingC2s {
-    pub const ID: i32 = 0x01;
-
-    pub fn decode_body(input: &mut &[u8]) -> Result<Self> {
-        Ok(Self {
-            payload: read_i64_be(input)?,
-        })
-    }
-}
-
-impl<'a> PacketDecode<'a> for StatusPingC2s {
-    const ID: i32 = Self::ID;
-
-    fn decode_body(input: &mut &'a [u8]) -> Result<Self> {
-        Self::decode_body(input)
-    }
-}
-
-impl PacketEncode for StatusPingC2s {
-    const ID: i32 = Self::ID;
-
-    fn encode_body(&self, out: &mut Vec<u8>) -> Result<()> {
-        write_i64_be(out, self.payload);
-        Ok(())
-    }
-}
-
-impl<'a> StatusResponseS2c<'a> {
-    pub const ID: i32 = 0x00;
-
-    pub fn decode_body(input: &mut &'a [u8]) -> Result<Self> {
-        Ok(Self {
-            json: read_string_bounded(input, 32_767)?,
-        })
-    }
-}
-
-impl<'a> PacketDecode<'a> for StatusResponseS2c<'a> {
-    const ID: i32 = StatusResponseS2c::ID;
-
-    fn decode_body(input: &mut &'a [u8]) -> Result<Self> {
-        StatusResponseS2c::decode_body(input)
-    }
-}
-
-impl PacketEncode for StatusResponseS2c<'_> {
-    const ID: i32 = StatusResponseS2c::ID;
-
-    fn encode_body(&self, out: &mut Vec<u8>) -> Result<()> {
-        write_string_bounded(out, self.json, 32_767)
-    }
-}
-
-impl StatusPongS2c {
-    pub const ID: i32 = 0x01;
-
-    pub fn decode_body(input: &mut &[u8]) -> Result<Self> {
-        Ok(Self {
-            payload: read_i64_be(input)?,
-        })
-    }
-}
-
-impl<'a> PacketDecode<'a> for StatusPongS2c {
-    const ID: i32 = Self::ID;
-
-    fn decode_body(input: &mut &'a [u8]) -> Result<Self> {
-        Self::decode_body(input)
-    }
-}
-
-impl PacketEncode for StatusPongS2c {
-    const ID: i32 = Self::ID;
-
-    fn encode_body(&self, out: &mut Vec<u8>) -> Result<()> {
-        write_i64_be(out, self.payload);
-        Ok(())
-    }
-}
-
-impl<'a> LoginDisconnectS2c<'a> {
-    pub const ID: i32 = 0x00;
-
-    pub fn decode_body(input: &mut &'a [u8]) -> Result<Self> {
-        Ok(Self {
-            reason: read_string_bounded(input, 32_767)?,
-        })
-    }
-}
-
-impl<'a> PacketDecode<'a> for LoginDisconnectS2c<'a> {
-    const ID: i32 = LoginDisconnectS2c::ID;
-
-    fn decode_body(input: &mut &'a [u8]) -> Result<Self> {
-        LoginDisconnectS2c::decode_body(input)
-    }
-}
-
-impl PacketEncode for LoginDisconnectS2c<'_> {
-    const ID: i32 = LoginDisconnectS2c::ID;
-
-    fn encode_body(&self, out: &mut Vec<u8>) -> Result<()> {
-        write_string_bounded(out, self.reason, 32_767)
-    }
-}
-
-impl<'a> LoginStartC2s<'a> {
-    pub const ID: i32 = 0x00;
-
-    pub fn decode_body_with_version(input: &mut &'a [u8], protocol_version: i32) -> Result<Self> {
-        let username = read_string_bounded(input, 16)?;
-        let mut profile_id = None;
-        let mut sig_data = None;
-
-        if input.is_empty() {
-            return Ok(Self {
-                username,
-                profile_id,
-                sig_data,
-            });
+        if !input.is_empty() {
+            return Err(ProtoError::TrailingBytes(input.len()));
         }
+        Ok(packet)
+    }
+}
 
-        if protocol_version >= LOGIN_START_UUID_PROTOCOL {
-            if input.len() < 16 {
-                return Err(ProtoError::UnexpectedEof);
-            }
-            profile_id = Some(read_uuid(input)?);
-        } else if protocol_version >= LOGIN_START_SIGNATURE_DATA_PROTOCOL {
-            let has_sig_data = read_bool(input)?;
-            if has_sig_data {
-                if input.len() == 16 {
-                    profile_id = Some(read_uuid(input)?);
-                    *input = &[];
-                    return Ok(Self {
-                        username,
-                        profile_id,
-                        sig_data,
-                    });
-                }
+pub(crate) fn read_byte_array<'a>(input: &mut &'a [u8]) -> Result<&'a [u8]> {
+    let len = read_varint(input)?;
+    if len < 0 {
+        return Err(ProtoError::NegativeLength(len));
+    }
+    let len = usize::try_from(len).map_err(|_| ProtoError::NegativeLength(len))?;
+    take(input, len)
+}
 
-                let timestamp = read_i64_be(input)?;
-                let public_key_len = read_varint(input)?;
-                if public_key_len < 0 {
-                    return Err(ProtoError::NegativeLength(public_key_len));
-                }
-                let public_key_len_usize = usize::try_from(public_key_len)
-                    .map_err(|_| ProtoError::NegativeLength(public_key_len))?;
-                let public_key = take(input, public_key_len_usize)?;
-                let signature_len = read_varint(input)?;
-                if signature_len < 0 {
-                    return Err(ProtoError::NegativeLength(signature_len));
-                }
-                let signature_len_usize = usize::try_from(signature_len)
-                    .map_err(|_| ProtoError::NegativeLength(signature_len))?;
-                let signature = take(input, signature_len_usize)?;
-                sig_data = Some(LoginStartSigData {
-                    timestamp,
-                    public_key,
-                    signature,
-                });
-            }
+pub fn packet_kind_for(
+    state: PacketState,
+    direction: PacketDirection,
+    protocol_version: i32,
+    id: i32,
+) -> PacketKind {
+    match (state, direction, id) {
+        (PacketState::Handshaking, PacketDirection::C2s, 0x00) => PacketKind::Handshake,
+        (PacketState::Status, PacketDirection::C2s, 0x00) => PacketKind::StatusRequest,
+        (PacketState::Status, PacketDirection::C2s, 0x01) => PacketKind::StatusPing,
+        (PacketState::Status, PacketDirection::S2c, 0x00) => PacketKind::StatusResponse,
+        (PacketState::Status, PacketDirection::S2c, 0x01) => PacketKind::StatusPong,
+        (PacketState::Login, PacketDirection::C2s, 0x00) => PacketKind::LoginStart,
+        (PacketState::Login, PacketDirection::C2s, 0x01) => PacketKind::EncryptionResponse,
+        (PacketState::Login, PacketDirection::S2c, 0x00) => PacketKind::LoginDisconnect,
+        (PacketState::Login, PacketDirection::S2c, 0x01) => PacketKind::EncryptionRequest,
+        (PacketState::Login, PacketDirection::S2c, 0x02) => PacketKind::LoginSuccess,
+        (PacketState::Login, PacketDirection::S2c, 0x03) => PacketKind::SetCompression,
+        (PacketState::Configuration, PacketDirection::S2c, _)
+            if is_join_game_id(protocol_version, id) =>
+        {
+            PacketKind::JoinGame
         }
-        *input = &[];
-
-        Ok(Self {
-            username,
-            profile_id,
-            sig_data,
-        })
-    }
-
-    pub fn encode_body_with_version(&self, out: &mut Vec<u8>, protocol_version: i32) -> Result<()> {
-        write_string_bounded(out, self.username, 16)?;
-        if protocol_version >= LOGIN_START_UUID_PROTOCOL {
-            let uuid = self
-                .profile_id
-                .ok_or(ProtoError::MissingField("login_start.uuid"))?;
-            write_uuid(out, &uuid);
-            return Ok(());
+        (PacketState::Play, PacketDirection::S2c, _) if is_join_game_id(protocol_version, id) => {
+            PacketKind::JoinGame
         }
-
-        if protocol_version >= LOGIN_START_SIGNATURE_DATA_PROTOCOL {
-            let has_sig_data = self.sig_data.is_some();
-            write_bool(out, has_sig_data);
-            if let Some(sig_data) = self.sig_data {
-                write_i64_be(out, sig_data.timestamp);
-                let public_key_len_i32 =
-                    i32::try_from(sig_data.public_key.len()).map_err(|_| {
-                        ProtoError::LengthTooLarge {
-                            max: i32::MAX as usize,
-                            actual: sig_data.public_key.len(),
-                        }
-                    })?;
-                write_varint(out, public_key_len_i32);
-                out.extend_from_slice(sig_data.public_key);
-                let signature_len_i32 = i32::try_from(sig_data.signature.len()).map_err(|_| {
-                    ProtoError::LengthTooLarge {
-                        max: i32::MAX as usize,
-                        actual: sig_data.signature.len(),
-                    }
-                })?;
-                write_varint(out, signature_len_i32);
-                out.extend_from_slice(sig_data.signature);
-            }
+        (PacketState::Play, PacketDirection::S2c, _) if is_respawn_id(protocol_version, id) => {
+            PacketKind::Respawn
         }
-        Ok(())
+        (PacketState::Play, PacketDirection::S2c, _)
+            if is_player_position_id(protocol_version, id) =>
+        {
+            PacketKind::PlayerPosition
+        }
+        _ => PacketKind::Unknown,
     }
 }
 
-impl<'a> PacketDecode<'a> for LoginStartC2s<'a> {
-    const ID: i32 = LoginStartC2s::ID;
-
-    fn decode_body(_input: &mut &'a [u8]) -> Result<Self> {
-        Err(ProtoError::MissingField("login_start.protocol_version"))
-    }
+fn is_join_game_id(protocol_version: i32, id: i32) -> bool {
+    matches!(
+        (protocol_version, id),
+        (47, 0x01) | (107..=340, 0x23) | (393..=404, 0x25) | (477..=578, 0x26) | (735..=758, 0x24)
+    )
 }
 
-impl PacketEncode for LoginStartC2s<'_> {
-    const ID: i32 = LoginStartC2s::ID;
-
-    fn encode_body(&self, _out: &mut Vec<u8>) -> Result<()> {
-        Err(ProtoError::MissingField("login_start.protocol_version"))
-    }
+fn is_respawn_id(protocol_version: i32, id: i32) -> bool {
+    matches!(
+        (protocol_version, id),
+        (47, 0x07)
+            | (107..=335, 0x33)
+            | (338..=340, 0x35)
+            | (393..=404, 0x38)
+            | (477..=498, 0x3a)
+            | (573..=578, 0x3b)
+            | (735..=758, 0x39)
+    )
 }
 
-/// Transfer in Configuration state (S2C) — Minecraft 1.20.5+ only (protocol >= 766).
-/// Instructs the client to reconnect to a different server.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TransferConfigS2c<'a> {
-    pub host: &'a str,
-    pub port: u16,
-}
-
-impl TransferConfigS2c<'_> {
-    pub const ID: i32 = 0x0B;
-}
-
-impl PacketEncode for TransferConfigS2c<'_> {
-    const ID: i32 = Self::ID;
-
-    fn encode_body(&self, out: &mut Vec<u8>) -> Result<()> {
-        write_string_bounded(out, self.host, 255)?;
-        write_u16_be(out, self.port);
-        Ok(())
-    }
+fn is_player_position_id(protocol_version: i32, id: i32) -> bool {
+    matches!(
+        (protocol_version, id),
+        (47, 0x08)
+            | (107..=340, 0x2f)
+            | (393..=404, 0x32)
+            | (477..=498, 0x35)
+            | (573..=578, 0x36)
+            | (735..=758, 0x34)
+    )
 }

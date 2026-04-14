@@ -1,8 +1,8 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use net::{
+use net::mc::{
     HandshakeC2s, HandshakeNextState, LoginDisconnectS2c, LoginStartC2s, PacketDecoder,
-    PacketEncode, PacketFrame, PacketState, ProtoError, StatusPingC2s, StatusPongS2c,
-    StatusRequestC2s, StatusResponseS2c, Uuid, encode_packet, mc::Result as McResult,
+    PacketEncode, PacketFrame, PacketState, ProtoError, Result as McResult, StatusPingC2s,
+    StatusPongS2c, StatusRequestC2s, StatusResponseS2c, Uuid, encode_packet,
 };
 
 const L7_TRUNCATE_LEN: usize = 16;

@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use net::{ProxyProgress, ProxyStats};
+use net::sock::{ProxyProgress, ProxyStats};
 use opentelemetry::{KeyValue, metrics::Counter};
 
 use crate::{
@@ -103,7 +103,7 @@ pub fn take_global_traffic_snapshot() -> (u64, u64, u64, u64) {
 /// Run this concurrently with a proxy future and signal shutdown when the
 /// proxy completes. Session-level `inspect.traffic` is updated here continuously.
 /// After the proxy finishes, reconcile any remaining bytes via the final
-/// [`net::ProxyStats`] totals.
+/// [`net::sock::ProxyStats`] totals.
 pub(crate) async fn pump_proxy_progress(
     inspect: Arc<crate::router::inspect::SessionInspectState>,
     progress: Arc<ProxyProgress>,

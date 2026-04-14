@@ -1,4 +1,4 @@
-use net::{StatusPingC2s, StatusPongS2c};
+use net::mc::{StatusPingC2s, StatusPongS2c, StatusResponseS2c};
 use serde_json::json;
 
 use crate::{
@@ -56,7 +56,7 @@ pub async fn send_status_failure(
 ) -> anyhow::Result<()> {
     let placeholder = placeholder_status_json(config, label);
     client
-        .send(&net::StatusResponseS2c { json: &placeholder })
+        .send(&StatusResponseS2c { json: &placeholder })
         .await?;
     Ok(())
 }
@@ -70,7 +70,7 @@ pub async fn send_status_failure_with_fallback(
 ) -> anyhow::Result<()> {
     let placeholder = placeholder_status_json_with_fallback(config, label, fallback);
     client
-        .send(&net::StatusResponseS2c { json: &placeholder })
+        .send(&StatusResponseS2c { json: &placeholder })
         .await?;
     Ok(())
 }
@@ -82,9 +82,7 @@ pub async fn send_status_response(
 ) -> anyhow::Result<()> {
     // Convert bytes to string for sending (StatusResponseS2c expects &str)
     let json_str = std::str::from_utf8(json_bytes)?;
-    client
-        .send(&net::StatusResponseS2c { json: json_str })
-        .await?;
+    client.send(&StatusResponseS2c { json: json_str }).await?;
     Ok(())
 }
 

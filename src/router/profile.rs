@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use net::Uuid;
+use net::mc::Uuid;
 use serde::{Deserialize, Serialize, ser::SerializeStruct};
 
 #[derive(Debug, Clone)]

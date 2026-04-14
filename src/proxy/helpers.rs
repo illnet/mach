@@ -3,7 +3,7 @@ use std::{
     sync::OnceLock,
 };
 
-use net::{HandshakeC2s, ProtoError};
+use net::mc::{HandshakeC2s, PacketFrame, ProtoError};
 
 use crate::{
     packet::OwnedHandshake,
@@ -83,7 +83,7 @@ pub(super) fn resolve_socket_addr(value: &str) -> anyhow::Result<SocketAddr> {
         .ok_or_else(|| anyhow::anyhow!("no addresses resolved for {value}"))
 }
 
-pub(super) fn decode_handshake_frame(frame: &net::PacketFrame) -> anyhow::Result<HandshakeC2s<'_>> {
+pub(super) fn decode_handshake_frame(frame: &PacketFrame) -> anyhow::Result<HandshakeC2s<'_>> {
     if frame.id != HandshakeC2s::ID {
         return Err(anyhow::anyhow!(
             "unexpected packet id {} (expected {})",

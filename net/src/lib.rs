@@ -8,15 +8,3 @@
 pub mod ha;
 pub mod mc;
 pub mod sock;
-
-pub use ha::{AddressInfo, Command, Family, Header, Protocol, Tlv, parse};
-pub use mc::{
-    HandshakeC2s, HandshakeNextState, LoginDisconnectS2c, LoginStartC2s, LoginStartSigData,
-    MAX_PACKET_SIZE, PacketDecode, PacketDecoder, PacketEncode, PacketEncoder, PacketFrame,
-    PacketState, ProtoError, ServerboundPacket, StatusPingC2s, StatusPongS2c, StatusRequestC2s,
-    StatusResponseS2c, TransferConfigS2c, Uuid, encode_packet, encode_raw_packet,
-};
-pub use sock::{
-    BackendKind, BackendSelection, LureConnection, LureListener, LureNet, ProxyHandle,
-    ProxyProgress, ProxyStats, Sock, backend_kind, backend_selection,
-};

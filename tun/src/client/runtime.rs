@@ -148,19 +148,19 @@ fn build_proxy_protocol_v2_header(
 ) -> anyhow::Result<Vec<u8>> {
     let (family, address) = match (client_addr, target_addr) {
         (SocketAddr::V4(src), SocketAddr::V4(dst)) => {
-            (net::Family::Inet, net::AddressInfo::Ipv4(src, dst))
+            (net::ha::Family::Inet, net::ha::AddressInfo::Ipv4(src, dst))
         }
         (SocketAddr::V6(src), SocketAddr::V6(dst)) => {
-            (net::Family::Inet6, net::AddressInfo::Ipv6(src, dst))
+            (net::ha::Family::Inet6, net::ha::AddressInfo::Ipv6(src, dst))
         }
         (src, dst) => {
             anyhow::bail!("cannot build PPv2 header for mixed families: src={src} dst={dst}")
         }
     };
-    let header = net::Header {
-        command: net::Command::Proxy,
+    let header = net::ha::Header {
+        command: net::ha::Command::Proxy,
         family,
-        protocol: net::Protocol::Stream,
+        protocol: net::ha::Protocol::Stream,
         address,
         tlvs: vec![],
     };
@@ -269,8 +269,8 @@ async fn handle_session(
     );
     // v4 request includes client_addr only when Lure wants early PP authoring.
     if let Some(caddr) = client_addr {
-        let pp = build_proxy_protocol_v2_header(caddr, target)
-            .context("failed to build PPv2 header")?;
+        let pp =
+            build_proxy_protocol_v2_header(caddr, target).context("failed to build PPv2 header")?;
         target_conn
             .write_all(pp)
             .await

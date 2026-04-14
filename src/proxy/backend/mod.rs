@@ -102,7 +102,7 @@ async fn init_handshake(
 
     let (server_address, server_port) =
         backend_handshake_parts(handshake, endpoint_host, endpoint_port, preserve_host);
-    let packet = net::HandshakeC2s {
+    let packet = net::mc::HandshakeC2s {
         protocol_version: handshake.protocol_version,
         server_address: server_address.as_ref(),
         server_port,
@@ -140,7 +140,7 @@ mod tests {
             protocol_version: 0,
             server_address: Arc::from(addr),
             server_port: 25565,
-            next_state: net::HandshakeNextState::Login,
+            next_state: net::mc::HandshakeNextState::Login,
         }
     }
 

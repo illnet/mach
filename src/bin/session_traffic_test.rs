@@ -15,7 +15,7 @@ use lure::{
     proxy::Lure,
     utils::leak,
 };
-use net::{HandshakeC2s, HandshakeNextState, LoginStartC2s, encode_packet, encode_raw_packet};
+use net::mc::{HandshakeC2s, HandshakeNextState, LoginStartC2s, encode_packet, encode_raw_packet};
 use tokio::sync::oneshot;
 
 fn main() -> anyhow::Result<()> {

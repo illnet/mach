@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use net::{HandshakeC2s, HandshakeNextState, LoginStartC2s, LoginStartSigData, PacketEncode, Uuid};
+use net::mc::{
+    HandshakeC2s, HandshakeNextState, LoginStartC2s, LoginStartSigData, PacketEncode, Uuid,
+};
 
 /// Adapter trait that stores packet fields in owned form.
 pub trait OwnedPacket<'a, P> {
@@ -105,7 +107,7 @@ impl<'a> OwnedPacket<'a, LoginStartC2s<'a>> for OwnedLoginStart {
 /// Encodes packet without compression frame.
 pub fn encode_uncompressed_packet<P: PacketEncode>(packet: &P) -> anyhow::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    net::encode_packet(&mut buf, packet)?;
+    net::mc::encode_packet(&mut buf, packet)?;
     Ok(buf)
 }
 

@@ -4,7 +4,7 @@ use std::{
 };
 
 // use futures::FutureExt;
-use net::{
+use net::mc::{
     LoginDisconnectS2c, LoginStartC2s, PacketDecode, PacketDecoder, PacketEncode, PacketEncoder,
     PacketFrame, ProtoError, encode_raw_packet,
 };

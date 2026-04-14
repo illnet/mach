@@ -6,7 +6,7 @@ use std::{
 
 use getrandom::fill as fill_random;
 use log::{debug, error, info};
-use net::{
+use net::mc::{
     HandshakeNextState, PacketDecoder, StatusPingC2s, StatusPongS2c, StatusRequestC2s,
     StatusResponseS2c, encode_raw_packet,
 };

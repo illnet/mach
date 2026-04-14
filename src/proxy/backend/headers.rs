@@ -6,7 +6,7 @@ use std::{
 use bytes::BytesMut;
 use ed25519_dalek::{Signature, Signer, SigningKey};
 use log::warn;
-use net::{AddressInfo, Command, Family, Header, Protocol, Tlv};
+use net::ha::{AddressInfo, Command, Family, Header, Protocol, Tlv};
 
 use crate::config::LureConfig;
 

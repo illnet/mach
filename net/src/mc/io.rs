@@ -47,6 +47,27 @@ pub fn read_u16_be(input: &mut &[u8]) -> Result<u16> {
 }
 
 #[inline]
+/// Reads big-endian `i32`.
+pub fn read_i32_be(input: &mut &[u8]) -> Result<i32> {
+    let bytes: [u8; 4] = take(input, 4)?.try_into().unwrap();
+    Ok(i32::from_be_bytes(bytes))
+}
+
+#[inline]
+/// Reads big-endian `f32`.
+pub fn read_f32_be(input: &mut &[u8]) -> Result<f32> {
+    let bytes: [u8; 4] = take(input, 4)?.try_into().unwrap();
+    Ok(f32::from_be_bytes(bytes))
+}
+
+#[inline]
+/// Reads big-endian `f64`.
+pub fn read_f64_be(input: &mut &[u8]) -> Result<f64> {
+    let bytes: [u8; 8] = take(input, 8)?.try_into().unwrap();
+    Ok(f64::from_be_bytes(bytes))
+}
+
+#[inline]
 /// Writes big-endian `u16`.
 pub fn write_u16_be(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_be_bytes());

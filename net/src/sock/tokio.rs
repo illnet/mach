@@ -1,9 +1,10 @@
-#[cfg(unix)]
 use std::{
     future::Future,
+    io,
+    net::SocketAddr,
+    pin::Pin,
     sync::{Arc, atomic::Ordering},
 };
-use std::{io, net::SocketAddr, pin::Pin};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -123,21 +124,17 @@ impl Connection {
         self,
         peer: Box<dyn crate::sock::Sock>,
     ) -> io::Result<crate::sock::ProxyHandle> {
+        #[cfg(not(unix))]
+        {
+            return self.into_proxy_via_sock(peer);
+        }
+
         // Duplicate peer's FD and register as a new TcpStream so we own both
         // halves independently of their previous tokio registrations.
+        #[cfg(unix)]
         let peer_fd = peer
             .raw_fd()
             .ok_or_else(|| io::Error::other("tokio proxy: peer has no raw fd"))?;
-
-        #[cfg(not(unix))]
-        {
-            drop(peer);
-            let _ = peer_fd;
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "tokio proxy: not supported on non-unix",
-            ));
-        }
 
         #[cfg(unix)]
         {
@@ -212,6 +209,67 @@ impl Connection {
 
             Ok(crate::sock::ProxyHandle { future, progress })
         }
+    }
+
+    #[cfg(not(unix))]
+    fn into_proxy_via_sock(
+        self,
+        peer: Box<dyn crate::sock::Sock>,
+    ) -> io::Result<crate::sock::ProxyHandle> {
+        let mut client: Box<dyn crate::sock::Sock> = Box::new(self);
+        let mut server = peer;
+
+        let progress = Arc::new(crate::sock::ProxyProgress::default());
+        let prog_final = Arc::clone(&progress);
+        let prog_c2s = Arc::clone(&progress);
+        let prog_s2c = Arc::clone(&progress);
+
+        let future: Pin<
+            Box<dyn Future<Output = io::Result<crate::sock::ProxyStats>> + Send + 'static>,
+        > = Box::pin(async move {
+            const BUF_SIZE: usize = 16 * 1024;
+
+            loop {
+                enum CopySide {
+                    C2S((usize, Vec<u8>)),
+                    S2C((usize, Vec<u8>)),
+                }
+
+                let copied = tokio::select! {
+                    result = client.read_chunk(vec![0u8; BUF_SIZE]) => {
+                        CopySide::C2S(result?)
+                    }
+                    result = server.read_chunk(vec![0u8; BUF_SIZE]) => {
+                        CopySide::S2C(result?)
+                    }
+                };
+
+                match copied {
+                    CopySide::C2S((n, mut buf)) => {
+                        if n == 0 {
+                            break;
+                        }
+                        buf.truncate(n);
+                        let _ = server.write_all(buf).await?;
+                        prog_c2s.c2s_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                        prog_c2s.c2s_chunks.fetch_add(1, Ordering::Relaxed);
+                    }
+                    CopySide::S2C((n, mut buf)) => {
+                        if n == 0 {
+                            break;
+                        }
+                        buf.truncate(n);
+                        let _ = client.write_all(buf).await?;
+                        prog_s2c.s2c_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                        prog_s2c.s2c_chunks.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+
+            Ok(prog_final.snapshot())
+        });
+
+        Ok(crate::sock::ProxyHandle { future, progress })
     }
 }
 
