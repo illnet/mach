@@ -320,5 +320,8 @@ fn decode_login_start_frame<'a>(
 
     let mut body = frame.body.as_slice();
     let pkt = LoginStartC2s::decode_body_with_version(&mut body, protocol_version)?;
+    if !body.is_empty() {
+        return Err(ProtoError::TrailingBytes(body.len()).into());
+    }
     Ok(pkt)
 }

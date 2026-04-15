@@ -1393,7 +1393,7 @@ dependencies = [
 [[package]]
 name = "net"
 version = "0.1.0"
-source = "git+https://github.com/illnet/net.git#0e03a19e82c08f3b598cb6952188e08b05a92cf1"
+source = "git+https://github.com/illnet/net.git#a1fc26a15087428fb24da3ce9bca545588785587"
 dependencies = [
  "cc",
  "io-uring",
