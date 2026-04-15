@@ -32,4 +32,4 @@
 
 ## Configuration & Ops Notes
 - Runtime config: `settings.toml` in repo root; reloaded on `SIGCONT`.
-- Env vars: `LURE_RPC` for backend, `LURE_PROXY_SIGNING_KEY` for signing, `OTEL_EXPORTER_OTLP_ENDPOINT` for telemetry.
+- Env vars: `MACH_RPC` for backend, `MACH_PROXY_SIGNING_KEY` for signing, `OTEL_EXPORTER_OTLP_ENDPOINT` for telemetry.

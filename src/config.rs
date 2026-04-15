@@ -235,7 +235,7 @@ fn default_auth_mode() -> String {
 
 fn default_string_value_for(key: &str) -> Option<&'static str> {
     match key {
-        "SERVER_LIST_BRAND" => Some("Lure"),
+        "SERVER_LIST_BRAND" => Some("Mach"),
         "ROUTE_NOT_FOUND" => Some("Route not found"),
         "SERVER_OFFLINE" => Some("Server offline"),
         "ERROR" => Some("Gateway error"),
@@ -617,7 +617,7 @@ mod tests {
     fn string_value_uses_builtin_fallbacks_for_common_user_messages() {
         let config = LureConfig::default();
 
-        assert_eq!(config.string_value("SERVER_LIST_BRAND").as_ref(), "Lure");
+        assert_eq!(config.string_value("SERVER_LIST_BRAND").as_ref(), "Mach");
         assert_eq!(
             config.string_value("MESSAGE_CANNOT_CONNECT").as_ref(),
             "Backend is offline or unreachable"

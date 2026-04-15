@@ -14,7 +14,7 @@ path = "src/bin/tun.rs"
 
 [dependencies]
 thiserror = "2.0"
-net = { path = "../net" }
+net = { git = "https://github.com/illnet/net.git" }
 tokio = { version = "1.48", default-features = false, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 anyhow = "1.0"
 sha2 = "0.11"

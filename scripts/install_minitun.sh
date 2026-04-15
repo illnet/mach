@@ -14,7 +14,7 @@ set -euo pipefail
 #   SCOPE="system"
 #   bash install_minitun.sh
 
-REPO="${REPO:-hUwUtao/Lure}"
+REPO="${REPO:-illnet/mach}"
 RELEASE="${RELEASE:-latest}"             # latest or a tag like v5.0
 ASSET="${ASSET:-minitun-linux-x86_64}"   # default Linux x86_64 release asset
 SCOPE="${SCOPE:-system}"                 # user | system
@@ -336,7 +336,7 @@ if is_true "$MIGRATE_TUNURE"; then
             service_name="$(basename "${unit_path%.service}")"
             env_file="$(sed -n 's/^EnvironmentFile=//p' "$unit_path" | head -n1)"
             endpoint="$(parse_legacy_unit_endpoint "$unit_path")"
-            token="$(read_env_value "${env_file}" "LURE_TUN_TOKEN" || true)"
+            token="$(read_env_value "${env_file}" "MACH_TUN_TOKEN" || true)"
             legacy_rust_log="$(read_env_value "${env_file}" "RUST_LOG" || true)"
 
             if [[ -z "$endpoint" || -z "$token" ]]; then

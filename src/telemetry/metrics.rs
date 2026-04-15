@@ -16,19 +16,19 @@ impl HandshakeMetrics {
     pub fn new(meter: &Meter) -> Self {
         Self {
             open: meter
-                .u64_counter("lure_socket_open")
+                .u64_counter("mach_socket_open")
                 .with_unit("{connection}")
                 .build(),
             attempts: meter
-                .u64_counter("lure_handshake")
+                .u64_counter("mach_handshake")
                 .with_unit("{handshake}")
                 .build(),
             failures: meter
-                .u64_counter("lure_handshake_fail")
+                .u64_counter("mach_handshake_fail")
                 .with_unit("{handshake}")
                 .build(),
             duration: meter
-                .u64_histogram("lure_handshake_duration")
+                .u64_histogram("mach_handshake_duration")
                 .with_unit("ms")
                 .build(),
         }
@@ -69,23 +69,23 @@ impl RouterMetrics {
     pub fn new(meter: &Meter) -> Self {
         Self {
             routes_active: meter
-                .u64_gauge("lure_router_routes")
+                .u64_gauge("mach_router_routes")
                 .with_unit("{route}")
                 .build(),
             routes_resolve: meter
-                .u64_counter("lure_router_route_resolve")
+                .u64_counter("mach_router_route_resolve")
                 .with_unit("1")
                 .build(),
             sessions_active: meter
-                .u64_gauge("lure_router_sessions")
+                .u64_gauge("mach_router_sessions")
                 .with_unit("{session}")
                 .build(),
             session_create: meter
-                .u64_counter("lure_router_session_create")
+                .u64_counter("mach_router_session_create")
                 .with_unit("{session}")
                 .build(),
             session_destroy: meter
-                .u64_counter("lure_router_session_destroy")
+                .u64_counter("mach_router_session_destroy")
                 .with_unit("{session}")
                 .build(),
         }

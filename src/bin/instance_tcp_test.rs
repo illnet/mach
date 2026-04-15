@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::Context;
 use log::error;
-use lure::{
+use mach::{
     config::{LureConfig, RouteConfig, RouteFlagsConfig, TokenEntry, TunnelConfig},
     proxy::Lure,
     sock,

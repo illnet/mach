@@ -43,7 +43,7 @@ pub fn placeholder_status_json_with_fallback(
     label: &str,
     fallback: &str,
 ) -> String {
-    let brand = string_or_fallback(config, "SERVER_LIST_BRAND", "Lure");
+    let brand = string_or_fallback(config, "SERVER_LIST_BRAND", "Mach");
     let target_label = string_or_fallback(config, label, fallback);
     placeholder_status_response(&brand, &target_label)
 }

@@ -2,7 +2,7 @@ use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "minitun")]
-#[command(about = "Lure mini tunnel agent")]
+#[command(about = "Mach mini tunnel agent")]
 pub(super) struct Cli {
     #[command(subcommand)]
     pub(super) command: Command,

@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::Context;
-use lure::sock::{self, BackendKind};
+use mach::sock::{self, BackendKind};
 
 // High-precision nanosecond timer using CLOCK_MONOTONIC
 fn get_nanos() -> u64 {

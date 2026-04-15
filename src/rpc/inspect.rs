@@ -26,14 +26,14 @@ static GLOBAL_S2C_CHUNKS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn transport_volume_counter() -> Counter<u64> {
     get_meter()
-        .u64_counter("lure_proxy_transport_volume")
+        .u64_counter("mach_proxy_transport_volume")
         .with_unit("By")
         .build()
 }
 
 pub(crate) fn transport_packet_counter() -> Counter<u64> {
     get_meter()
-        .u64_counter("lure_proxy_transport_packet")
+        .u64_counter("mach_proxy_transport_packet")
         .with_unit("{packet}")
         .build()
 }

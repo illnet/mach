@@ -12,7 +12,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get upgrade && apt-get install -y openssl
 
 WORKDIR /app
-COPY --from=builder /usr/local/cargo/bin/lure /app/lure
+COPY --from=builder /usr/local/cargo/bin/mach /app/mach
 
 # Command to run the application
-CMD ["/app/lure"]
+CMD ["/app/mach"]

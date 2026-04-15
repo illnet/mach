@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::Context;
-use lure::{
+use mach::{
     config::{LureConfig, RouteConfig},
     proxy::Lure,
     sock,
@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
                 println!();
                 println!("what it does:");
                 println!("  - starts a raw TCP echo server (no Minecraft protocol)");
-                println!("  - creates an in-process Lure with epoll backend (LURE_IO_EPOLL=1)");
+                println!("  - creates an in-process Mach with epoll backend (MACH_IO_EPOLL=1)");
                 println!("  - drives continuous 64KB-chunk load through the proxy");
                 println!("  - every second: prints instance, route, and session stats");
                 println!(

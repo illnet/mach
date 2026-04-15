@@ -57,13 +57,13 @@ jobs:
           import json, sys
           data = json.load(sys.stdin)
           for pkg in data.get("packages", []):
-              if pkg.get("name") == "lure":
+              if pkg.get("name") == "mach":
                   print(pkg.get("version", ""))
                   break
           '
           )"
           gitsha="$(git rev-parse --short=12 HEAD)"
-          pack_base="lure_${version}+${gitsha}"
+          pack_base="mach_${version}+${gitsha}"
           image_name="$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
           ref_name="${{ github.ref_name }}"
           ref_tag="$(printf '%s' "${ref_name}" | tr '[:upper:]' '[:lower:]' | sed 's#[^a-z0-9._-]#-#g')"
@@ -161,14 +161,14 @@ jobs:
 
       - name: Build release binaries
         run: |
-          cargo +${{ env.TOOLCHAIN }} build -p lure --bin lure --release --target ${{ env.TARGET }} --verbose
+          cargo +${{ env.TOOLCHAIN }} build -p mach --bin mach --release --target ${{ env.TARGET }} --verbose
           cargo +${{ env.TOOLCHAIN }} build -p tun --bin minitun --release --target ${{ env.TARGET }} --verbose
 
       - name: Prepare Linux artifact
         shell: bash
         run: |
           mkdir -p artifacts/linux-amd64
-          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/lure artifacts/linux-amd64/lure
+          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/mach artifacts/linux-amd64/mach
           cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/minitun artifacts/linux-amd64/minitun
           cp README.md LICENSE artifacts/linux-amd64/
           if [[ -f settings.toml ]]; then
@@ -182,10 +182,10 @@ jobs:
               'rate_limit_by_ip = 10' \
               > artifacts/linux-amd64/settings.toml
           fi
-          chmod +x artifacts/linux-amd64/lure artifacts/linux-amd64/minitun
+          chmod +x artifacts/linux-amd64/mach artifacts/linux-amd64/minitun
           (
             cd artifacts/linux-amd64
-            sha256sum lure minitun README.md LICENSE settings.toml > SHA256SUMS
+            sha256sum mach minitun README.md LICENSE settings.toml > SHA256SUMS
           )
 
       - name: Upload Linux artifact
@@ -324,14 +324,14 @@ jobs:
 
       - name: Build release binaries
         run: |
-          cargo +${{ env.TOOLCHAIN }} build -p lure --bin lure --release --target ${{ env.TARGET }} --verbose
+          cargo +${{ env.TOOLCHAIN }} build -p mach --bin mach --release --target ${{ env.TARGET }} --verbose
           cargo +${{ env.TOOLCHAIN }} build -p tun --bin minitun --release --target ${{ env.TARGET }} --verbose
 
       - name: Prepare Linux arm64 artifact
         shell: bash
         run: |
           mkdir -p artifacts/linux-arm64
-          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/lure artifacts/linux-arm64/lure
+          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/mach artifacts/linux-arm64/mach
           cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/minitun artifacts/linux-arm64/minitun
           cp README.md LICENSE artifacts/linux-arm64/
           if [[ -f settings.toml ]]; then
@@ -345,10 +345,10 @@ jobs:
               'rate_limit_by_ip = 10' \
               > artifacts/linux-arm64/settings.toml
           fi
-          chmod +x artifacts/linux-arm64/lure artifacts/linux-arm64/minitun
+          chmod +x artifacts/linux-arm64/mach artifacts/linux-arm64/minitun
           (
             cd artifacts/linux-arm64
-            sha256sum lure minitun README.md LICENSE settings.toml > SHA256SUMS
+            sha256sum mach minitun README.md LICENSE settings.toml > SHA256SUMS
           )
 
       - name: Upload Linux arm64 artifact
@@ -439,14 +439,14 @@ jobs:
         if: matrix.family != 'windows'
         shell: bash
         run: |
-          cargo +${{ env.TOOLCHAIN }} build -p lure --bin lure --release --target ${{ env.TARGET }} --verbose
+          cargo +${{ env.TOOLCHAIN }} build -p mach --bin mach --release --target ${{ env.TARGET }} --verbose
           cargo +${{ env.TOOLCHAIN }} build -p tun --bin minitun --release --target ${{ env.TARGET }} --verbose
 
       - name: Build release binaries
         if: matrix.family == 'windows'
         shell: pwsh
         run: |
-          cargo +${{ env.TOOLCHAIN }} build -p lure --bin lure --release --target ${{ env.TARGET }} --verbose
+          cargo +${{ env.TOOLCHAIN }} build -p mach --bin mach --release --target ${{ env.TARGET }} --verbose
           cargo +${{ env.TOOLCHAIN }} build -p tun --bin minitun --release --target ${{ env.TARGET }} --verbose
 
       - name: Prepare Unix artifact
@@ -454,7 +454,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p artifacts/${{ matrix.artifact_name }}
-          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/lure artifacts/${{ matrix.artifact_name }}/lure
+          cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/mach artifacts/${{ matrix.artifact_name }}/mach
           cp ${{ env.CARGO_TARGET_DIR }}/${{ env.TARGET }}/release/minitun artifacts/${{ matrix.artifact_name }}/minitun
           cp README.md LICENSE artifacts/${{ matrix.artifact_name }}/
           if [[ -f settings.toml ]]; then
@@ -468,10 +468,10 @@ jobs:
               'rate_limit_by_ip = 10' \
               > artifacts/${{ matrix.artifact_name }}/settings.toml
           fi
-          chmod +x artifacts/${{ matrix.artifact_name }}/lure artifacts/${{ matrix.artifact_name }}/minitun
+          chmod +x artifacts/${{ matrix.artifact_name }}/mach artifacts/${{ matrix.artifact_name }}/minitun
           (
             cd artifacts/${{ matrix.artifact_name }}
-            shasum -a 256 lure minitun README.md LICENSE settings.toml > SHA256SUMS
+            shasum -a 256 mach minitun README.md LICENSE settings.toml > SHA256SUMS
           )
 
       - name: Prepare Windows artifact
@@ -479,7 +479,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path artifacts/${{ matrix.artifact_name }} | Out-Null
-          Copy-Item -Force $env:CARGO_TARGET_DIR\${{ env.TARGET }}\release\lure.exe artifacts/${{ matrix.artifact_name }}/lure.exe
+          Copy-Item -Force $env:CARGO_TARGET_DIR\${{ env.TARGET }}\release\mach.exe artifacts/${{ matrix.artifact_name }}/mach.exe
           Copy-Item -Force $env:CARGO_TARGET_DIR\${{ env.TARGET }}\release\minitun.exe artifacts/${{ matrix.artifact_name }}/minitun.exe
           Copy-Item -Force README.md artifacts/${{ matrix.artifact_name }}/README.md
           Copy-Item -Force LICENSE artifacts/${{ matrix.artifact_name }}/LICENSE
@@ -495,7 +495,7 @@ jobs:
             ) | Out-File -Encoding ascii artifacts/${{ matrix.artifact_name }}/settings.toml
           }
           $hashLines = @(
-            (Get-FileHash -Algorithm SHA256 artifacts/${{ matrix.artifact_name }}/lure.exe).Hash.ToLower() + "  lure.exe"
+            (Get-FileHash -Algorithm SHA256 artifacts/${{ matrix.artifact_name }}/mach.exe).Hash.ToLower() + "  mach.exe"
             (Get-FileHash -Algorithm SHA256 artifacts/${{ matrix.artifact_name }}/minitun.exe).Hash.ToLower() + "  minitun.exe"
             (Get-FileHash -Algorithm SHA256 artifacts/${{ matrix.artifact_name }}/README.md).Hash.ToLower() + "  README.md"
             (Get-FileHash -Algorithm SHA256 artifacts/${{ matrix.artifact_name }}/LICENSE).Hash.ToLower() + "  LICENSE"
@@ -573,17 +573,17 @@ jobs:
           (
             cd dist
             mkdir -p release-assets
-            cp ../bundle/linux-amd64/lure release-assets/lure-linux-x86_64
+            cp ../bundle/linux-amd64/mach release-assets/mach-linux-x86_64
             cp ../bundle/linux-amd64/minitun release-assets/minitun-linux-x86_64
-            cp ../bundle/linux-arm64/lure release-assets/lure-linux-aarch64
+            cp ../bundle/linux-arm64/mach release-assets/mach-linux-aarch64
             cp ../bundle/linux-arm64/minitun release-assets/minitun-linux-aarch64
-            cp ../bundle/macos-amd64/lure release-assets/lure-macos-x86_64
+            cp ../bundle/macos-amd64/mach release-assets/mach-macos-x86_64
             cp ../bundle/macos-amd64/minitun release-assets/minitun-macos-x86_64
-            cp ../bundle/macos-arm64/lure release-assets/lure-macos-aarch64
+            cp ../bundle/macos-arm64/mach release-assets/mach-macos-aarch64
             cp ../bundle/macos-arm64/minitun release-assets/minitun-macos-aarch64
-            cp ../bundle/windows-amd64/lure.exe release-assets/lure-windows-x86_64.exe
+            cp ../bundle/windows-amd64/mach.exe release-assets/mach-windows-x86_64.exe
             cp ../bundle/windows-amd64/minitun.exe release-assets/minitun-windows-x86_64.exe
-            cp ../bundle/windows-arm64/lure.exe release-assets/lure-windows-aarch64.exe
+            cp ../bundle/windows-arm64/mach.exe release-assets/mach-windows-aarch64.exe
             cp ../bundle/windows-arm64/minitun.exe release-assets/minitun-windows-aarch64.exe
 
             sha256sum "${bundle_name}" release-assets/* > SHA256SUMS
@@ -638,8 +638,8 @@ jobs:
       - name: Stage Docker payload
         run: |
           mkdir -p docker/linux-amd64 docker/linux-arm64
-          cp artifacts/linux-amd64/lure docker/linux-amd64/lure
-          cp artifacts/linux-arm64/lure docker/linux-arm64/lure
+          cp artifacts/linux-amd64/mach docker/linux-amd64/mach
+          cp artifacts/linux-arm64/mach docker/linux-arm64/mach
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -692,8 +692,8 @@ jobs:
       - name: Stage Docker payload
         run: |
           mkdir -p docker/linux-amd64 docker/linux-arm64
-          cp artifacts/linux-amd64/lure docker/linux-amd64/lure
-          cp artifacts/linux-arm64/lure docker/linux-arm64/lure
+          cp artifacts/linux-amd64/mach docker/linux-amd64/mach
+          cp artifacts/linux-arm64/mach docker/linux-arm64/mach
 
       - name: Build and push canary Docker image
         uses: docker/build-push-action@v6
@@ -770,8 +770,8 @@ jobs:
       - name: Stage Docker payload
         run: |
           mkdir -p docker/linux-amd64 docker/linux-arm64
-          cp artifacts/linux-amd64/lure docker/linux-amd64/lure
-          cp artifacts/linux-arm64/lure docker/linux-arm64/lure
+          cp artifacts/linux-amd64/mach docker/linux-amd64/mach
+          cp artifacts/linux-arm64/mach docker/linux-arm64/mach
 
       - name: Build and push stable Docker image
         uses: docker/build-push-action@v6

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use lure::{config::LureConfig, proxy::Lure, sock, utils::leak};
+use mach::{config::LureConfig, proxy::Lure, sock, utils::leak};
 use tokio::sync::oneshot;
 
 fn main() -> anyhow::Result<()> {

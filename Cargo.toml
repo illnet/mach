@@ -1,11 +1,12 @@
 [package]
-name = "lure"
+name = "mach"
 version = "0.5.6"
 edition = "2024"
-default-run = "lure"
+default-run = "mach"
+license = "AGPL-3.0-or-later"
 
 [workspace]
-members = ["net", "tun"]
+members = ["tun"]
 
 [lib]
 doctest = false
@@ -15,7 +16,7 @@ anyhow = "1.0"
 bytes = "1.10"
 log = "0.4.27"
 libc = "0.2"
-net = { path = "net" }
+net = { git = "https://github.com/illnet/net.git" }
 tun = { path = "tun" }
 opentelemetry = { version = "0.31", default-features = false, features = ["metrics", "trace"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = [

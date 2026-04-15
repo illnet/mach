@@ -1,6 +1,6 @@
 use std::{env, error::Error, io::ErrorKind, time::Duration};
 
-use lure::{
+use mach::{
     config::{LureConfig, LureConfigLoadError, ProxySigningKey},
     proxy::Lure,
     rpc,
@@ -13,10 +13,10 @@ const SENTRY_DSN: &str =
     "https://d8cb23f37184d406d4b129c0dc0b24d4@o1192891.ingest.us.sentry.io/4511109122293760";
 
 fn main() {
-    let sentry = init_sentry("lure");
+    let sentry = init_sentry("mach");
     if let Err(err) = try_main() {
-        capture_sentry_error("lure_fatal", "proxy", &*err);
-        eprintln!("lure failed: {err}");
+        capture_sentry_error("mach_fatal", "proxy", &*err);
+        eprintln!("mach failed: {err}");
         drop(sentry);
         std::process::exit(1);
     }
@@ -32,7 +32,7 @@ fn try_main() -> Result<(), Box<dyn Error>> {
                 return Ok(());
             }
             "--help" | "-h" => {
-                println!("usage: lure [--version]");
+                println!("usage: mach [--version]");
                 return Ok(());
             }
             _ => {}
@@ -83,12 +83,11 @@ fn try_main() -> Result<(), Box<dyn Error>> {
 }
 
 fn init_sentry(service: &'static str) -> Option<sentry::ClientInitGuard> {
-    if env::var_os("LURE_NOSENTRY").is_some() || env::var_os("NOSENTRY").is_some() {
+    if env::var_os("MACH_NOSENTRY").is_some() || env::var_os("NOSENTRY").is_some() {
         return None;
     }
 
-    let sentry_environment = env::var("LURE_SENTRY_ENV")
-        .ok()
+    let sentry_environment = env_var("MACH_SENTRY_ENV")
         .or_else(|| env::var("SENTRY_ENVIRONMENT").ok())
         .map(Into::into);
     let guard = sentry::init((
@@ -125,9 +124,13 @@ fn capture_sentry_error(event: &str, origin: &str, err: &dyn Error) {
             scope.set_tag("error_type", std::any::type_name_of_val(err));
         },
         || {
-            sentry::capture_message("Lure runtime failure", sentry::Level::Error);
+            sentry::capture_message("Mach runtime failure", sentry::Level::Error);
         },
     );
+}
+
+fn env_var(key: &str) -> Option<String> {
+    env::var(key).ok()
 }
 
 async fn run() -> Result<(), Box<dyn Error>> {
@@ -230,7 +233,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 
     spawn_named("Main thread", async move {
         if let Err(e) = lure.start().await {
-            capture_sentry_error("lure_start_failed", "proxy", &*e);
+            capture_sentry_error("mach_start_failed", "proxy", &*e);
             log::error!("{e}");
         }
         if let Some(providers) = providers {
@@ -261,7 +264,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 }
 
 fn apply_proxy_signing_key(config: &mut LureConfig) {
-    if let Ok(value) = env::var("LURE_PROXY_SIGNING_KEY") {
+    if let Some(value) = env_var("MACH_PROXY_SIGNING_KEY") {
         let trimmed = value.trim();
         if trimmed.is_empty() {
             return;
@@ -272,7 +275,7 @@ fn apply_proxy_signing_key(config: &mut LureConfig) {
                 log::info!("proxy signing key loaded from env");
             }
             Err(err) => {
-                log::warn!("LURE_PROXY_SIGNING_KEY is not valid base64: {err}");
+                log::warn!("MACH_PROXY_SIGNING_KEY is not valid base64: {err}");
             }
         }
         return;
@@ -292,7 +295,7 @@ fn apply_proxy_signing_key(config: &mut LureConfig) {
 }
 
 fn apply_tunnel_master_url(config: &mut LureConfig) {
-    let Ok(value) = env::var("LURE_TUN_MASTER_URL") else {
+    let Some(value) = env_var("MACH_TUN_MASTER_URL") else {
         return;
     };
 

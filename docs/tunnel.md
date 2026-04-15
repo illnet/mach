@@ -1,13 +1,13 @@
 # TCP Tunnel (Beta)
 
-This document describes the pure-TCP tunnel agent flow and the slave-to-master forwarded-request extension for distributed Lure deployments.
+This document describes the pure-TCP tunnel agent flow and the slave-to-master forwarded-request extension for distributed Mach deployments.
 
 ## Purpose
 
 - NAT passthrough for routes marked as tunnel-enabled.
 - No encryption or auth beyond a shared 32-byte token.
-- `minitun` connects to Lure ingress and reverse-proxies to the target.
-- Optional slave forwarding mode relays tunnel session requests through a master Lure instance while keeping the client data plane local to the slave.
+- `minitun` connects to Mach ingress and reverse-proxies to the target.
+- Optional slave forwarding mode relays tunnel session requests through a master Mach instance while keeping the client data plane local to the slave.
 
 ## Status
 
@@ -35,7 +35,7 @@ tunnel = true
 
 ### minitun
 
-`minitun` is the singleton tunnel client. One process can register multiple tunnel keys against the same Lure endpoint using a TOML configuration file.
+`minitun` is the singleton tunnel client. One process can register multiple tunnel keys against the same Mach endpoint using a TOML configuration file.
 
 #### Configuration
 
@@ -50,11 +50,11 @@ strict = false
 
 # Tunnel entries (each can have multiple endpoints for failover)
 [[tunnel]]
-endpoints = ["lure.example.com:25577"]
+endpoints = ["mach.example.com:25577"]
 token = "0011223344556677:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 [[tunnel]]
-endpoints = ["sgp-lure.example.com:25577", "hkg-lure.example.com:25577"]
+endpoints = ["sgp-mach.example.com:25577", "hkg-mach.example.com:25577"]
 token = "8899aabbccddeeff:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 # Optional: address whitelist for strict mode
@@ -84,13 +84,13 @@ Format: `key_id_hex:secret_hex` where:
 # Install binary and create initial config
 minitun install \
   --token 0011223344556677:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  --endpoints "lure.example.com:25577" \
+  --endpoints "mach.example.com:25577" \
   --map-name lobby --map-addr 127.0.0.1:25565
 
 # Add more tunnels
 minitun config add-tunnel \
   --token 8899aabbccddeeff:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
-  --endpoints "sgp-lure.example.com:25577,hkg-lure.example.com:25577"
+  --endpoints "sgp-mach.example.com:25577,hkg-mach.example.com:25577"
 
 # View current config
 minitun config show
@@ -130,7 +130,7 @@ inst = "sgp-edge-1"
 master_url = "master.example.com:25577"
 ```
 
-- `LURE_TUN_MASTER_URL` overrides `tunnel.master_url`.
+- `MACH_TUN_MASTER_URL` overrides `tunnel.master_url`.
 - The value is a TCP endpoint (`host:port`), even though the config field keeps the historical `*_url` naming.
 
 ## Tunnel Wire Protocol
@@ -164,21 +164,21 @@ After receiving a tunnel hello, the server can send:
 
 ## End-to-End Flow
 
-1) Agent connects to Lure ingress with intent=listen and token.
+1) Agent connects to Mach ingress with intent=listen and token.
 2) Client connects normally (Minecraft handshake + login).
-3) If the resolved route has `tunnel` flag and a valid `tunnel_token`, Lure:
+3) If the resolved route has `tunnel` flag and a valid `tunnel_token`, Mach:
    - generates a session token
    - sends SessionOffer to the active agent
 4) Agent reconnects with intent=connect, token, session token.
-5) Lure responds with TargetAddr (the resolved backend address).
-6) Lure bridges client stream to agent stream and forwards:
+5) Mach responds with TargetAddr (the resolved backend address).
+6) Mach bridges client stream to agent stream and forwards:
    - raw handshake
    - raw login start
    - any pending buffered bytes
 
 ### Distributed Slave Forward Flow
 
-1) A slave Lure instance accepts a client on a tunnel-enabled route.
+1) A slave Mach instance accepts a client on a tunnel-enabled route.
 2) The slave resolves the backend locally, creates a pending tunnel session, and opens a tunnel `forward` hello to `tunnel.master_url`.
 3) The forward payload contains:
    - the session token
@@ -224,7 +224,7 @@ After receiving a tunnel hello, the server can send:
 - **Future**: Keep-alive will be added in a future wire-protocol revision.
 
 ### Maximum Pending Sessions
-- **Default limit**: 10,000 pending sessions per Lure instance.
+- **Default limit**: 10,000 pending sessions per Mach instance.
 - **Rationale**: Prevents unbounded memory growth from clients that accept but never complete login.
 - **Behavior**: New session offers are rejected if the limit is exceeded; clients receive a "tunnel session limit exceeded" error.
 
@@ -232,7 +232,7 @@ After receiving a tunnel hello, the server can send:
 
 ### Logging
 
-Tunnel events are logged using the standard Lure logger:
+Tunnel events are logged using the standard Mach logger:
 
 ```
 [INFO] Tunnel agent registered: token=8f
@@ -266,14 +266,14 @@ The following metrics are exposed:
 
 ## Troubleshooting
 
-### Agent cannot connect to Lure
+### Agent cannot connect to Mach
 
 **Symptoms**: Agent reports connection refused or timeout.
 
 **Diagnosis**:
-1. Verify Lure is listening on the correct address: `netstat -tlnp | grep lure`
+1. Verify Mach is listening on the correct address: `netstat -tlnp | grep mach`
 2. Check firewall rules: `sudo iptables -L -n` or cloud security group
-3. Verify network connectivity: `ping <lure-server>`
+3. Verify network connectivity: `ping <mach-server>`
 
 **Solution**: Open the port in firewall and verify connectivity.
 
@@ -283,7 +283,7 @@ The following metrics are exposed:
 
 **Diagnosis**:
 1. Check agent logs: Are there any connection errors?
-2. Check Lure logs for "session timeout" or "agent disconnected"
+2. Check Mach logs for "session timeout" or "agent disconnected"
 3. Enable debug logging on both sides
 
 **Solution**:
@@ -310,7 +310,7 @@ The following metrics are exposed:
 
 **Diagnosis**:
 1. Check network stability: Look for packet loss or timeout errors
-2. Check Lure logs for write errors or protocol violations
+2. Check Mach logs for write errors or protocol violations
 3. Verify agent correctly handles connection drops
 
 **Solution**:
@@ -320,7 +320,7 @@ The following metrics are exposed:
 
 ## Example Deployment
 
-### Agent on internal network, Lure on public internet
+### Agent on internal network, Mach on public internet
 
 ```
 [Internal Network]
@@ -330,7 +330,7 @@ The following metrics are exposed:
        |
     [Internet]
        |
-   Lure Gateway
+   Mach Gateway
        |
    Minecraft Clients
 ```
@@ -349,7 +349,7 @@ minitun install --token 0011223344556677:8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9
 minitun run
 ```
 
-**Route configuration in Lure** (`settings.toml`):
+**Route configuration in Mach** (`settings.toml`):
 ```toml
 [[route]]
 matcher = "behind-nat.example.com"
@@ -363,7 +363,7 @@ tunnel_token = "8f1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f00112233445566778899aabb
 
 ### Multi-agent for redundancy
 
-Deploy multiple `minitun` instances with the same token if you want redundancy. Lure will keep one active listener per key, so restarts and failover are handled by reconnecting instances.
+Deploy multiple `minitun` instances with the same token if you want redundancy. Mach will keep one active listener per key, so restarts and failover are handled by reconnecting instances.
 
 **Shared config** (`~/.config/minitun.toml`):
 ```toml
@@ -377,11 +377,11 @@ token = "0011223344556677:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 minitun run
 ```
 
-Both instances connect with the same token; Lure accepts whichever connects first. On restart, the other instance takes over automatically.
+Both instances connect with the same token; Mach accepts whichever connects first. On restart, the other instance takes over automatically.
 
 ## Notes
 
 - Tunnel detection happens before decoding Minecraft handshake; if the magic
-  bytes are not present, Lure proceeds with the normal handshake path.
+  bytes are not present, Mach proceeds with the normal handshake path.
 - This is a simple coordination layer and does not provide encryption.
 - Session timeouts are automatic and transparent to agents and clients.

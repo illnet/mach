@@ -63,11 +63,11 @@ impl ConnectionMetric {
     fn new(metric: &Meter) -> Self {
         Self {
             packet_count: metric
-                .u64_counter("lure_proxy_packet")
+                .u64_counter("mach_proxy_packet")
                 .with_unit("{packet}")
                 .build(),
             packet_size: metric
-                .u64_histogram("lure_proxy_packet_size")
+                .u64_histogram("mach_proxy_packet_size")
                 .with_unit("By")
                 .build(),
         }

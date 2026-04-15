@@ -1,11 +1,11 @@
 # minitun
 
-Lightweight TCP tunnel agent for Lure. Manages multiple tunnel keys with multi-endpoint failover and hot-reload.
+Lightweight TCP tunnel agent for Mach. Manages multiple tunnel keys with multi-endpoint failover and hot-reload.
 
 ## Install
 
 ```bash
-minitun install --token <key_id>:<secret> --endpoints lure.example.com:25577
+minitun install --token <key_id>:<secret> --endpoints mach.example.com:25577
 ```
 
 Copies binary to `~/.local/bin/minitun` and writes config to `~/.config/minitun.toml`.
@@ -20,12 +20,12 @@ strict = false
 reconnect = "5s"  # max backoff, floor is 1s
 
 [[tunnel]]
-endpoints = ["lure.example.com:25577"]
+endpoints = ["mach.example.com:25577"]
 token = "0011223344556677:aabbccdd..."
 
 # multiple endpoints = round-robin failover
 [[tunnel]]
-endpoints = ["sgp.lure.com:25577", "hkg.lure.com:25577"]
+endpoints = ["sgp.mach.com:25577", "hkg.mach.com:25577"]
 token = "8899aabbccddeeff:11223344..."
 
 [map]

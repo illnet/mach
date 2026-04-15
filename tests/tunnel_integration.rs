@@ -6,7 +6,7 @@ use std::sync::Arc;
 #[test]
 fn tunnel_basic_types() {
     // Test: Basic tunnel types are valid
-    use lure::tunnel::{SessionToken, TokenKeyId};
+    use mach::tunnel::{SessionToken, TokenKeyId};
 
     let key_id = TokenKeyId([0u8; 8]);
     let session = SessionToken([1u8; 32]);
@@ -354,7 +354,7 @@ fn tunnel_hmac_computation() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn tunnel_registry_live_auth_handshake() {
-    use lure::{
+    use mach::{
         config::TokenEntry,
         router::AuthMode,
         sock::{LureConnection, LureListener},

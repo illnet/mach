@@ -98,123 +98,123 @@ impl ProcessMetricsService {
         let unstable_metrics = UnstableMetrics {
             // Initialize unstable runtime metrics
             noop_total: meter
-                .u64_counter("lure_runtime_noop_total")
+                .u64_counter("mach_runtime_noop_total")
                 .with_unit("{noop}")
                 .build(),
             noop_max: meter
-                .u64_counter("lure_runtime_noop_max")
+                .u64_counter("mach_runtime_noop_max")
                 .with_unit("{noop}")
                 .build(),
             noop_min: meter
-                .u64_counter("lure_runtime_noop_min")
+                .u64_counter("mach_runtime_noop_min")
                 .with_unit("{noop}")
                 .build(),
             steal_total: meter
-                .u64_counter("lure_runtime_steal_total")
+                .u64_counter("mach_runtime_steal_total")
                 .with_unit("{steal}")
                 .build(),
             steal_max: meter
-                .u64_counter("lure_runtime_steal_max")
+                .u64_counter("mach_runtime_steal_max")
                 .with_unit("{steal}")
                 .build(),
             steal_min: meter
-                .u64_counter("lure_runtime_steal_min")
+                .u64_counter("mach_runtime_steal_min")
                 .with_unit("{steal}")
                 .build(),
             steal_operations_total: meter
-                .u64_counter("lure_runtime_steal_operations_total")
+                .u64_counter("mach_runtime_steal_operations_total")
                 .with_unit("{operation}")
                 .build(),
             steal_operations_max: meter
-                .u64_counter("lure_runtime_steal_operations_max")
+                .u64_counter("mach_runtime_steal_operations_max")
                 .with_unit("{operation}")
                 .build(),
             steal_operations_min: meter
-                .u64_counter("lure_runtime_steal_operations_min")
+                .u64_counter("mach_runtime_steal_operations_min")
                 .with_unit("{operation}")
                 .build(),
             remote_schedule: meter
-                .u64_counter("lure_runtime_remote_schedule")
+                .u64_counter("mach_runtime_remote_schedule")
                 .with_unit("{task}")
                 .build(),
             local_schedule_total: meter
-                .u64_counter("lure_runtime_local_schedule_total")
+                .u64_counter("mach_runtime_local_schedule_total")
                 .with_unit("{task}")
                 .build(),
             local_schedule_max: meter
-                .u64_counter("lure_runtime_local_schedule_max")
+                .u64_counter("mach_runtime_local_schedule_max")
                 .with_unit("{task}")
                 .build(),
             local_schedule_min: meter
-                .u64_counter("lure_runtime_local_schedule_min")
+                .u64_counter("mach_runtime_local_schedule_min")
                 .with_unit("{task}")
                 .build(),
             overflow_total: meter
-                .u64_counter("lure_runtime_overflow_total")
+                .u64_counter("mach_runtime_overflow_total")
                 .with_unit("{overflow}")
                 .build(),
             overflow_max: meter
-                .u64_counter("lure_runtime_overflow_max")
+                .u64_counter("mach_runtime_overflow_max")
                 .with_unit("{overflow}")
                 .build(),
             overflow_min: meter
-                .u64_counter("lure_runtime_overflow_min")
+                .u64_counter("mach_runtime_overflow_min")
                 .with_unit("{overflow}")
                 .build(),
             polls_total: meter
-                .u64_counter("lure_runtime_polls_total")
+                .u64_counter("mach_runtime_polls_total")
                 .with_unit("{poll}")
                 .build(),
             polls_max: meter
-                .u64_counter("lure_runtime_polls_max")
+                .u64_counter("mach_runtime_polls_max")
                 .with_unit("{poll}")
                 .build(),
             polls_min: meter
-                .u64_counter("lure_runtime_polls_min")
+                .u64_counter("mach_runtime_polls_min")
                 .with_unit("{poll}")
                 .build(),
             local_queue_depth_total: meter
-                .u64_gauge("lure_runtime_local_queue_depth_total")
+                .u64_gauge("mach_runtime_local_queue_depth_total")
                 .with_unit("{task}")
                 .build(),
             local_queue_depth_max: meter
-                .u64_gauge("lure_runtime_local_queue_depth_max")
+                .u64_gauge("mach_runtime_local_queue_depth_max")
                 .with_unit("{task}")
                 .build(),
             local_queue_depth_min: meter
-                .u64_gauge("lure_runtime_local_queue_depth_min")
+                .u64_gauge("mach_runtime_local_queue_depth_min")
                 .with_unit("{task}")
                 .build(),
             blocking_queue_depth: meter
-                .u64_gauge("lure_runtime_blocking_queue_depth")
+                .u64_gauge("mach_runtime_blocking_queue_depth")
                 .with_unit("{task}")
                 .build(),
             tasks_live: meter
-                .u64_gauge("lure_runtime_tasks_live")
+                .u64_gauge("mach_runtime_tasks_live")
                 .with_unit("{task}")
                 .build(),
             threads_blocking: meter
-                .u64_gauge("lure_runtime_threads_blocking")
+                .u64_gauge("mach_runtime_threads_blocking")
                 .with_unit("{thread}")
                 .build(),
             threads_blocking_idle: meter
-                .u64_gauge("lure_runtime_threads_blocking_idle")
+                .u64_gauge("mach_runtime_threads_blocking_idle")
                 .with_unit("{thread}")
                 .build(),
             budget_forced_yield: meter
-                .u64_counter("lure_runtime_budget_forced_yield")
+                .u64_counter("mach_runtime_budget_forced_yield")
                 .with_unit("{yield}")
                 .build(),
             io_driver_ready: meter
-                .u64_counter("lure_runtime_io_driver_ready")
+                .u64_counter("mach_runtime_io_driver_ready")
                 .with_unit("{event}")
                 .build(),
             busy_ratio: meter
-                .f64_gauge("lure_runtime_busy_ratio")
+                .f64_gauge("mach_runtime_busy_ratio")
                 .with_unit("1")
                 .build(),
             mean_polls_per_park: meter
-                .f64_gauge("lure_runtime_mean_polls_per_park")
+                .f64_gauge("mach_runtime_mean_polls_per_park")
                 .with_unit("{poll}")
                 .build(),
         };
@@ -222,72 +222,72 @@ impl ProcessMetricsService {
         Self {
             // Initialize stable runtime metrics
             workers: meter
-                .u64_gauge("lure_runtime_workers")
+                .u64_gauge("mach_runtime_workers")
                 .with_unit("{thread}")
                 .build(),
             park_total: meter
-                .u64_gauge("lure_runtime_park_total")
+                .u64_gauge("mach_runtime_park_total")
                 .with_unit("{park}")
                 .build(),
             park_max: meter
-                .u64_gauge("lure_runtime_park_max")
+                .u64_gauge("mach_runtime_park_max")
                 .with_unit("{park}")
                 .build(),
             park_min: meter
-                .u64_gauge("lure_runtime_park_min")
+                .u64_gauge("mach_runtime_park_min")
                 .with_unit("{park}")
                 .build(),
             busy_duration_total: meter
-                .u64_counter("lure_runtime_busy_duration_total")
+                .u64_counter("mach_runtime_busy_duration_total")
                 .with_unit("us")
                 .build(),
             busy_duration_max: meter
-                .u64_counter("lure_runtime_busy_duration_max")
+                .u64_counter("mach_runtime_busy_duration_max")
                 .with_unit("us")
                 .build(),
             busy_duration_min: meter
-                .u64_counter("lure_runtime_busy_duration_min")
+                .u64_counter("mach_runtime_busy_duration_min")
                 .with_unit("us")
                 .build(),
             queue_depth: meter
-                .u64_gauge("lure_runtime_queue_depth")
+                .u64_gauge("mach_runtime_queue_depth")
                 .with_unit("{task}")
                 .build(),
 
             #[cfg(feature = "tokio_unstable")]
             unstable: unstable_metrics,
             // Initialize task metrics
-            // instrumented_count: meter.u64_counter("lure_runtime_instrumented_count").with_unit("1").build(),
-            // dropped_count: meter.u64_counter("lure_runtime_dropped_count").with_unit("1").build(),
-            // first_poll_count: meter.u64_counter("lure_runtime_first_poll_count").with_unit("1").build(),
-            // total_first_poll_delay: meter.f64_histogram("lure_runtime_total_first_poll_delay").with_unit("s").build(),
-            // total_idled_count: meter.u64_counter("lure_runtime_total_idled_count").with_unit("1").build(),
-            // total_idle_duration: meter.f64_histogram("lure_runtime_total_idle_duration").with_unit("s").build(),
-            // total_scheduled_count: meter.u64_counter("lure_runtime_total_scheduled_count").with_unit("1").build(),
+            // instrumented_count: meter.u64_counter("mach_runtime_instrumented_count").with_unit("1").build(),
+            // dropped_count: meter.u64_counter("mach_runtime_dropped_count").with_unit("1").build(),
+            // first_poll_count: meter.u64_counter("mach_runtime_first_poll_count").with_unit("1").build(),
+            // total_first_poll_delay: meter.f64_histogram("mach_runtime_total_first_poll_delay").with_unit("s").build(),
+            // total_idled_count: meter.u64_counter("mach_runtime_total_idled_count").with_unit("1").build(),
+            // total_idle_duration: meter.f64_histogram("mach_runtime_total_idle_duration").with_unit("s").build(),
+            // total_scheduled_count: meter.u64_counter("mach_runtime_total_scheduled_count").with_unit("1").build(),
             // total_scheduled_duration: meter
-            //     .f64_histogram("lure_runtime_total_scheduled_duration")
+            //     .f64_histogram("mach_runtime_total_scheduled_duration")
             //     .with_unit("s")
             //     .build(),
-            // total_poll_count: meter.u64_counter("lure_runtime_total_poll_count").with_unit("1").build(),
-            // total_poll_duration: meter.f64_histogram("lure_runtime_total_poll_duration").with_unit("s").build(),
-            // total_fast_poll_count: meter.u64_counter("lure_runtime_total_fast_poll_count").with_unit("1").build(),
+            // total_poll_count: meter.u64_counter("mach_runtime_total_poll_count").with_unit("1").build(),
+            // total_poll_duration: meter.f64_histogram("mach_runtime_total_poll_duration").with_unit("s").build(),
+            // total_fast_poll_count: meter.u64_counter("mach_runtime_total_fast_poll_count").with_unit("1").build(),
             // total_fast_poll_duration: meter
-            //     .f64_histogram("lure_runtime_total_fast_poll_duration")
+            //     .f64_histogram("mach_runtime_total_fast_poll_duration")
             //     .with_unit("s")
             //     .build(),
-            // total_slow_poll_count: meter.u64_counter("lure_runtime_total_slow_poll_count").with_unit("1").build(),
+            // total_slow_poll_count: meter.u64_counter("mach_runtime_total_slow_poll_count").with_unit("1").build(),
             // total_slow_poll_duration: meter
-            //     .f64_histogram("lure_runtime_total_slow_poll_duration")
+            //     .f64_histogram("mach_runtime_total_slow_poll_duration")
             //     .with_unit("s")
             //     .build(),
-            // total_short_delay_count: meter.u64_counter("lure_runtime_total_short_delay_count").with_unit("1").build(),
+            // total_short_delay_count: meter.u64_counter("mach_runtime_total_short_delay_count").with_unit("1").build(),
             // total_short_delay_duration: meter
-            //     .f64_histogram("lure_runtime_total_short_delay_duration")
+            //     .f64_histogram("mach_runtime_total_short_delay_duration")
             //     .with_unit("s")
             //     .build(),
-            // total_long_delay_count: meter.u64_counter("lure_runtime_total_long_delay_count").with_unit("1").build(),
+            // total_long_delay_count: meter.u64_counter("mach_runtime_total_long_delay_count").with_unit("1").build(),
             // total_long_delay_duration: meter
-            //     .f64_histogram("lure_runtime_total_long_delay_duration")
+            //     .f64_histogram("mach_runtime_total_long_delay_duration")
             //     .with_unit("s")
             //     .build(),
 

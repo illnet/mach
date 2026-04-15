@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::Context;
-use lure::{
+use mach::{
     config::{LureConfig, RouteConfig},
     proxy::Lure,
     utils::leak,

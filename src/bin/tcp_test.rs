@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::Context;
-use lure::sock::{self, BackendKind};
+use mach::sock::{self, BackendKind};
 
 // High-precision nanosecond timer using CLOCK_MONOTONIC.
 fn get_nanos() -> u64 {
@@ -250,7 +250,7 @@ fn print_help() {
     println!("notes:");
     println!("  - Validates send/recv pairing and strict FIFO response order per-connection.");
     println!("  - Prints latency stats and (when mode=both) proxy RTT overhead vs direct.");
-    println!("  - Backend selection follows Lure's socket backend env (e.g. LURE_IO_EPOLL=1).");
+    println!("  - Backend selection follows Mach socket backend env (e.g. MACH_IO_EPOLL=1).");
 }
 
 fn run_load(cfg: &TestConfig, addr: SocketAddr, record_samples: bool) -> anyhow::Result<RunResult> {

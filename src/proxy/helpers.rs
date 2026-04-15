@@ -57,7 +57,7 @@ pub(super) fn enforce_local_ip_block() -> bool {
     static ENFORCE: OnceLock<bool> = OnceLock::new();
 
     *ENFORCE.get_or_init(|| {
-        std::env::var("LURE_ENFORCE_LOCAL_BLOCK")
+        std::env::var("MACH_ENFORCE_LOCAL_BLOCK")
             .ok()
             .as_deref()
             .map(|value| matches!(value, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))

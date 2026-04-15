@@ -45,6 +45,10 @@ use helpers::{
     socket_backend_label, unsupported_tunnel_version,
 };
 
+fn rpc_url_from_env() -> Option<String> {
+    dotenvy::var("MACH_RPC").ok()
+}
+
 /// Main proxy runtime service orchestrating routing, tunnels, and telemetry.
 pub struct Lure {
     config: RwLock<LureConfig>,
@@ -196,7 +200,7 @@ impl Lure {
         let inst = config.inst.clone();
         drop(config);
 
-        if let Ok(rpc_url) = dotenvy::var("LURE_RPC") {
+        if let Some(rpc_url) = rpc_url_from_env() {
             // TunnelRegistry is not Send due to connection types; bridge RPC events to a local task.
             let (tun_tx, mut tun_rx) = tokio::sync::mpsc::unbounded_channel();
             let tunnels = Arc::clone(&self.tunnels);
@@ -348,7 +352,7 @@ impl Lure {
         let inst = config.inst.clone();
         drop(config);
 
-        if let Ok(rpc_url) = dotenvy::var("LURE_RPC") {
+        if let Some(rpc_url) = rpc_url_from_env() {
             // TunnelRegistry is not Send due to connection types; bridge RPC events to a local task.
             let (tun_tx, mut tun_rx) = tokio::sync::mpsc::unbounded_channel();
             let tunnels = Arc::clone(&self.tunnels);

@@ -39,7 +39,7 @@ echo ""
 echo "======================================================================"
 echo "Test 2: Epoll Backend (HAProxy-Inspired Redesign)"
 echo "======================================================================"
-LURE_IO_EPOLL=1 ./target/release/bench_proxy \
+MACH_IO_EPOLL=1 ./target/release/bench_proxy \
     --duration $DURATION \
     --warmup $WARMUP \
     --concurrency $CONCURRENCY \
