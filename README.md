@@ -18,7 +18,7 @@
 </p>
 
 > [!NOTE]
-> `mach` is a fork from the original Mach, that were living under same Mach name. Founded into illnet. Contribution and member applicant is welcome <3. [Discord here](https://discord.gg/rs93smkSms)
+> `mach` is a fork from the original Lure, that were living under same Lure name. Founded into illnet. Contribution and member applicant is welcome <3. [Discord here](https://discord.gg/rs93smkSms)
 
 ---
 
