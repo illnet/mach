@@ -42,8 +42,8 @@ tunnel = true
 Create `~/.config/minitun.toml`:
 
 ```toml
-# Reconnect backoff (default: "1s")
-reconnect = "1s"
+# Maximum reconnect backoff (default: "5s"; starts at 250ms and doubles up to this cap)
+reconnect = "5s"
 
 # Optional: strict mode — only forward to addresses in [map]
 strict = false
@@ -314,7 +314,7 @@ The following metrics are exposed:
 3. Verify agent correctly handles connection drops
 
 **Solution**:
-1. Implement agent reconnect logic (exponential backoff)
+1. Tune `minitun` maximum reconnect backoff with `reconnect`
 2. Add keep-alive heartbeats (future feature)
 3. Use persistent network (WireGuard/VPN) for reliability
 

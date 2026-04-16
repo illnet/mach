@@ -50,7 +50,7 @@ pub(super) struct InstallArgs {
     #[arg(long)]
     pub(super) strict: bool,
 
-    /// Set reconnect backoff duration (e.g. "1s", "500ms", "2m").
+    /// Set maximum reconnect backoff duration (e.g. "1s", "500ms", "2m").
     #[arg(long)]
     pub(super) reconnect: Option<String>,
 

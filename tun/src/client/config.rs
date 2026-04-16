@@ -7,7 +7,7 @@ use std::{
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-/// Human-readable duration: "1s", "500ms", "2m". Default: 1s.
+/// Human-readable duration: "1s", "500ms", "2m". Default: 5s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct HumanDuration(pub std::time::Duration);
 
@@ -22,8 +22,6 @@ impl Default for HumanDuration {
         Self(std::time::Duration::from_secs(5))
     }
 }
-
-pub(super) const MIN_RECONNECT: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub(super) fn parse_human_duration(s: &str) -> anyhow::Result<std::time::Duration> {
     let s = s.trim();
