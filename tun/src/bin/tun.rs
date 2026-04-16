@@ -1,11 +1,25 @@
+use std::sync::Arc;
+
 use log::error;
+use sentry::protocol::LogLevel;
 
 const SENTRY_DSN: &str =
     "https://d8cb23f37184d406d4b129c0dc0b24d4@o1192891.ingest.us.sentry.io/4511109122293760";
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let sentry = init_sentry("minitun");
+
+    #[cfg(debug_assertions)]
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    #[cfg(not(debug_assertions))]
+    {
+        let logger = sentry::integrations::log::SentryLogger::with_dest(
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")),
+        );
+        log::set_boxed_logger(Box::new(logger)).unwrap();
+        log::set_max_level(log::LevelFilter::Trace);
+    }
 
     if let Err(err) = tun::client::run_cli() {
         capture_sentry_error("minitun_fatal", "tunnel_client", &err);
@@ -30,6 +44,11 @@ fn init_sentry(service: &'static str) -> Option<sentry::ClientInitGuard> {
             release: sentry::release_name!(),
             send_default_pii: false,
             server_name: None,
+            enable_logs: true,
+            before_send_log: Some(Arc::new(|log| match log.level {
+                LogLevel::Warn | LogLevel::Error | LogLevel::Fatal => Some(log),
+                _ => None,
+            })),
             environment: sentry_environment,
             ..Default::default()
         },

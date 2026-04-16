@@ -1,4 +1,4 @@
-use std::{env, error::Error, io::ErrorKind, time::Duration};
+use std::{env, error::Error, io::ErrorKind, sync::Arc, time::Duration};
 
 use mach::{
     config::{LureConfig, LureConfigLoadError, ProxySigningKey},
@@ -8,6 +8,7 @@ use mach::{
     telemetry::{oltp::init_meter, process::ProcessMetricsService},
     utils::{leak, spawn_named},
 };
+use sentry::protocol::LogLevel;
 
 const SENTRY_DSN: &str =
     "https://d8cb23f37184d406d4b129c0dc0b24d4@o1192891.ingest.us.sentry.io/4511109122293760";
@@ -45,7 +46,13 @@ fn try_main() -> Result<(), Box<dyn Error>> {
         .filter_level(log::LevelFilter::Debug)
         .init();
     #[cfg(not(debug_assertions))]
-    env_logger::init();
+    {
+        let logger = sentry::integrations::log::SentryLogger::with_dest(
+            env_logger::Builder::from_default_env().build(),
+        );
+        log::set_boxed_logger(Box::new(logger)).unwrap();
+        log::set_max_level(log::LevelFilter::Trace);
+    }
 
     let backend = backend_selection();
     sentry::configure_scope(|scope| {
@@ -90,6 +97,7 @@ fn init_sentry(service: &'static str) -> Option<sentry::ClientInitGuard> {
     let sentry_environment = env_var("MACH_SENTRY_ENV")
         .or_else(|| env::var("SENTRY_ENVIRONMENT").ok())
         .map(Into::into);
+
     let guard = sentry::init((
         SENTRY_DSN,
         sentry::ClientOptions {
@@ -97,6 +105,11 @@ fn init_sentry(service: &'static str) -> Option<sentry::ClientInitGuard> {
             send_default_pii: false,
             server_name: None,
             environment: sentry_environment,
+            enable_logs: true,
+            before_send_log: Some(Arc::new(|log| match log.level {
+                LogLevel::Warn | LogLevel::Error | LogLevel::Fatal => Some(log),
+                _ => None,
+            })),
             ..Default::default()
         },
     ));
@@ -124,7 +137,7 @@ fn capture_sentry_error(event: &str, origin: &str, err: &dyn Error) {
             scope.set_tag("error_type", std::any::type_name_of_val(err));
         },
         || {
-            sentry::capture_message("Mach runtime failure", sentry::Level::Error);
+            sentry::capture_message(&format!("mach:{event}"), sentry::Level::Error);
         },
     );
 }

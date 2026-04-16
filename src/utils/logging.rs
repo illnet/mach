@@ -66,16 +66,16 @@ fn format_anyhow_chain(err: &Error) -> String {
 }
 
 impl LureLogger {
+    // ============================================================================
+    // Standard Info/Debug (Ignored by Sentry hook, safe for PII)
+    // ============================================================================
+
     pub fn preparing_socket(address: &str) {
         info!("Preparing socket {address}");
     }
 
     pub fn rate_limited(ip: &IpAddr) {
         debug!("Rate-limited {ip}");
-    }
-
-    pub fn tcp_nodelay_failed(err: &std::io::Error) {
-        error!("Failed to set TCP_NODELAY: {err}");
     }
 
     pub fn new_connection(address: &SocketAddr) {
@@ -86,20 +86,35 @@ impl LureLogger {
         debug!("Handshake completed in {elapsed_ms}ms, next state: {next_state}");
     }
 
+    pub fn session_creation_timeout(addr: &SocketAddr, hostname: &str) {
+        debug!("Session creation timed out for {addr} (host '{hostname}')");
+    }
+
+    // ============================================================================
+    // Split Logging: Info/Debug (PII) + Warn/Error (Sentry-safe)
+    // ============================================================================
+
+    pub fn tcp_nodelay_failed(err: &std::io::Error) {
+        error!("Failed to set TCP_NODELAY: {err}");
+    }
+
     pub fn connection_closed(addr: &SocketAddr, err: &Error) {
+        // Keeping in debug as it's a standard flow, but sanitized just in case
+        // you ever bump connection closures to warn level.
         debug!("Connection {addr} closed: {}", format_anyhow_chain(err));
     }
 
     pub fn passthrough_unexpected_termination(
-        session_id: u64,
+        _session_id: u64,
         client: &SocketAddr,
         backend: &SocketAddr,
         tunnel: bool,
         err: &std::io::Error,
     ) {
-        warn!(
-            "Passthrough terminated abnormally: session_id={session_id} client={client} backend={backend} tunnel={tunnel} err={err}"
-        );
+        // 1. Stdout PII
+        info!("Passthrough termination context: client={client} backend={backend}");
+
+        // 2. Sentry sanitized
         sentry::with_scope(
             |scope| {
                 scope.set_tag("event", "passthrough_unexpected_termination");
@@ -107,38 +122,16 @@ impl LureLogger {
                 scope.set_tag("io_error_kind", format!("{:?}", err.kind()));
             },
             || {
-                sentry::capture_message(
-                    &format!(
-                        "Proxy tunnel abnormally terminated [{}]: {}",
-                        sentry_origin_label(tunnel),
-                        sentry_io_error_text(err)
-                    ),
-                    sentry::Level::Warning,
+                warn!(
+                    "Passthrough terminated abnormal err={}",
+                    sentry_io_error_text(err)
                 );
             },
         );
     }
 
-    pub fn session_replaced(client: &SocketAddr, old_session_id: u64, new_session_id: u64) {
-        warn!(
-            "Session map entry replaced for {client}: old_session_id={old_session_id} new_session_id={new_session_id}"
-        );
-        sentry::with_scope(
-            |scope| {
-                scope.set_tag("event", "session_replaced");
-                scope.set_tag("error_origin", "proxy");
-                scope.set_tag("old_session_id", old_session_id.to_string());
-                scope.set_tag("new_session_id", new_session_id.to_string());
-            },
-            || {
-                sentry::capture_message(
-                    &format!(
-                        "Session map entry replaced: old={old_session_id} new={new_session_id}"
-                    ),
-                    sentry::Level::Warning,
-                );
-            },
-        );
+    pub fn session_replaced(client: &SocketAddr, _old_session_id: u64, _new_session_id: u64) {
+        info!("Session replaced context: client={client}");
     }
 
     pub(crate) fn connection_error(
@@ -150,45 +143,33 @@ impl LureLogger {
             return;
         }
         let server_str = server.map(|s| format!(" -> {s}")).unwrap_or_default();
-        error!(
-            "connection error@{client}{server_str}: {}",
-            format_std_error_chain(err)
-        );
+
+        info!("Connection error context: {client}{server_str}");
+        error!("Connection error: {}", format_std_error_chain(err));
     }
 
     pub fn disconnect_warning(addr: &SocketAddr, reason: &str) {
-        warn!("Disconnecting client {addr}: {reason}");
+        info!("Disconnecting client context: {addr}");
+        warn!("Disconnecting client: {reason}");
     }
 
     pub fn disconnect_failure(addr: &SocketAddr, err: &Error) {
-        debug!(
-            "Failed to send disconnect to {addr}: {}",
-            format_anyhow_chain(err)
-        );
+        info!("Disconnect failure context: {addr}");
+        warn!("Failed to send disconnect: {}", format_anyhow_chain(err));
     }
 
     pub fn session_creation_failed(addr: &SocketAddr, hostname: &str, err: &Error) {
-        debug!(
-            "Failed to create session for {addr} (host '{hostname}'): {}",
-            format_anyhow_chain(err)
-        );
-    }
-
-    pub fn session_creation_timeout(addr: &SocketAddr, hostname: &str) {
-        debug!("Session creation timed out for {addr} (host '{hostname}')");
+        info!("Session creation failed context: addr={addr} host='{hostname}'");
+        warn!("Failed to create session: {}", format_anyhow_chain(err));
     }
 
     pub fn parser_failure(addr: &SocketAddr, stage: &str, err: &Error) {
-        warn!(
-            "Parser failed during {stage} for client {addr}: {}",
-            format_anyhow_chain(err)
-        );
+        info!("Parser failure context: client={addr}");
+        warn!("Parser failed during {stage}: {}", format_anyhow_chain(err));
     }
 
     pub fn tunnel_protocol_rejected(addr: &SocketAddr, version: u8, current: u8) {
-        warn!(
-            "Rejected tunnel protocol version {version} from {addr}; current supported version is {current}"
-        );
+        info!("Protocol rejected context: client={addr}");
         sentry::with_scope(
             |scope| {
                 scope.set_tag("event", "tunnel_protocol_rejected");
@@ -197,11 +178,8 @@ impl LureLogger {
                 scope.set_tag("tunnel_current_version", current.to_string());
             },
             || {
-                sentry::capture_message(
-                    &format!(
-                        "Rejected tunnel protocol version {version}; current version {current}"
-                    ),
-                    sentry::Level::Warning,
+                warn!(
+                    "Rejected tunnel protocol version {version}; current supported version is {current}"
                 );
             },
         );
@@ -213,9 +191,7 @@ impl LureLogger {
         current: u8,
         intent: tun::Intent,
     ) {
-        warn!(
-            "Accepted legacy tunnel protocol version {version} from {addr}; current version is {current} (intent={intent:?})"
-        );
+        info!("Legacy protocol context: client={addr}");
         sentry::with_scope(
             |scope| {
                 scope.set_tag("event", "tunnel_protocol_legacy");
@@ -225,11 +201,8 @@ impl LureLogger {
                 scope.set_tag("tunnel_intent", format!("{intent:?}"));
             },
             || {
-                sentry::capture_message(
-                    &format!(
-                        "Accepted legacy tunnel protocol version {version} (current {current}, intent {intent:?})"
-                    ),
-                    sentry::Level::Warning,
+                warn!(
+                    "Accepted legacy tunnel protocol version {version}; current version is {current} (intent={intent:?})"
                 );
             },
         );
@@ -241,16 +214,11 @@ impl LureLogger {
         stage: &str,
         err: &Error,
     ) {
-        match client {
-            Some(addr) => error!(
-                "Backend {stage} failed for client {addr} -> {backend}: {}",
-                format_anyhow_chain(err)
-            ),
-            None => error!(
-                "Backend {stage} failed for {backend}: {}",
-                format_anyhow_chain(err)
-            ),
-        }
+        let client_str = client
+            .map(|c| format!("client={c} -> "))
+            .unwrap_or_default();
+        info!("Backend failure context: {client_str}backend={backend}");
+        error!("Backend {stage} failed: {}", format_anyhow_chain(err));
     }
 
     pub fn deadline_missed(
@@ -266,7 +234,11 @@ impl LureLogger {
         if let Some(t) = target {
             context.push_str(&format!(" target={t}"));
         }
-        warn!("Deadline exceeded while {stage} (limit {duration:?}){context}");
+
+        if !context.is_empty() {
+            info!("Deadline exceeded context:{context}");
+        }
+        warn!("Deadline exceeded while {stage} (limit {duration:?})");
     }
 
     // ============================================================================
@@ -284,9 +256,8 @@ impl LureLogger {
         new_addr: &SocketAddr,
         new_version: u8,
     ) {
-        warn!(
-            "Tunnel agent replaced: token={token_prefix} old_peer={old_addr} old_version={old_version} \
-             new_peer={new_addr} new_version={new_version}"
+        info!(
+            "Tunnel agent replaced context: token={token_prefix} old_peer={old_addr} new_peer={new_addr} old_v={old_version} new_v={new_version}"
         );
     }
 
@@ -307,10 +278,7 @@ impl LureLogger {
         from: &SocketAddr,
         target: &SocketAddr,
     ) {
-        debug!(
-            "Tunnel forward request received: token={token_prefix} \
-             from={from} target={target}"
-        );
+        debug!("Tunnel forward request received: token={token_prefix} from={from} target={target}");
     }
 
     pub fn tunnel_session_timeout(session_prefix: &str) {
@@ -318,17 +286,20 @@ impl LureLogger {
     }
 
     pub fn tunnel_session_missing(session_prefix: &str) {
-        warn!("Tunnel session not found: session={session_prefix}");
+        info!("Tunnel session missing context: session={session_prefix}");
+        warn!("Tunnel session not found");
     }
 
     pub fn tunnel_agent_missing(token_prefix: &str, session_prefix: &str) {
-        warn!("Tunnel agent not found: token={token_prefix} session={session_prefix}");
+        info!("Tunnel agent missing context: token={token_prefix} session={session_prefix}");
+        warn!("Tunnel agent not found");
     }
 
     pub fn tunnel_token_mismatch(agent_token_prefix: &str, session_token_prefix: &str) {
-        warn!(
-            "Tunnel token mismatch (unauthorized accept attempt): agent={agent_token_prefix} session={session_token_prefix}"
+        info!(
+            "Tunnel token mismatch context: agent={agent_token_prefix} session={session_token_prefix}"
         );
+        warn!("Tunnel token mismatch (unauthorized accept attempt)");
     }
 
     pub fn tunnel_ingress_error(stage: &str, err: &Error) {
@@ -344,11 +315,13 @@ impl LureLogger {
         backend: Option<&str>,
         err: &ReportableError,
     ) {
-        let backend = backend
+        let backend_str = backend
             .map(|backend| format!(" backend={backend}"))
             .unwrap_or_default();
+
+        info!("Tunnel session error context: target={target}{backend_str}");
         error!(
-            "Tunnel session error during {stage} (target {target}{backend}): {}",
+            "Tunnel error on stage {stage}: {}",
             format_std_error_chain(err)
         );
     }

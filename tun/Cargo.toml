@@ -15,7 +15,13 @@ path = "src/bin/tun.rs"
 [dependencies]
 thiserror = "2.0"
 net = { git = "https://github.com/illnet/net.git" }
-tokio = { version = "1.48", default-features = false, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.48", default-features = false, features = [
+	"macros",
+	"rt-multi-thread",
+	"signal",
+	"sync",
+	"time",
+] }
 anyhow = "1.0"
 sha2 = "0.11"
 clap = { version = "4", features = ["derive", "env"] }
@@ -26,4 +32,11 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "1.1"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 libc = "0.2"
-sentry = { version = "0.47.0", default-features = false, features = ["contexts", "panic", "rustls", "ureq"] }
+sentry = { version = "0.48.0", default-features = false, features = [
+	"contexts",
+	"panic",
+	"rustls",
+	"ureq",
+	"log",
+	"logs",
+] }

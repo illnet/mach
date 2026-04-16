@@ -8,9 +8,7 @@ use std::{
 use anyhow::Context;
 use log::{debug, error, info, warn};
 
-use super::config::{
-    MIN_RECONNECT, MiniTunConfig, TunConfig, ensure_parent_dir, load_config, resolve_endpoint,
-};
+use super::config::{MiniTunConfig, TunConfig, ensure_parent_dir, load_config, resolve_endpoint};
 use crate::{AgentHello, Intent, ServerMsg};
 
 async fn read_server_msg(
@@ -22,6 +20,11 @@ async fn read_server_msg(
         if let Some((msg, consumed)) = crate::decode_server_msg(buf)? {
             buf.drain(..consumed);
             return Ok(msg);
+        }
+        // `read_server_msg` is used inside `tokio::select!`; a canceled read can drop the
+        // buffer after `mem::take`, so restore capacity before the next socket read.
+        if read_buf.is_empty() {
+            read_buf.resize(1024, 0);
         }
         let (n, next) = conn.read_chunk(std::mem::take(read_buf)).await?;
         *read_buf = next;
@@ -84,7 +87,10 @@ async fn send_health_beacon(ingress: SocketAddr, config: &TunConfig) -> anyhow::
     .context("timed out waiting for beacon ack")??;
 
     match ack {
-        ServerMsg::ForwardAck(token) if token == hmac => Ok(()),
+        ServerMsg::ForwardAck(token) if token == hmac => {
+            beacon.shutdown().await?;
+            Ok(())
+        }
         ServerMsg::ForwardAck(_) => anyhow::bail!("beacon ack token mismatch"),
         other => anyhow::bail!("unexpected beacon ack message: {other:?}"),
     }
@@ -133,8 +139,20 @@ struct SharedState {
 }
 
 const MAX_CONCURRENT_TUNNEL_SESSIONS: usize = 1000;
+const INITIAL_RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 const HEALTH_BEACON_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 const HEALTH_BEACON_WARN_EVERY: u8 = 3;
+
+fn initial_reconnect_delay(max_delay: std::time::Duration) -> std::time::Duration {
+    INITIAL_RECONNECT_BACKOFF.min(max_delay)
+}
+
+fn next_reconnect_delay(
+    current: std::time::Duration,
+    max_delay: std::time::Duration,
+) -> std::time::Duration {
+    current.saturating_mul(2).min(max_delay)
+}
 
 // =============================================================================
 // Session and Tunnel Handling
@@ -479,14 +497,18 @@ async fn listen_once(
 }
 
 async fn run(config: TunConfig, shared: Arc<SharedState>) {
-    let mut delay = std::time::Duration::from_millis(250);
+    let mut delay = {
+        let cfg = shared.config.read().await;
+        initial_reconnect_delay(cfg.reconnect.as_duration())
+    };
     let mut endpoint_idx: usize = 0;
 
     loop {
         let max_delay = {
             let cfg = shared.config.read().await;
-            cfg.reconnect.as_duration().max(MIN_RECONNECT)
+            cfg.reconnect.as_duration()
         };
+        delay = delay.min(max_delay);
 
         let endpoints = &config.endpoints;
         if endpoints.is_empty() {
@@ -504,7 +526,7 @@ async fn run(config: TunConfig, shared: Arc<SharedState>) {
                     config.label
                 );
                 tokio::time::sleep(delay).await;
-                delay = std::cmp::min(max_delay, delay.saturating_mul(2));
+                delay = next_reconnect_delay(delay, max_delay);
                 endpoint_idx = endpoint_idx.wrapping_add(1);
                 continue;
             }
@@ -512,7 +534,7 @@ async fn run(config: TunConfig, shared: Arc<SharedState>) {
 
         match listen_once(ingress, &config, Arc::clone(&shared)).await {
             Ok(()) => {
-                delay = std::time::Duration::from_millis(250);
+                delay = initial_reconnect_delay(max_delay);
             }
             Err(e) => {
                 error!(
@@ -521,7 +543,7 @@ async fn run(config: TunConfig, shared: Arc<SharedState>) {
                     config.label
                 );
                 tokio::time::sleep(delay).await;
-                delay = std::cmp::min(max_delay, delay.saturating_mul(2));
+                delay = next_reconnect_delay(delay, max_delay);
                 endpoint_idx = endpoint_idx.wrapping_add(1);
             }
         }
@@ -713,5 +735,43 @@ pub(super) async fn run_orchestrator(
         };
 
         apply_reload(&mut task_map, &mut active_configs, &shared, new_config).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{initial_reconnect_delay, next_reconnect_delay};
+
+    #[test]
+    fn reconnect_backoff_starts_at_initial_when_cap_is_larger() {
+        assert_eq!(
+            initial_reconnect_delay(Duration::from_secs(5)),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_uses_config_as_max_cap() {
+        let cap = Duration::from_millis(100);
+
+        assert_eq!(initial_reconnect_delay(cap), cap);
+        assert_eq!(next_reconnect_delay(cap, cap), cap);
+    }
+
+    #[test]
+    fn reconnect_backoff_doubles_until_config_cap() {
+        let cap = Duration::from_secs(1);
+
+        let first = initial_reconnect_delay(cap);
+        let second = next_reconnect_delay(first, cap);
+        let third = next_reconnect_delay(second, cap);
+        let fourth = next_reconnect_delay(third, cap);
+
+        assert_eq!(first, Duration::from_millis(250));
+        assert_eq!(second, Duration::from_millis(500));
+        assert_eq!(third, Duration::from_secs(1));
+        assert_eq!(fourth, Duration::from_secs(1));
     }
 }
