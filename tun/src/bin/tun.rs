@@ -15,7 +15,8 @@ fn main() {
     #[cfg(not(debug_assertions))]
     {
         let logger = sentry::integrations::log::SentryLogger::with_dest(
-            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")),
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+                .build(),
         );
         log::set_boxed_logger(Box::new(logger)).unwrap();
         log::set_max_level(log::LevelFilter::Trace);
