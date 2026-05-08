@@ -50,6 +50,10 @@ impl TunnelRegistry {
             let mut pending = self.pending.write().await;
             pending.clear();
         }
+        {
+            let mut pending_query = self.pending_query.write().await;
+            pending_query.clear();
+        }
         log::info!("tunnel: cleared runtime token/zone/pending state");
     }
 
@@ -220,7 +224,7 @@ impl TunnelRegistry {
                         request,
                         client_addr,
                     } => {
-                        if agent_version >= tun::VERSION {
+                        if agent_version >= tun::V4_VERSION {
                             // v4+: keep the target inline and encode a sentinel client address
                             // when no proxy metadata is being forwarded.
                             tun::encode_server_msg(
@@ -243,6 +247,22 @@ impl TunnelRegistry {
                                 &mut buf,
                             );
                         }
+                    }
+                    TunnelCommand::QueryRequest {
+                        session,
+                        protocol_version,
+                        server_address,
+                        target,
+                    } => {
+                        tun::encode_server_msg(
+                            &tun::ServerMsg::QueryRequestV5(tun::QueryRequestV5Msg {
+                                session: session.0,
+                                protocol_version,
+                                server_address,
+                                target,
+                            }),
+                            &mut buf,
+                        );
                     }
                 }
                 if connection.write_all(buf).await.is_err() {
@@ -351,6 +371,10 @@ impl TunnelRegistry {
         }
     }
 
+    pub async fn agent_version(&self, key_id: TokenKeyId) -> Option<u8> {
+        self.agents.read().await.get(&key_id).map(|agent| agent.version)
+    }
+
     pub async fn forward_request_to_agent(
         &self,
         key_id: TokenKeyId,
@@ -400,6 +424,60 @@ impl TunnelRegistry {
             );
             anyhow::bail!("failed to notify tunnel agent")
         }
+    }
+
+    pub async fn request_query_from_agent(
+        &self,
+        key_id: TokenKeyId,
+        session: SessionToken,
+        protocol_version: i32,
+        server_address: SocketAddr,
+        target: SocketAddr,
+    ) -> anyhow::Result<oneshot::Receiver<TunnelStatusResponse>> {
+        {
+            let tokens = self.tokens.read().await;
+            if !tokens.contains_key(&key_id) {
+                anyhow::bail!("tunnel token not registered for key_id");
+            }
+        }
+
+        let agent_tx = { self.agents.read().await.get(&key_id).map(|a| a.tx.clone()) };
+        let Some(agent_tx) = agent_tx else {
+            anyhow::bail!("no active tunnel agent registered for key_id");
+        };
+
+        let (tx, rx) = oneshot::channel();
+        self.pending_query.write().await.insert(session, tx);
+
+        if agent_tx
+            .send(TunnelCommand::QueryRequest {
+                session,
+                protocol_version,
+                server_address,
+                target,
+            })
+            .await
+            .is_ok()
+        {
+            Ok(rx)
+        } else {
+            self.pending_query.write().await.remove(&session);
+            anyhow::bail!("failed to notify tunnel agent for query")
+        }
+    }
+
+    pub async fn accept_query_response(
+        &self,
+        session: SessionToken,
+        json: String,
+        agent_version: u8,
+    ) -> anyhow::Result<()> {
+        let Some(respond) = self.pending_query.write().await.remove(&session) else {
+            anyhow::bail!("no pending tunnel query session");
+        };
+        respond
+            .send(TunnelStatusResponse { json, agent_version })
+            .map_err(|_| anyhow::anyhow!("pending tunnel query closed"))
     }
 
     pub async fn accept_connect(

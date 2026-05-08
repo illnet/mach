@@ -35,6 +35,7 @@ fn tunnel_protocol_agent_hello_roundtrip() {
         hmac: [25u8; 32],
         session: Some([21u8; 32]),
         forward: None,
+        query: None,
     };
 
     let mut buf = Vec::new();
@@ -68,6 +69,7 @@ fn tunnel_protocol_agent_hello_roundtrip() {
         hmac: [23u8; 32],
         session: None,
         forward: None,
+        query: None,
     };
 
     let mut buf2 = Vec::new();
@@ -112,6 +114,7 @@ fn tunnel_protocol_agent_hello_forward_roundtrip() {
                 45678,
             )),
         }),
+        query: None,
     };
 
     let mut buf = Vec::new();

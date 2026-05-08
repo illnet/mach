@@ -386,6 +386,7 @@ pub(super) fn run_sign(args: SignArgs) -> anyhow::Result<()> {
             Some(parse_hex_exact::<32>(&s).map_err(|e| anyhow::anyhow!("{e}"))?)
         }
         Intent::Forward => anyhow::bail!("forward intent is not supported by `sign`"),
+        Intent::Query => anyhow::bail!("query intent is not supported by `sign`"),
     };
 
     let hmac = crate::compute_agent_hmac(
