@@ -50,6 +50,10 @@ impl TunnelRegistry {
             let mut pending = self.pending.write().await;
             pending.clear();
         }
+        {
+            let mut pending_query = self.pending_query.write().await;
+            pending_query.clear();
+        }
         log::info!("tunnel: cleared runtime token/zone/pending state");
     }
 
@@ -176,12 +180,16 @@ impl TunnelRegistry {
             .agent_gen
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        if agent_version >= tun::VERSION {
+            let _ = tx.try_send(TunnelCommand::Affirmation([0u8; 32]));
+        }
+
         LureLogger::tunnel_agent_registered(&key_id_prefix(&key_id.0));
 
-        // Spawn the task that will push offers to the agent. If a new agent registers with the
-        // same key_id (restart), we abort the old task and replace it.
+        // Spawn the task that serializes all writes to the agent. If a new agent registers with the
+        // same key_id, dropping the old sender lets the old task drain and close cleanly.
         let registry = Arc::clone(self);
-        let task = spawn_named("tunnel-agent-listener", async move {
+        let _task = spawn_named("tunnel-agent-listener", async move {
             // Keep listener socket active during idle periods so intermediate NAT/load-balancer
             // state does not expire the long-lived listen channel.
             const LISTENER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -192,27 +200,31 @@ impl TunnelRegistry {
                 let maybe_cmd = tokio::select! {
                     cmd = rx.recv() => cmd,
                     _ = keepalive_interval.tick(), if agent_version >= tun::VERSION => {
-                        let mut keepalive = Vec::new();
-                        tun::encode_server_msg(&tun::ServerMsg::ForwardAck([0u8; 32]), &mut keepalive);
-                        if connection.write_all(keepalive).await.is_err() {
-                            break;
-                        }
-                        continue;
+                        Some(TunnelCommand::Affirmation([0u8; 32]))
                     }
                 };
                 let Some(cmd) = maybe_cmd else {
+                    if agent_version >= tun::VERSION {
+                        let mut buf = Vec::new();
+                        tun::encode_server_msg(&tun::ServerMsg::ForwardAck([0u8; 32]), &mut buf);
+                        let _ = connection.write_all(buf).await;
+                        let _ = connection.shutdown().await;
+                    }
                     break;
                 };
 
                 let mut buf = Vec::new();
                 match cmd {
+                    TunnelCommand::Affirmation(token) => {
+                        tun::encode_server_msg(&tun::ServerMsg::ForwardAck(token), &mut buf);
+                    }
                     TunnelCommand::ForwardRequest {
                         session,
                         ttl,
                         request,
                         client_addr,
                     } => {
-                        if agent_version >= tun::VERSION {
+                        if agent_version >= tun::V4_VERSION {
                             // v4+: keep the target inline and encode a sentinel client address
                             // when no proxy metadata is being forwarded.
                             tun::encode_server_msg(
@@ -235,6 +247,22 @@ impl TunnelRegistry {
                                 &mut buf,
                             );
                         }
+                    }
+                    TunnelCommand::QueryRequest {
+                        session,
+                        protocol_version,
+                        server_address,
+                        target,
+                    } => {
+                        tun::encode_server_msg(
+                            &tun::ServerMsg::QueryRequestV5(tun::QueryRequestV5Msg {
+                                session: session.0,
+                                protocol_version,
+                                server_address,
+                                target,
+                            }),
+                            &mut buf,
+                        );
                     }
                 }
                 if connection.write_all(buf).await.is_err() {
@@ -261,7 +289,6 @@ impl TunnelRegistry {
                     version: agent_version,
                     peer_addr,
                     tx: tx.clone(),
-                    task,
                     connected_at: Instant::now(),
                     last_beacon_at: Instant::now(),
                     offers_sent: 0,
@@ -277,7 +304,7 @@ impl TunnelRegistry {
                 &peer_addr,
                 agent_version,
             );
-            old.task.abort();
+            drop(old.tx);
         }
 
         Ok(())
@@ -344,6 +371,10 @@ impl TunnelRegistry {
         }
     }
 
+    pub async fn agent_version(&self, key_id: TokenKeyId) -> Option<u8> {
+        self.agents.read().await.get(&key_id).map(|agent| agent.version)
+    }
+
     pub async fn forward_request_to_agent(
         &self,
         key_id: TokenKeyId,
@@ -393,6 +424,75 @@ impl TunnelRegistry {
             );
             anyhow::bail!("failed to notify tunnel agent")
         }
+    }
+
+    pub async fn request_query_from_agent(
+        &self,
+        key_id: TokenKeyId,
+        session: SessionToken,
+        protocol_version: i32,
+        server_address: SocketAddr,
+        target: SocketAddr,
+    ) -> anyhow::Result<oneshot::Receiver<TunnelStatusResponse>> {
+        {
+            let tokens = self.tokens.read().await;
+            if !tokens.contains_key(&key_id) {
+                anyhow::bail!("tunnel token not registered for key_id");
+            }
+        }
+
+        let agent_tx = { self.agents.read().await.get(&key_id).map(|a| a.tx.clone()) };
+        let Some(agent_tx) = agent_tx else {
+            anyhow::bail!("no active tunnel agent registered for key_id");
+        };
+
+        let (tx, rx) = oneshot::channel();
+        self.pending_query.write().await.insert(session, tx);
+
+        if agent_tx
+            .send(TunnelCommand::QueryRequest {
+                session,
+                protocol_version,
+                server_address,
+                target,
+            })
+            .await
+            .is_ok()
+        {
+            Ok(rx)
+        } else {
+            self.pending_query.write().await.remove(&session);
+            anyhow::bail!("failed to notify tunnel agent for query")
+        }
+    }
+
+    pub async fn accept_query_response(
+        &self,
+        key_id: TokenKeyId,
+        timestamp: u64,
+        hmac: [u8; 32],
+        session: SessionToken,
+        json: String,
+        agent_version: u8,
+    ) -> anyhow::Result<()> {
+        self.validate_hmac(
+            &key_id,
+            timestamp,
+            tun::Intent::Query,
+            Some(&session.0),
+            None,
+            0,
+            None,
+            &hmac,
+        )
+        .await?;
+
+        let Some(respond) = self.pending_query.write().await.remove(&session) else {
+            anyhow::bail!("no pending tunnel query session");
+        };
+        respond
+            .send(TunnelStatusResponse { json, agent_version })
+            .map_err(|_| anyhow::anyhow!("pending tunnel query closed"))
     }
 
     pub async fn accept_connect(
@@ -489,8 +589,10 @@ impl TunnelRegistry {
         let mut agents = self.agents.write().await;
         if let Some(agent) = agents.get_mut(&key_id) {
             agent.last_beacon_at = now;
+            return Ok(());
         }
-        Ok(())
+
+        anyhow::bail!("no active tunnel agent registered for beacon key_id")
     }
 
     pub async fn inspect_snapshot(&self) -> crate::telemetry::inspect::TunnelInspectSnapshot {

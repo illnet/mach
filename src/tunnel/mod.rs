@@ -203,6 +203,11 @@ pub struct AcceptedTunnelConnection {
     pub agent_version: u8,
 }
 
+pub struct TunnelStatusResponse {
+    pub json: String,
+    pub agent_version: u8,
+}
+
 /// Shared runtime registry for tunnel tokens, agents, and pending sessions.
 pub struct TunnelRegistry {
     /// Token registry by `key_id`
@@ -215,6 +220,8 @@ pub struct TunnelRegistry {
     agent_gen: std::sync::atomic::AtomicU64,
     /// Pending sessions
     pending: RwLock<HashMap<SessionToken, PendingSession>>,
+    /// Pending query responses
+    pending_query: RwLock<HashMap<SessionToken, oneshot::Sender<TunnelStatusResponse>>>,
     /// Expired sessions counter
     expired_sessions: std::sync::atomic::AtomicU64,
     /// Cached endpoint list from bootstrap poller
@@ -230,8 +237,6 @@ struct AgentRecord {
     peer_addr: SocketAddr,
     /// Channel used by the registry to send [`TunnelCommand`] offers to this agent task.
     tx: mpsc::Sender<TunnelCommand>,
-    /// Listener task that owns the agent socket; abort on replacement/eviction.
-    task: tokio::task::JoinHandle<()>,
     /// Instant when the current agent registration was created.
     connected_at: Instant,
     /// Instant of the latest health beacon; expected to be >= `connected_at`.
@@ -248,11 +253,18 @@ struct PendingSession {
 }
 
 enum TunnelCommand {
+    Affirmation([u8; 32]),
     ForwardRequest {
         session: SessionToken,
         ttl: u8,
         request: tun::TunnelAgentRequest,
         client_addr: Option<SocketAddr>,
+    },
+    QueryRequest {
+        session: SessionToken,
+        protocol_version: i32,
+        server_address: SocketAddr,
+        target: SocketAddr,
     },
 }
 
@@ -263,6 +275,7 @@ impl Default for TunnelRegistry {
             zones: RwLock::new(HashMap::new()),
             agents: RwLock::new(HashMap::new()),
             pending: RwLock::new(HashMap::new()),
+            pending_query: RwLock::new(HashMap::new()),
             expired_sessions: std::sync::atomic::AtomicU64::new(0),
             agent_gen: std::sync::atomic::AtomicU64::new(1),
             endpoint_cache: tokio::sync::RwLock::new(Vec::new()),
@@ -407,6 +420,7 @@ impl TunnelAgentController {
                 request: request.tunnel_agent_request,
                 client_addr: request.client_addr,
             }),
+            query: None,
         };
         let mut buf = Vec::new();
         tun::encode_agent_hello(&hello, &mut buf)?;

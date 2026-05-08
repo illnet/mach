@@ -20,12 +20,16 @@ pub enum TunnelError {
     InvalidMsgKind(u8),
     #[error("invalid address family {0}")]
     InvalidAddrFamily(u8),
+    #[error("payload too large for wire format")]
+    PayloadTooLarge,
 }
 
 /// Fixed protocol magic prefix.
 pub const MAGIC: [u8; 4] = *b"LTUN";
 /// Current tunnel wire protocol version.
-pub const VERSION: u8 = 4;
+pub const VERSION: u8 = 5;
+/// Previous wire format version with inline target + client address support.
+pub const V4_VERSION: u8 = 4;
 /// Previous wire format version with forward intent support.
 pub const V3_VERSION: u8 = 3;
 /// Legacy wire format version.
@@ -40,6 +44,7 @@ pub enum Intent {
     Connect = 2,
     Forward = 3,
     Beacon = 4,
+    Query = 5,
 }
 
 impl Intent {
@@ -49,6 +54,7 @@ impl Intent {
             2 => Ok(Self::Connect),
             3 => Ok(Self::Forward),
             4 => Ok(Self::Beacon),
+            5 => Ok(Self::Query),
             other => Err(TunnelError::InvalidIntent(other)),
         }
     }
@@ -71,6 +77,7 @@ pub struct AgentHello {
     pub hmac: [u8; 32],
     pub session: Option<[u8; 32]>,
     pub forward: Option<ForwardHello>,
+    pub query: Option<QueryResponseV5Msg>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +108,22 @@ pub struct ForwardRequestV4Msg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Version 5 query request executed by the tunnel agent against the backend.
+pub struct QueryRequestV5Msg {
+    pub session: [u8; 32],
+    pub protocol_version: i32,
+    pub server_address: SocketAddr,
+    pub target: SocketAddr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Version 5 query response carrying backend status JSON.
+pub struct QueryResponseV5Msg {
+    pub session: [u8; 32],
+    pub json: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 /// Server-to-agent message discriminants.
 pub enum ServerMsgKind {
@@ -109,9 +132,11 @@ pub enum ServerMsgKind {
     ForwardAck = 3,
     ForwardRequest = 4,
     ForwardRequestV4 = 5,
+    QueryRequestV5 = 6,
+    QueryResponseV5 = 7,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// Decoded server-to-agent messages.
 pub enum ServerMsg {
     SessionOffer([u8; 32]),
@@ -119,6 +144,8 @@ pub enum ServerMsg {
     ForwardAck([u8; 32]),
     ForwardRequest(ForwardRequestMsg),
     ForwardRequestV4(ForwardRequestV4Msg),
+    QueryRequestV5(QueryRequestV5Msg),
+    QueryResponseV5(QueryResponseV5Msg),
 }
 
 /// Connects to tunnel server as agent.
@@ -145,7 +172,11 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
     }
 
     let version = buf[4];
-    if version != VERSION && version != V3_VERSION && version != LEGACY_VERSION {
+    if version != VERSION
+        && version != V4_VERSION
+        && version != V3_VERSION
+        && version != LEGACY_VERSION
+    {
         return Err(TunnelError::UnsupportedVersion(version));
     }
 
@@ -159,7 +190,10 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
     if version < V3_VERSION && matches!(intent, Intent::Forward) {
         return Err(TunnelError::UnsupportedVersion(version));
     }
-    if version < VERSION && matches!(intent, Intent::Beacon) {
+    if version < V4_VERSION && matches!(intent, Intent::Beacon) {
+        return Err(TunnelError::UnsupportedVersion(version));
+    }
+    if version < VERSION && matches!(intent, Intent::Query) {
         return Err(TunnelError::UnsupportedVersion(version));
     }
 
@@ -174,8 +208,8 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
     hmac.copy_from_slice(&buf[22..54]);
 
     let mut consumed = 54;
-    let (session, forward) = match intent {
-        Intent::Listen => (None, None),
+    let (session, forward, query) = match intent {
+        Intent::Listen => (None, None, None),
         Intent::Connect => {
             if buf.len() < consumed + 32 {
                 return Ok(None);
@@ -183,7 +217,7 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
             let mut session = [0u8; 32];
             session.copy_from_slice(&buf[consumed..consumed + 32]);
             consumed += 32;
-            (Some(session), None)
+            (Some(session), None, None)
         }
         Intent::Forward => {
             if buf.len() < consumed + 33 {
@@ -202,7 +236,7 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
                 return Ok(None);
             };
             consumed += consumed_to;
-            let client_addr = if version >= VERSION {
+            let client_addr = if version >= V4_VERSION {
                 let Some((client_addr, consumed_client_addr)) =
                     decode_socket_addr_payload(&buf[consumed..])?
                 else {
@@ -221,9 +255,32 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
                     request: TunnelAgentRequest { from, to },
                     client_addr,
                 }),
+                None,
             )
         }
-        Intent::Beacon => (None, None),
+        Intent::Beacon => (None, None, None),
+        Intent::Query => {
+            if buf.len() < consumed + 32 + 2 {
+                return Ok(None);
+            }
+            let mut session = [0u8; 32];
+            session.copy_from_slice(&buf[consumed..consumed + 32]);
+            consumed += 32;
+            let len = u16::from_be_bytes([buf[consumed], buf[consumed + 1]]) as usize;
+            consumed += 2;
+            if buf.len() < consumed + len {
+                return Ok(None);
+            }
+            let json = std::str::from_utf8(&buf[consumed..consumed + len])
+                .map_err(|_| TunnelError::ShortBuffer)?
+                .to_owned();
+            consumed += len;
+            (
+                None,
+                None,
+                Some(QueryResponseV5Msg { session, json }),
+            )
+        }
     };
 
     Ok(Some((
@@ -235,6 +292,7 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
             hmac,
             session,
             forward,
+            query,
         },
         consumed,
     )))
@@ -242,25 +300,34 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
 
 /// Encodes `AgentHello` into output buffer.
 pub fn encode_agent_hello(hello: &AgentHello, out: &mut Vec<u8>) -> Result<(), TunnelError> {
+    if hello.version < VERSION && matches!(hello.intent, Intent::Query) {
+        return Err(TunnelError::UnsupportedVersion(hello.version));
+    }
+
     // Validate intent/session invariant: only Connect may have a session, others must not
     match hello.intent {
         Intent::Connect => {
-            if hello.session.is_none() || hello.forward.is_some() {
+            if hello.session.is_none() || hello.forward.is_some() || hello.query.is_some() {
                 return Err(TunnelError::InvalidIntent(hello.intent as u8));
             }
         }
         Intent::Listen => {
-            if hello.session.is_some() || hello.forward.is_some() {
+            if hello.session.is_some() || hello.forward.is_some() || hello.query.is_some() {
                 return Err(TunnelError::InvalidIntent(hello.intent as u8));
             }
         }
         Intent::Forward => {
-            if hello.session.is_some() || hello.forward.is_none() {
+            if hello.session.is_some() || hello.forward.is_none() || hello.query.is_some() {
                 return Err(TunnelError::InvalidIntent(hello.intent as u8));
             }
         }
         Intent::Beacon => {
-            if hello.session.is_some() || hello.forward.is_some() {
+            if hello.session.is_some() || hello.forward.is_some() || hello.query.is_some() {
+                return Err(TunnelError::InvalidIntent(hello.intent as u8));
+            }
+        }
+        Intent::Query => {
+            if hello.session.is_some() || hello.forward.is_some() || hello.query.is_none() {
                 return Err(TunnelError::InvalidIntent(hello.intent as u8));
             }
         }
@@ -283,7 +350,7 @@ pub fn encode_agent_hello(hello: &AgentHello, out: &mut Vec<u8>) -> Result<(), T
             out.push(forward.ttl);
             encode_socket_addr_payload(forward.request.from, out);
             encode_socket_addr_payload(forward.request.to, out);
-            if hello.version >= VERSION {
+            if hello.version >= V4_VERSION {
                 encode_socket_addr_payload(
                     forward_client_addr_wire_value(forward.client_addr),
                     out,
@@ -291,6 +358,14 @@ pub fn encode_agent_hello(hello: &AgentHello, out: &mut Vec<u8>) -> Result<(), T
             }
         }
         Intent::Beacon => {}
+        Intent::Query => {
+            let query = hello.query.as_ref().expect("validated above");
+            out.extend_from_slice(&query.session);
+            let json = query.json.as_bytes();
+            let len = u16::try_from(json.len()).map_err(|_| TunnelError::PayloadTooLarge)?;
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(json);
+        }
     }
     Ok(())
 }
@@ -324,6 +399,22 @@ pub fn encode_server_msg(msg: &ServerMsg, out: &mut Vec<u8>) {
             encode_socket_addr_payload(msg.request.from, out);
             encode_socket_addr_payload(msg.request.to, out);
             encode_socket_addr_payload(forward_client_addr_wire_value(msg.client_addr), out);
+        }
+        ServerMsg::QueryRequestV5(msg) => {
+            out.push(ServerMsgKind::QueryRequestV5 as u8);
+            out.extend_from_slice(&msg.session);
+            out.extend_from_slice(&msg.protocol_version.to_be_bytes());
+            encode_socket_addr_payload(msg.server_address, out);
+            encode_socket_addr_payload(msg.target, out);
+        }
+        ServerMsg::QueryResponseV5(msg) => {
+            out.push(ServerMsgKind::QueryResponseV5 as u8);
+            out.extend_from_slice(&msg.session);
+            let json = msg.json.as_bytes();
+            let len = u16::try_from(json.len())
+                .expect("query response json exceeds u16::MAX wire limit");
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(json);
         }
     }
 }
@@ -408,6 +499,50 @@ pub fn decode_server_msg(buf: &[u8]) -> Result<Option<(ServerMsg, usize)>, Tunne
                     client_addr: decode_forward_client_addr(client_addr),
                 }),
                 pos,
+            )))
+        }
+        x if x == ServerMsgKind::QueryRequestV5 as u8 => {
+            if buf.len() < 37 {
+                return Ok(None);
+            }
+            let mut session = [0u8; 32];
+            session.copy_from_slice(&buf[1..33]);
+            let protocol_version = i32::from_be_bytes([buf[33], buf[34], buf[35], buf[36]]);
+            let mut pos = 37;
+            let Some((server_address, n)) = decode_socket_addr_payload(&buf[pos..])? else {
+                return Ok(None);
+            };
+            pos += n;
+            let Some((target, n)) = decode_socket_addr_payload(&buf[pos..])? else {
+                return Ok(None);
+            };
+            pos += n;
+            Ok(Some((
+                ServerMsg::QueryRequestV5(QueryRequestV5Msg {
+                    session,
+                    protocol_version,
+                    server_address,
+                    target,
+                }),
+                pos,
+            )))
+        }
+        x if x == ServerMsgKind::QueryResponseV5 as u8 => {
+            if buf.len() < 35 {
+                return Ok(None);
+            }
+            let mut session = [0u8; 32];
+            session.copy_from_slice(&buf[1..33]);
+            let len = u16::from_be_bytes([buf[33], buf[34]]) as usize;
+            if buf.len() < 35 + len {
+                return Ok(None);
+            }
+            let json = std::str::from_utf8(&buf[35..35 + len])
+                .map_err(|_| TunnelError::ShortBuffer)?
+                .to_owned();
+            Ok(Some((
+                ServerMsg::QueryResponseV5(QueryResponseV5Msg { session, json }),
+                35 + len,
             )))
         }
         other => Err(TunnelError::InvalidMsgKind(other)),
@@ -544,6 +679,7 @@ mod tests {
             hmac: [42u8; 32],
             session: None,
             forward: None,
+            query: None,
         };
         let mut buf = Vec::new();
         assert!(encode_agent_hello(&hello, &mut buf).is_ok());
@@ -566,6 +702,7 @@ mod tests {
             hmac: [43u8; 32],
             session: Some([44u8; 32]),
             forward: None,
+            query: None,
         };
         let mut buf = Vec::new();
         assert!(encode_agent_hello(&hello, &mut buf).is_ok());
@@ -589,6 +726,7 @@ mod tests {
             hmac: [43u8; 32],
             session: None,
             forward: None,
+            query: None,
         };
         let mut buf = Vec::new();
         assert!(encode_agent_hello(&hello, &mut buf).is_err());
@@ -604,6 +742,7 @@ mod tests {
             hmac: [42u8; 32],
             session: Some([44u8; 32]),
             forward: None,
+            query: None,
         };
         let mut buf = Vec::new();
         assert!(encode_agent_hello(&hello, &mut buf).is_err());
@@ -623,6 +762,7 @@ mod tests {
             hmac: [42u8; 32],
             session: None,
             forward: None,
+            query: None,
         };
         let mut buf = Vec::new();
         encode_agent_hello(&hello, &mut buf).unwrap();
@@ -647,6 +787,7 @@ mod tests {
             hmac: [43u8; 32],
             session: Some([44u8; 32]),
             forward: None,
+            query: None,
         };
         let mut buf = Vec::new();
         encode_agent_hello(&hello, &mut buf).unwrap();
@@ -671,6 +812,7 @@ mod tests {
             hmac: [55u8; 32],
             session: None,
             forward: None,
+            query: None,
         };
         let mut buf = Vec::new();
         encode_agent_hello(&hello, &mut buf).unwrap();
@@ -691,6 +833,7 @@ mod tests {
             hmac: [56u8; 32],
             session: Some([57u8; 32]),
             forward: None,
+            query: None,
         };
         let mut buf = Vec::new();
         encode_agent_hello(&hello, &mut buf).unwrap();
@@ -724,6 +867,7 @@ mod tests {
                     41234,
                 )),
             }),
+            query: None,
         };
         let mut buf = Vec::new();
         encode_agent_hello(&hello, &mut buf).unwrap();
@@ -764,6 +908,7 @@ mod tests {
                 request,
                 client_addr: None,
             }),
+            query: None,
         };
         let mut buf = Vec::new();
         encode_agent_hello(&hello, &mut buf).unwrap();
@@ -795,6 +940,7 @@ mod tests {
                 },
                 client_addr: None,
             }),
+            query: None,
         };
         let mut buf = Vec::new();
         encode_agent_hello(&hello, &mut buf).unwrap();

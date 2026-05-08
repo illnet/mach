@@ -674,6 +674,7 @@ async fn run_tun_agent(
             hmac,
             session: None,
             forward: None,
+            query: None,
         },
     )
     .await?;
@@ -757,6 +758,7 @@ async fn handle_session(
             hmac,
             session: Some(session),
             forward: None,
+            query: None,
         },
     )
     .await?;

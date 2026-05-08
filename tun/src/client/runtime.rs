@@ -3,10 +3,12 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::Context;
 use log::{debug, error, info, warn};
+use net::mc::{HandshakeC2s, HandshakeNextState, PacketDecoder, StatusRequestC2s, StatusResponseS2c, encode_packet};
 
 use super::config::{MiniTunConfig, TunConfig, ensure_parent_dir, load_config, resolve_endpoint};
 use crate::{AgentHello, Intent, ServerMsg};
@@ -73,6 +75,7 @@ async fn send_health_beacon(ingress: SocketAddr, config: &TunConfig) -> anyhow::
             hmac,
             session: None,
             forward: None,
+            query: None,
         },
     )
     .await?;
@@ -142,6 +145,7 @@ const MAX_CONCURRENT_TUNNEL_SESSIONS: usize = 1000;
 const INITIAL_RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 const HEALTH_BEACON_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 const HEALTH_BEACON_WARN_EVERY: u8 = 3;
+const HEALTH_BEACON_RECONNECT_AFTER: u8 = 2;
 
 fn initial_reconnect_delay(max_delay: std::time::Duration) -> std::time::Duration {
     INITIAL_RECONNECT_BACKOFF.min(max_delay)
@@ -240,6 +244,7 @@ async fn handle_session(
             hmac,
             session: Some(session),
             forward: None,
+            query: None,
         },
     )
     .await?;
@@ -318,6 +323,107 @@ async fn handle_session(
     Ok(())
 }
 
+async fn handle_query(
+    ingress: SocketAddr,
+    config: &TunConfig,
+    query: crate::QueryRequestV5Msg,
+) -> anyhow::Result<()> {
+    const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+    tokio::time::timeout(QUERY_TIMEOUT, handle_query_inner(ingress, config, query.clone()))
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("query timed out")))
+}
+
+async fn handle_query_inner(
+    ingress: SocketAddr,
+    config: &TunConfig,
+    query: crate::QueryRequestV5Msg,
+) -> anyhow::Result<()> {
+    let session_prefix = format!("{:02x}", query.session[0]);
+    info!(
+        "query request: session={session_prefix} target={}",
+        query.target
+    );
+
+    let mut target_conn = net::sock::LureConnection::connect(query.target).await?;
+    tune_socket(&target_conn);
+
+    let hs = HandshakeC2s {
+        protocol_version: query.protocol_version,
+        server_address: &query.server_address.to_string(),
+        server_port: query.server_address.port(),
+        next_state: HandshakeNextState::Status,
+    };
+    let mut enc_buf = Vec::new();
+    encode_packet(&mut enc_buf, &hs)?;
+    target_conn.write_all(enc_buf).await?;
+    let mut enc_buf = Vec::new();
+    encode_packet(&mut enc_buf, &StatusRequestC2s)?;
+    target_conn.write_all(enc_buf).await?;
+
+    let mut read_buf: Vec<u8> = vec![0u8; 1024];
+    let mut dec = PacketDecoder::new();
+    loop {
+        let (n, next) = target_conn.read_chunk(read_buf).await?;
+        read_buf = next;
+        if n == 0 {
+            anyhow::bail!("backend closed during status query");
+        }
+        dec.queue_slice(&read_buf[..n]);
+        if let Some(frame) = dec.try_next_packet()? {
+            if frame.id != StatusResponseS2c::ID {
+                anyhow::bail!(
+                    "unexpected backend packet id {} during status query",
+                    frame.id
+                );
+            }
+            let mut body = frame.body.as_slice();
+            let response = StatusResponseS2c::decode_body(&mut body)?;
+            let json = response.json.to_owned();
+
+            let mut agent_conn = crate::connect_agent(ingress).await?;
+            tune_socket(&agent_conn);
+
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            let hmac = crate::compute_agent_hmac(
+                &config.secret,
+                &config.key_id,
+                timestamp,
+                Intent::Query,
+                Some(&query.session),
+                None,
+                0,
+                None,
+            );
+
+            send_agent_hello(
+                &mut agent_conn,
+                AgentHello {
+                    version: crate::VERSION,
+                    intent: Intent::Query,
+                    key_id: config.key_id,
+                    timestamp,
+                    hmac,
+                    session: None,
+                    forward: None,
+                    query: Some(crate::QueryResponseV5Msg {
+                        session: query.session,
+                        json,
+                    }),
+                },
+            )
+            .await?;
+
+            info!(
+                "query response sent: session={session_prefix}",
+            );
+            return Ok(());
+        }
+    }
+}
+
 async fn listen_once(
     ingress: SocketAddr,
     config: &TunConfig,
@@ -355,6 +461,7 @@ async fn listen_once(
             hmac,
             session: None,
             forward: None,
+            query: None,
         },
     )
     .await?;
@@ -399,9 +506,14 @@ async fn listen_once(
                             || beacon_failures.is_multiple_of(HEALTH_BEACON_WARN_EVERY)
                         {
                             warn!(
-                                "health beacon failed (non-fatal): key_id={} endpoint={ingress} failures={} err={err}",
+                                "health beacon failed: key_id={} endpoint={ingress} failures={} err={err}",
                                 config.label,
                                 beacon_failures
+                            );
+                        }
+                        if beacon_failures >= HEALTH_BEACON_RECONNECT_AFTER {
+                            anyhow::bail!(
+                                "health beacon failed {beacon_failures} times; reconnecting listen channel"
                             );
                         }
                     }
@@ -411,9 +523,14 @@ async fn listen_once(
                             || beacon_failures.is_multiple_of(HEALTH_BEACON_WARN_EVERY)
                         {
                             warn!(
-                                "health beacon probe task dropped (non-fatal): key_id={} endpoint={ingress} failures={}",
+                                "health beacon probe task dropped: key_id={} endpoint={ingress} failures={}",
                                 config.label,
                                 beacon_failures
+                            );
+                        }
+                        if beacon_failures >= HEALTH_BEACON_RECONNECT_AFTER {
+                            anyhow::bail!(
+                                "health beacon probe dropped {beacon_failures} times; reconnecting listen channel"
                             );
                         }
                     }
@@ -432,18 +549,41 @@ async fn listen_once(
         };
         let (session, ingress, client_addr, target_override) = match msg {
             ServerMsg::ForwardRequest(forward) => {
-                // v3: agent must wait for TargetAddr from server; no client IP
                 (forward.session, forward.request.from, None, None)
             }
             ServerMsg::ForwardRequestV4(forward) => {
-                // v4: target is known upfront; client_addr is present only when
-                // Lure wants the tunnel to emit PROXY protocol.
                 (
                     forward.session,
                     forward.request.from,
                     forward.client_addr,
                     Some(forward.request.to),
                 )
+            }
+            ServerMsg::QueryRequestV5(query) => {
+                let config = TunConfig {
+                    key_id: config.key_id,
+                    secret: config.secret,
+                    label: config.label.clone(),
+                    endpoints: config.endpoints.clone(),
+                    proxy_protocol: config.proxy_protocol,
+                };
+                match net::sock::backend_kind() {
+                    net::sock::BackendKind::Tokio | net::sock::BackendKind::Epoll => {
+                        tokio::task::spawn_local(async move {
+                            if let Err(e) = handle_query(ingress, &config, query).await {
+                                error!("minitun handle_query failed: {e}");
+                            }
+                        });
+                    }
+                    net::sock::BackendKind::Uring => {
+                        net::sock::uring::spawn(async move {
+                            if let Err(e) = handle_query(ingress, &config, query).await {
+                                error!("minitun handle_query failed: {e}");
+                            }
+                        });
+                    }
+                }
+                continue;
             }
             _ => continue,
         };

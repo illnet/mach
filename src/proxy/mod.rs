@@ -595,7 +595,7 @@ impl Lure {
         mut client: EncodedConnection,
         handshake: &OwnedHandshake,
         resolved: Option<ResolvedRoute>,
-        handshake_raw: Vec<u8>,
+        _handshake_raw: Vec<u8>,
     ) -> anyhow::Result<()> {
         const INTENT: ClientIntent = ClientIntent {
             tag: IntentTag::Query,
@@ -663,12 +663,32 @@ impl Lure {
                 return Ok(());
             };
 
+            // v5+ fast path: agent performs MC status handshake locally, returns just JSON
+            if let Some(json) = self
+                .try_tunnel_status_query_fast_path(
+                    route.as_ref(),
+                    backend_addr,
+                    key_id,
+                    handshake,
+                    client_addr,
+                )
+                .await?
+            {
+                if route.cache_query() {
+                    self.router.query_cache().set(route_id, json.as_bytes().to_vec()).await;
+                    debug!("CacheQuery cached response for route {}", route_id);
+                }
+                query::send_status_response(&mut client, json.as_bytes()).await?;
+                query::handle_ping_pong_local(&mut client, self.threat).await?;
+                return Ok(());
+            }
+
             match self
                 .open_tunnel_status_connection(
                     route.as_ref(),
                     backend_addr,
                     key_id,
-                    &handshake_raw,
+                    handshake,
                     client_addr,
                 )
                 .await
@@ -1037,19 +1057,69 @@ impl Lure {
         Ok(())
     }
 
+    async fn try_tunnel_status_query_fast_path(
+        &self,
+        _route: &Route,
+        target: SocketAddr,
+        key_id: TokenKeyId,
+        handshake: &OwnedHandshake,
+        _client_addr: SocketAddr,
+    ) -> anyhow::Result<Option<String>> {
+        let agent_version = self.tunnels.agent_version(key_id).await.unwrap_or(0);
+        if agent_version < tun::VERSION {
+            return Ok(None);
+        }
+
+        let mut session_bytes = [0u8; 32];
+        fill_random(&mut session_bytes)?;
+        let session_token = SessionToken(session_bytes);
+
+        let server_addr_str = format!(
+            "{}:{}",
+            handshake.server_address,
+            handshake.server_port
+        );
+        let server_address = resolve_socket_addr(&server_addr_str)
+            .map_err(|e| anyhow::anyhow!("failed to resolve handshake server address {server_addr_str}: {e}"))?;
+
+        let receiver = self
+            .tunnels
+            .request_query_from_agent(
+                key_id,
+                session_token,
+                handshake.protocol_version,
+                server_address,
+                target,
+            )
+            .await?;
+
+        match timeout(Duration::from_secs(10), receiver).await {
+            Ok(Ok(response)) => Ok(Some(response.json)),
+            Ok(Err(_)) => anyhow::bail!("tunnel agent dropped query session"),
+            Err(_) => anyhow::bail!("tunnel agent query timeout"),
+        }
+    }
+
     async fn open_tunnel_status_connection(
         &self,
         route: &Route,
         target: SocketAddr,
         key_id: TokenKeyId,
-        handshake_raw: &[u8],
+        handshake: &OwnedHandshake,
         client_addr: SocketAddr,
     ) -> anyhow::Result<EncodedConnection> {
         let connection = self
             .open_tunnel_connection(route, target, key_id, client_addr)
             .await?;
         let mut server = EncodedConnection::new(connection, SocketIntent::GreetToBackend);
-        server.send_raw(handshake_raw).await?;
+        let packet = net::mc::HandshakeC2s {
+            protocol_version: handshake.protocol_version,
+            server_address: &handshake.server_address,
+            server_port: handshake.server_port,
+            next_state: HandshakeNextState::Status,
+        };
+        let encoded = crate::packet::encode_uncompressed_packet(&packet)?;
+        server.send_raw(&encoded).await?;
         Ok(server)
     }
 
@@ -1174,6 +1244,21 @@ impl Lure {
                 tun::encode_server_msg(&tun::ServerMsg::ForwardAck(hello.hmac), &mut buf);
                 let mut connection = connection;
                 connection.write_all(buf).await?;
+            }
+            tun::Intent::Query => {
+                let Some(query) = hello.query else {
+                    anyhow::bail!("query intent hello missing query payload");
+                };
+                self.tunnels
+                    .accept_query_response(
+                        key_id,
+                        hello.timestamp,
+                        hello.hmac,
+                        SessionToken(query.session),
+                        query.json,
+                        hello.version,
+                    )
+                    .await?;
             }
         }
         Ok(())
