@@ -24,7 +24,8 @@ fn main() {
     if let Err(err) = tun::client::run_cli() {
         eprintln!("{err}");
         if is_code_error(&err) {
-            sentry::capture_error(&err);
+            let err: &(dyn std::error::Error + 'static) = err.as_ref();
+            sentry::capture_error(err);
         }
         drop(sentry);
         std::process::exit(1);
@@ -60,7 +61,7 @@ fn init_sentry(service: &'static str) -> Option<sentry::ClientInitGuard> {
             server_name: None,
             enable_logs: true,
             before_send_log: Some(Arc::new(|log| match log.level {
-                LogLevel::Error | LogLevel::Warning => Some(log),
+                LogLevel::Error | LogLevel::Warn => Some(log),
                 _ => None,
             })),
             environment: sentry_environment,
