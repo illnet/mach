@@ -230,8 +230,6 @@ struct AgentRecord {
     peer_addr: SocketAddr,
     /// Channel used by the registry to send [`TunnelCommand`] offers to this agent task.
     tx: mpsc::Sender<TunnelCommand>,
-    /// Listener task that owns the agent socket; abort on replacement/eviction.
-    task: tokio::task::JoinHandle<()>,
     /// Instant when the current agent registration was created.
     connected_at: Instant,
     /// Instant of the latest health beacon; expected to be >= `connected_at`.
@@ -248,6 +246,7 @@ struct PendingSession {
 }
 
 enum TunnelCommand {
+    Affirmation([u8; 32]),
     ForwardRequest {
         session: SessionToken,
         ttl: u8,

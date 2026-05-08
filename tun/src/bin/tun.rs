@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use log::error;
 use sentry::protocol::LogLevel;
 
 const SENTRY_DSN: &str =
@@ -23,8 +22,7 @@ fn main() {
     }
 
     if let Err(err) = tun::client::run_cli() {
-        capture_sentry_error("minitun_fatal", "tunnel_client", &err);
-        error!("{err}");
+        eprintln!("{err}");
         drop(sentry);
         std::process::exit(1);
     }
@@ -47,7 +45,7 @@ fn init_sentry(service: &'static str) -> Option<sentry::ClientInitGuard> {
             server_name: None,
             enable_logs: true,
             before_send_log: Some(Arc::new(|log| match log.level {
-                LogLevel::Warn | LogLevel::Error | LogLevel::Fatal => Some(log),
+                LogLevel::Fatal => Some(log),
                 _ => None,
             })),
             environment: sentry_environment,
@@ -60,21 +58,4 @@ fn init_sentry(service: &'static str) -> Option<sentry::ClientInitGuard> {
         scope.set_tag("default_error_origin", "tunnel_client");
     });
     Some(guard)
-}
-
-fn capture_sentry_error(event: &str, origin: &str, err: &anyhow::Error) {
-    sentry::with_scope(
-        |scope| {
-            scope.set_tag("event", event);
-            scope.set_tag("error_origin", origin);
-            scope.set_tag("error_type", "anyhow::Error");
-            scope.set_extra("error", format!("{err:#}").into());
-        },
-        || {
-            sentry::capture_message(
-                &format!("Tunnel client runtime failure: {err:#}"),
-                sentry::Level::Error,
-            );
-        },
-    );
 }

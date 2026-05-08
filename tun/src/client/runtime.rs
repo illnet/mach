@@ -142,6 +142,7 @@ const MAX_CONCURRENT_TUNNEL_SESSIONS: usize = 1000;
 const INITIAL_RECONNECT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 const HEALTH_BEACON_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 const HEALTH_BEACON_WARN_EVERY: u8 = 3;
+const HEALTH_BEACON_RECONNECT_AFTER: u8 = 2;
 
 fn initial_reconnect_delay(max_delay: std::time::Duration) -> std::time::Duration {
     INITIAL_RECONNECT_BACKOFF.min(max_delay)
@@ -399,9 +400,14 @@ async fn listen_once(
                             || beacon_failures.is_multiple_of(HEALTH_BEACON_WARN_EVERY)
                         {
                             warn!(
-                                "health beacon failed (non-fatal): key_id={} endpoint={ingress} failures={} err={err}",
+                                "health beacon failed: key_id={} endpoint={ingress} failures={} err={err}",
                                 config.label,
                                 beacon_failures
+                            );
+                        }
+                        if beacon_failures >= HEALTH_BEACON_RECONNECT_AFTER {
+                            anyhow::bail!(
+                                "health beacon failed {beacon_failures} times; reconnecting listen channel"
                             );
                         }
                     }
@@ -411,9 +417,14 @@ async fn listen_once(
                             || beacon_failures.is_multiple_of(HEALTH_BEACON_WARN_EVERY)
                         {
                             warn!(
-                                "health beacon probe task dropped (non-fatal): key_id={} endpoint={ingress} failures={}",
+                                "health beacon probe task dropped: key_id={} endpoint={ingress} failures={}",
                                 config.label,
                                 beacon_failures
+                            );
+                        }
+                        if beacon_failures >= HEALTH_BEACON_RECONNECT_AFTER {
+                            anyhow::bail!(
+                                "health beacon probe dropped {beacon_failures} times; reconnecting listen channel"
                             );
                         }
                     }

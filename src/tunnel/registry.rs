@@ -176,12 +176,16 @@ impl TunnelRegistry {
             .agent_gen
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        if agent_version >= tun::VERSION {
+            let _ = tx.try_send(TunnelCommand::Affirmation([0u8; 32]));
+        }
+
         LureLogger::tunnel_agent_registered(&key_id_prefix(&key_id.0));
 
-        // Spawn the task that will push offers to the agent. If a new agent registers with the
-        // same key_id (restart), we abort the old task and replace it.
+        // Spawn the task that serializes all writes to the agent. If a new agent registers with the
+        // same key_id, dropping the old sender lets the old task drain and close cleanly.
         let registry = Arc::clone(self);
-        let task = spawn_named("tunnel-agent-listener", async move {
+        let _task = spawn_named("tunnel-agent-listener", async move {
             // Keep listener socket active during idle periods so intermediate NAT/load-balancer
             // state does not expire the long-lived listen channel.
             const LISTENER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -192,20 +196,24 @@ impl TunnelRegistry {
                 let maybe_cmd = tokio::select! {
                     cmd = rx.recv() => cmd,
                     _ = keepalive_interval.tick(), if agent_version >= tun::VERSION => {
-                        let mut keepalive = Vec::new();
-                        tun::encode_server_msg(&tun::ServerMsg::ForwardAck([0u8; 32]), &mut keepalive);
-                        if connection.write_all(keepalive).await.is_err() {
-                            break;
-                        }
-                        continue;
+                        Some(TunnelCommand::Affirmation([0u8; 32]))
                     }
                 };
                 let Some(cmd) = maybe_cmd else {
+                    if agent_version >= tun::VERSION {
+                        let mut buf = Vec::new();
+                        tun::encode_server_msg(&tun::ServerMsg::ForwardAck([0u8; 32]), &mut buf);
+                        let _ = connection.write_all(buf).await;
+                        let _ = connection.shutdown().await;
+                    }
                     break;
                 };
 
                 let mut buf = Vec::new();
                 match cmd {
+                    TunnelCommand::Affirmation(token) => {
+                        tun::encode_server_msg(&tun::ServerMsg::ForwardAck(token), &mut buf);
+                    }
                     TunnelCommand::ForwardRequest {
                         session,
                         ttl,
@@ -261,7 +269,6 @@ impl TunnelRegistry {
                     version: agent_version,
                     peer_addr,
                     tx: tx.clone(),
-                    task,
                     connected_at: Instant::now(),
                     last_beacon_at: Instant::now(),
                     offers_sent: 0,
@@ -277,7 +284,7 @@ impl TunnelRegistry {
                 &peer_addr,
                 agent_version,
             );
-            old.task.abort();
+            drop(old.tx);
         }
 
         Ok(())
@@ -489,8 +496,10 @@ impl TunnelRegistry {
         let mut agents = self.agents.write().await;
         if let Some(agent) = agents.get_mut(&key_id) {
             agent.last_beacon_at = now;
+            return Ok(());
         }
-        Ok(())
+
+        anyhow::bail!("no active tunnel agent registered for beacon key_id")
     }
 
     pub async fn inspect_snapshot(&self) -> crate::telemetry::inspect::TunnelInspectSnapshot {
