@@ -20,6 +20,8 @@ pub enum TunnelError {
     InvalidMsgKind(u8),
     #[error("invalid address family {0}")]
     InvalidAddrFamily(u8),
+    #[error("payload too large for wire format")]
+    PayloadTooLarge,
 }
 
 /// Fixed protocol magic prefix.
@@ -191,6 +193,9 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
     if version < V4_VERSION && matches!(intent, Intent::Beacon) {
         return Err(TunnelError::UnsupportedVersion(version));
     }
+    if version < VERSION && matches!(intent, Intent::Query) {
+        return Err(TunnelError::UnsupportedVersion(version));
+    }
 
     let mut key_id = [0u8; 8];
     key_id.copy_from_slice(&buf[6..14]);
@@ -295,6 +300,10 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
 
 /// Encodes `AgentHello` into output buffer.
 pub fn encode_agent_hello(hello: &AgentHello, out: &mut Vec<u8>) -> Result<(), TunnelError> {
+    if hello.version < VERSION && matches!(hello.intent, Intent::Query) {
+        return Err(TunnelError::UnsupportedVersion(hello.version));
+    }
+
     // Validate intent/session invariant: only Connect may have a session, others must not
     match hello.intent {
         Intent::Connect => {
@@ -353,7 +362,7 @@ pub fn encode_agent_hello(hello: &AgentHello, out: &mut Vec<u8>) -> Result<(), T
             let query = hello.query.as_ref().expect("validated above");
             out.extend_from_slice(&query.session);
             let json = query.json.as_bytes();
-            let len = u16::try_from(json.len()).expect("query json too long");
+            let len = u16::try_from(json.len()).map_err(|_| TunnelError::PayloadTooLarge)?;
             out.extend_from_slice(&len.to_be_bytes());
             out.extend_from_slice(json);
         }
@@ -402,7 +411,8 @@ pub fn encode_server_msg(msg: &ServerMsg, out: &mut Vec<u8>) {
             out.push(ServerMsgKind::QueryResponseV5 as u8);
             out.extend_from_slice(&msg.session);
             let json = msg.json.as_bytes();
-            let len = u16::try_from(json.len()).expect("query json too long");
+            let len = u16::try_from(json.len())
+                .expect("query response json exceeds u16::MAX wire limit");
             out.extend_from_slice(&len.to_be_bytes());
             out.extend_from_slice(json);
         }

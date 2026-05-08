@@ -468,10 +468,25 @@ impl TunnelRegistry {
 
     pub async fn accept_query_response(
         &self,
+        key_id: TokenKeyId,
+        timestamp: u64,
+        hmac: [u8; 32],
         session: SessionToken,
         json: String,
         agent_version: u8,
     ) -> anyhow::Result<()> {
+        self.validate_hmac(
+            &key_id,
+            timestamp,
+            tun::Intent::Query,
+            Some(&session.0),
+            None,
+            0,
+            None,
+            &hmac,
+        )
+        .await?;
+
         let Some(respond) = self.pending_query.write().await.remove(&session) else {
             anyhow::bail!("no pending tunnel query session");
         };

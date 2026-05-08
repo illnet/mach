@@ -23,9 +23,24 @@ fn main() {
 
     if let Err(err) = tun::client::run_cli() {
         eprintln!("{err}");
+        if is_code_error(&err) {
+            sentry::capture_error(&err);
+        }
         drop(sentry);
         std::process::exit(1);
     }
+}
+
+fn is_code_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if cause.downcast_ref::<tun::TunnelError>().is_some() {
+            return false;
+        }
+        if cause.downcast_ref::<std::io::Error>().is_some() {
+            return false;
+        }
+    }
+    true
 }
 
 fn init_sentry(service: &'static str) -> Option<sentry::ClientInitGuard> {
@@ -45,7 +60,7 @@ fn init_sentry(service: &'static str) -> Option<sentry::ClientInitGuard> {
             server_name: None,
             enable_logs: true,
             before_send_log: Some(Arc::new(|log| match log.level {
-                LogLevel::Fatal => Some(log),
+                LogLevel::Error | LogLevel::Warning => Some(log),
                 _ => None,
             })),
             environment: sentry_environment,

@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -323,6 +324,17 @@ async fn handle_session(
 }
 
 async fn handle_query(
+    ingress: SocketAddr,
+    config: &TunConfig,
+    query: crate::QueryRequestV5Msg,
+) -> anyhow::Result<()> {
+    const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+    tokio::time::timeout(QUERY_TIMEOUT, handle_query_inner(ingress, config, query.clone()))
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("query timed out")))
+}
+
+async fn handle_query_inner(
     ingress: SocketAddr,
     config: &TunConfig,
     query: crate::QueryRequestV5Msg,

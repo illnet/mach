@@ -1074,13 +1074,21 @@ impl Lure {
         fill_random(&mut session_bytes)?;
         let session_token = SessionToken(session_bytes);
 
+        let server_addr_str = format!(
+            "{}:{}",
+            handshake.server_address,
+            handshake.server_port
+        );
+        let server_address = resolve_socket_addr(&server_addr_str)
+            .map_err(|e| anyhow::anyhow!("failed to resolve handshake server address {server_addr_str}: {e}"))?;
+
         let receiver = self
             .tunnels
             .request_query_from_agent(
                 key_id,
                 session_token,
                 handshake.protocol_version,
-                self.tunnel_forward_addr().await?,
+                server_address,
                 target,
             )
             .await?;
@@ -1243,6 +1251,9 @@ impl Lure {
                 };
                 self.tunnels
                     .accept_query_response(
+                        key_id,
+                        hello.timestamp,
+                        hello.hmac,
                         SessionToken(query.session),
                         query.json,
                         hello.version,
