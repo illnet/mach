@@ -116,7 +116,7 @@ async fn run() -> anyhow::Result<()> {
         let mut hs_raw = Vec::new();
         let _ = encode_packet(&mut hs_raw, &hs);
         let mut login_body = Vec::new();
-        let _ = login.encode_body_with_version(&mut login_body, 758);
+        let _ = login.encode_body_with_version(&mut login_body, *hs.protocol_version);
         let mut login_raw = Vec::new();
         let _ = encode_raw_packet(&mut login_raw, LoginStartC2s::ID, &login_body);
 

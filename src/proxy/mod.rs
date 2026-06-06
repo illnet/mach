@@ -50,14 +50,14 @@ fn rpc_url_from_env() -> Option<String> {
 }
 
 /// Read and parse an incoming HAProxy PROXY protocol v2 header from a
-/// freshly-accepted connection, returning the real client address.
+/// freshly-accepted connection, returning the real client address and any
+/// leftover bytes after the header (e.g., pipelined handshake data).
 async fn read_proxy_protocol_addr(
     client: &mut crate::sock::LureConnection,
-) -> anyhow::Result<SocketAddr> {
+) -> anyhow::Result<(SocketAddr, Vec<u8>)> {
     let mut buf = Vec::new();
     let mut read_buf = vec![0u8; 1024];
 
-    // Keep reading until we have at least the 16-byte fixed header.
     loop {
         let (n, next) = client.read_chunk(read_buf).await?;
         read_buf = next;
@@ -70,11 +70,9 @@ async fn read_proxy_protocol_addr(
         }
     }
 
-    // The full header length is encoded in bytes 14-15 (big-endian u16).
     let var_len = u16::from_be_bytes([buf[14], buf[15]]) as usize;
     let total_len = 16 + var_len;
 
-    // Read any remaining bytes we need.
     while buf.len() < total_len {
         let (n, next) = client.read_chunk(read_buf).await?;
         read_buf = next;
@@ -85,6 +83,7 @@ async fn read_proxy_protocol_addr(
     }
 
     let header = net::ha::parse(&buf[..total_len])?;
+    let leftovers = buf[total_len..].to_vec();
 
     let real_addr = match header.address {
         net::ha::AddressInfo::Ipv4(src, _) => SocketAddr::V4(src),
@@ -93,12 +92,11 @@ async fn read_proxy_protocol_addr(
             anyhow::bail!("proxy protocol UNIX address family not supported for client address");
         }
         net::ha::AddressInfo::None => {
-            // LOCAL command or UNSPEC family — no address info, keep the TCP peer address.
-            return Ok(*client.addr());
+            return Ok((*client.addr(), leftovers));
         }
     };
 
-    Ok(real_addr)
+    Ok((real_addr, leftovers))
 }
 
 /// Main proxy runtime service orchestrating routing, tunnels, and telemetry.
@@ -341,13 +339,26 @@ impl Lure {
                     break;
                 }
                 res = listener.accept() => {
-                    // Accept connection first
                     let (mut client, addr) = res?;
 
                     self.metrics.record_open();
 
-                    // Apply IP-based rate limiting against the proxy's IP
-                    let ip = addr.ip();
+                    // Read incoming PROXY protocol header if enabled
+                    let (client_addr, leftover) = if proxy_protocol {
+                        match read_proxy_protocol_addr(&mut client).await {
+                            Ok((real_addr, leftover)) => (real_addr, leftover),
+                            Err(e) => {
+                                LureLogger::proxy_protocol_failure(&addr, &e);
+                                drop(client);
+                                continue;
+                            }
+                        }
+                    } else {
+                        (addr, Vec::new())
+                    };
+
+                    // Apply IP-based rate limiting against the real client IP
+                    let ip = client_addr.ip();
                     if let Some(rate_limiter) = &rate_limiter
                         && let crate::threat::ratelimit::RateLimitResult::Disallowed { retry_after: _ra } =
                             rate_limiter.check(&ip)
@@ -356,20 +367,6 @@ impl Lure {
                             drop(client);
                             continue;
                     }
-
-                    // Read incoming PROXY protocol header if enabled
-                    let client_addr = if proxy_protocol {
-                        match read_proxy_protocol_addr(&mut client).await {
-                            Ok(real_addr) => real_addr,
-                            Err(e) => {
-                                LureLogger::proxy_protocol_failure(&addr, &e);
-                                drop(client);
-                                continue;
-                            }
-                        }
-                    } else {
-                        addr
-                    };
 
                     // Try to acquire semaphore (non-blocking)
                     match semaphore.clone().try_acquire_owned() {
@@ -382,8 +379,7 @@ impl Lure {
 
                             let lure = self;
                             let handler = async move {
-                                // Apply timeout to connection handling
-                                if let Err(e) = lure.handle_connection(client, client_addr).await {
+                                if let Err(e) = lure.handle_connection(client, client_addr, leftover).await {
                                     LureLogger::connection_closed(&client_addr, &e);
                                 }
                                 drop(permit);
@@ -500,13 +496,26 @@ impl Lure {
         };
 
         loop {
-            // Accept connection first
             let (mut client, addr) = listener.accept().await?;
 
             self.metrics.record_open();
 
-            // Apply IP-based rate limiting against the proxy's IP
-            let ip = addr.ip();
+            // Read incoming PROXY protocol header if enabled
+            let (client_addr, leftover) = if proxy_protocol {
+                match read_proxy_protocol_addr(&mut client).await {
+                    Ok((real_addr, leftover)) => (real_addr, leftover),
+                    Err(e) => {
+                        LureLogger::proxy_protocol_failure(&addr, &e);
+                        drop(client);
+                        continue;
+                    }
+                }
+            } else {
+                (addr, Vec::new())
+            };
+
+            // Apply IP-based rate limiting against the real client IP
+            let ip = client_addr.ip();
             if let Some(rate_limiter) = &rate_limiter
                 && let crate::threat::ratelimit::RateLimitResult::Disallowed { retry_after: _ra } =
                     rate_limiter.check(&ip)
@@ -515,20 +524,6 @@ impl Lure {
                 drop(client);
                 continue;
             }
-
-            // Read incoming PROXY protocol header if enabled
-            let client_addr = if proxy_protocol {
-                match read_proxy_protocol_addr(&mut client).await {
-                    Ok(real_addr) => real_addr,
-                    Err(e) => {
-                        LureLogger::proxy_protocol_failure(&addr, &e);
-                        drop(client);
-                        continue;
-                    }
-                }
-            } else {
-                addr
-            };
 
             // Try to acquire semaphore (non-blocking)
             match semaphore.clone().try_acquire_owned() {
@@ -541,8 +536,8 @@ impl Lure {
 
                     let lure = self;
                     let handler = async move {
-                        // Apply timeout to connection handling
-                        if let Err(e) = lure.handle_connection(client, client_addr).await {
+                        if let Err(e) = lure.handle_connection(client, client_addr, leftover).await
+                        {
                             LureLogger::connection_closed(&client_addr, &e);
                         }
                         drop(permit);
@@ -566,10 +561,12 @@ impl Lure {
         &self,
         client_socket: crate::sock::LureConnection,
         address: SocketAddr,
+        leftover: Vec<u8>,
     ) -> anyhow::Result<()> {
         LureLogger::new_connection(&address);
 
-        self.handle_handshake(client_socket, address).await?;
+        self.handle_handshake(client_socket, address, leftover)
+            .await?;
         Ok(())
     }
 
@@ -577,6 +574,7 @@ impl Lure {
         &self,
         mut connection: crate::sock::LureConnection,
         client_addr: SocketAddr,
+        leftover: Vec<u8>,
     ) -> anyhow::Result<()> {
         let start = Instant::now();
         const HANDSHAKE_INTENT: ClientIntent = ClientIntent {
@@ -585,7 +583,10 @@ impl Lure {
         };
         let ingress = self
             .threat
-            .nuisance(self.read_ingress_hello(&mut connection), HANDSHAKE_INTENT)
+            .nuisance(
+                self.read_ingress_hello(&mut connection, leftover),
+                HANDSHAKE_INTENT,
+            )
             .await
             .inspect_err(|err| {
                 if let Some(ClientFail::Timeout { intent, .. }) = err.downcast_ref::<ClientFail>() {
@@ -662,11 +663,11 @@ impl Lure {
 
         match hs.next_state {
             HandshakeNextState::Status => {
-                self.handle_status(handler, &hs, resolved, handshake_raw)
+                self.handle_status(handler, &hs, resolved, handshake_raw, client_addr)
                     .await
             }
             HandshakeNextState::Login => {
-                self.handle_proxy(handler, &hs, resolved, handshake_raw)
+                self.handle_proxy(handler, &hs, resolved, handshake_raw, client_addr)
                     .await
             }
         }
@@ -678,12 +679,12 @@ impl Lure {
         handshake: &OwnedHandshake,
         resolved: Option<ResolvedRoute>,
         _handshake_raw: Vec<u8>,
+        client_addr: SocketAddr,
     ) -> anyhow::Result<()> {
         const INTENT: ClientIntent = ClientIntent {
             tag: IntentTag::Query,
             duration: Duration::from_secs(1),
         };
-        let client_addr = *client.as_inner().addr();
         let config = self.config_snapshot().await;
         let Some(resolved) = resolved else {
             self.status_error(
@@ -969,6 +970,7 @@ impl Lure {
         handshake: &OwnedHandshake,
         resolved: Option<ResolvedRoute>,
         handshake_raw: Vec<u8>,
+        address: SocketAddr,
     ) -> anyhow::Result<()> {
         const INTENT: ClientIntent = ClientIntent {
             tag: IntentTag::Handshake,
@@ -989,8 +991,6 @@ impl Lure {
             name: Arc::clone(&login.username),
             uuid: login.profile_id,
         });
-
-        let address = *client.as_inner().addr();
         let hostname = handshake.get_stripped_hostname();
         let hostname = hostname.as_ref();
 
@@ -1432,20 +1432,23 @@ impl Lure {
     async fn read_ingress_hello(
         &self,
         connection: &mut crate::sock::LureConnection,
+        initial: Vec<u8>,
     ) -> anyhow::Result<IngressHello> {
-        let mut buf = Vec::new();
+        let mut buf = initial;
         let mut read_buf = vec![0u8; 1024];
         loop {
+            if !buf.is_empty() && buf.len() >= 4 {
+                break;
+            }
             let (n, next) = connection.read_chunk(read_buf).await?;
             read_buf = next;
             if n == 0 {
                 anyhow::bail!("unexpected eof while reading hello");
             }
             buf.extend_from_slice(&read_buf[..n]);
-            if buf.len() < 4 {
-                continue;
+            if buf.len() >= 4 {
+                break;
             }
-            break;
         }
 
         if buf.starts_with(&tun::MAGIC) {
