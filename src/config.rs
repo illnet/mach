@@ -86,7 +86,7 @@ pub struct LureConfig {
     pub advertised_addr: Option<String>,
 
     /// Enable or disable proxy protocol support.
-    #[serde(default, rename = "proxy_procol")]
+    #[serde(default)]
     pub proxy_protocol: bool,
 
     /// Optional Ed25519 private key (base64 string or byte array) for signing proxy headers.

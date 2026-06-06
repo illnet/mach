@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     sync::OnceLock,
 };
@@ -6,9 +7,11 @@ use std::{
 use net::mc::{HandshakeC2s, PacketDecode, PacketFrame, ProtoError};
 
 use crate::{
+    config::LureConfig,
     packet::OwnedHandshake,
     router::{Route, TunnelOpt},
     sock::BackendKind,
+    tunnel::TokenKeyId,
 };
 
 pub(super) fn is_local_ip(ip: IpAddr) -> bool {
@@ -112,6 +115,40 @@ pub(super) fn route_requests_tunnel(route: &Route, tunnel: TunnelOpt) -> bool {
         TunnelOpt::ZoneDefault => true,
         TunnelOpt::None => route.tunnel(),
     }
+}
+
+pub(super) fn should_pretend_tunnel_key(config: &LureConfig, key_id: TokenKeyId) -> bool {
+    let pretended = pretend_tunnel_names();
+    if pretended.is_empty() {
+        return false;
+    }
+
+    let key_hex = hex::encode(key_id.0);
+    if pretended.contains(&key_hex) {
+        return true;
+    }
+
+    config.tunnel.token.iter().any(|token| {
+        token.key_id.trim().eq_ignore_ascii_case(&key_hex)
+            && token
+                .name
+                .as_deref()
+                .is_some_and(|name| pretended.contains(&name.trim().to_ascii_lowercase()))
+    })
+}
+
+fn pretend_tunnel_names() -> &'static HashSet<String> {
+    static PRETENDED: OnceLock<HashSet<String>> = OnceLock::new();
+
+    PRETENDED.get_or_init(|| {
+        std::env::var("MACH_PROXY_PRETEND_TUNNELS")
+            .unwrap_or_default()
+            .split([',', '\n', '\r', '\t', ' '])
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    })
 }
 
 pub(super) fn socket_backend_label(kind: BackendKind) -> &'static str {

@@ -86,15 +86,12 @@ Telemetry: set `OTEL_EXPORTER_OTLP_ENDPOINT` to enable OTEL export.
 
 `settings.toml` is plain TOML. No generators. No templates. No "just run the installer".
 
-Notes:
-- The config key is spelled `proxy_procol` (typo preserved for compatibility).
-
 Minimal example:
 
 ```toml
 inst = "main"
 bind = "0.0.0.0:25577"
-proxy_procol = false
+proxy_protocol = false
 max_conn = 65535
 cooldown = 3
 

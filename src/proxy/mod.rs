@@ -42,7 +42,7 @@ pub(crate) use event_ident::EventIdent;
 use helpers::{
     IngressHello, decode_handshake_frame, enforce_local_ip_block, is_local_ip,
     is_routable_forward_ip, normalize_optional_url, resolve_socket_addr, route_requests_tunnel,
-    socket_backend_label, unsupported_tunnel_version,
+    should_pretend_tunnel_key, socket_backend_label, unsupported_tunnel_version,
 };
 
 fn rpc_url_from_env() -> Option<String> {
@@ -58,6 +58,7 @@ async fn read_proxy_protocol_addr(
     let mut buf = Vec::new();
     let mut read_buf = vec![0u8; 1024];
 
+    // Keep reading until we have at least the 16-byte fixed header.
     loop {
         let (n, next) = client.read_chunk(read_buf).await?;
         read_buf = next;
@@ -70,9 +71,11 @@ async fn read_proxy_protocol_addr(
         }
     }
 
+    // The full header length is encoded in bytes 14-15 (big-endian u16).
     let var_len = u16::from_be_bytes([buf[14], buf[15]]) as usize;
     let total_len = 16 + var_len;
 
+    // Read any remaining bytes we need.
     while buf.len() < total_len {
         let (n, next) = client.read_chunk(read_buf).await?;
         read_buf = next;
@@ -694,6 +697,7 @@ impl Lure {
                 "Server route not found",
             )
             .await?;
+            query::handle_ping_pong_local(&mut client, self.threat).await?;
             return Ok(());
         };
 
@@ -701,6 +705,14 @@ impl Lure {
         let route_id = route.id;
         let tunnel = resolved.tunnel;
         let requested_tunnel = route_requests_tunnel(route, tunnel);
+        let resolved_key_id = if requested_tunnel {
+            self.resolve_tunnel_key_id(route, tunnel).await
+        } else {
+            None
+        };
+        let pretend_tunnel = resolved_key_id
+            .is_some_and(|key_id| should_pretend_tunnel_key(&config, key_id));
+        let use_tunnel = requested_tunnel && !pretend_tunnel;
 
         // Check OverrideQuery flag: serve placeholder without contacting backend
         if route.override_query() {
@@ -734,8 +746,8 @@ impl Lure {
         let backend_addr = resolved.endpoint;
         let backend_label = backend_addr.to_string();
 
-        let mut server = if requested_tunnel {
-            let Some(key_id) = self.resolve_tunnel_key_id(route, tunnel).await else {
+        let mut server = if use_tunnel {
+            let Some(key_id) = resolved_key_id else {
                 self.status_error(
                     &mut client,
                     &config,
@@ -1006,11 +1018,7 @@ impl Lure {
         };
 
         let tunnel = resolved.tunnel;
-        let requested_tunnel = match tunnel {
-            crate::router::TunnelOpt::KeyId(_) => true,
-            crate::router::TunnelOpt::ZoneDefault => true,
-            crate::router::TunnelOpt::None => resolved.route.tunnel(),
-        };
+        let requested_tunnel = route_requests_tunnel(resolved.route.as_ref(), tunnel);
 
         // Block local IP clients unless route explicitly permits or the effective route uses a
         // tunnel-backed target.
@@ -1052,8 +1060,11 @@ impl Lure {
         // Tenant tunnel key is optional. We only hard-require it when an endpoint explicitly opts
         // into tunnel mode with @tunnel-key or @<key_id>.
         let resolved_key_id = self.resolve_tunnel_key_id(route.as_ref(), tunnel).await;
+        let config = self.config_snapshot().await;
+        let pretend_tunnel = resolved_key_id
+            .is_some_and(|key_id| should_pretend_tunnel_key(&config, key_id));
 
-        if requested_tunnel {
+        if requested_tunnel && !pretend_tunnel {
             if let Some(key_id) = resolved_key_id {
                 session.inspect.set_tunnel(true);
                 let _ = self
