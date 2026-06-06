@@ -58,7 +58,6 @@ async fn read_proxy_protocol_addr(
     let mut buf = Vec::new();
     let mut read_buf = vec![0u8; 1024];
 
-    // Keep reading until we have at least the 16-byte fixed header.
     loop {
         let (n, next) = client.read_chunk(read_buf).await?;
         read_buf = next;
@@ -71,11 +70,9 @@ async fn read_proxy_protocol_addr(
         }
     }
 
-    // The full header length is encoded in bytes 14-15 (big-endian u16).
     let var_len = u16::from_be_bytes([buf[14], buf[15]]) as usize;
     let total_len = 16 + var_len;
 
-    // Read any remaining bytes we need.
     while buf.len() < total_len {
         let (n, next) = client.read_chunk(read_buf).await?;
         read_buf = next;
