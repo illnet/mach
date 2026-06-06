@@ -103,9 +103,9 @@ async fn init_handshake(
     let (server_address, server_port) =
         backend_handshake_parts(handshake, endpoint_host, endpoint_port, preserve_host);
     let packet = net::mc::HandshakeC2s {
-        protocol_version: handshake.protocol_version,
-        server_address: server_address.as_ref(),
-        server_port,
+        protocol_version: net::mc::VarInt(handshake.protocol_version),
+        server_address: net::mc::BoundedStr(server_address.as_ref()),
+        server_port: net::mc::BEu16(server_port),
         next_state: handshake.next_state,
     };
 

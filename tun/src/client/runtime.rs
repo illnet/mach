@@ -8,7 +8,10 @@ use std::{
 
 use anyhow::Context;
 use log::{debug, error, info, warn};
-use net::mc::{HandshakeC2s, HandshakeNextState, PacketDecoder, StatusRequestC2s, StatusResponseS2c, encode_packet};
+use net::mc::{
+    HandshakeC2s, HandshakeNextState, PacketDecode, PacketDecoder, StatusRequestC2s,
+    StatusResponseS2c, encode_packet,
+};
 
 use super::config::{MiniTunConfig, TunConfig, ensure_parent_dir, load_config, resolve_endpoint};
 use crate::{AgentHello, Intent, ServerMsg};
@@ -329,9 +332,12 @@ async fn handle_query(
     query: crate::QueryRequestV5Msg,
 ) -> anyhow::Result<()> {
     const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
-    tokio::time::timeout(QUERY_TIMEOUT, handle_query_inner(ingress, config, query.clone()))
-        .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("query timed out")))
+    tokio::time::timeout(
+        QUERY_TIMEOUT,
+        handle_query_inner(ingress, config, query.clone()),
+    )
+    .await
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("query timed out")))
 }
 
 async fn handle_query_inner(
@@ -349,9 +355,9 @@ async fn handle_query_inner(
     tune_socket(&target_conn);
 
     let hs = HandshakeC2s {
-        protocol_version: query.protocol_version,
-        server_address: &query.server_address.to_string(),
-        server_port: query.server_address.port(),
+        protocol_version: net::mc::VarInt(query.protocol_version),
+        server_address: net::mc::BoundedStr(&query.server_address.to_string()),
+        server_port: net::mc::BEu16(query.server_address.port()),
         next_state: HandshakeNextState::Status,
     };
     let mut enc_buf = Vec::new();
@@ -379,7 +385,7 @@ async fn handle_query_inner(
             }
             let mut body = frame.body.as_slice();
             let response = StatusResponseS2c::decode_body(&mut body)?;
-            let json = response.json.to_owned();
+            let json = response.json.0.to_owned();
 
             let mut agent_conn = crate::connect_agent(ingress).await?;
             tune_socket(&agent_conn);
@@ -416,9 +422,7 @@ async fn handle_query_inner(
             )
             .await?;
 
-            info!(
-                "query response sent: session={session_prefix}",
-            );
+            info!("query response sent: session={session_prefix}",);
             return Ok(());
         }
     }
@@ -551,14 +555,12 @@ async fn listen_once(
             ServerMsg::ForwardRequest(forward) => {
                 (forward.session, forward.request.from, None, None)
             }
-            ServerMsg::ForwardRequestV4(forward) => {
-                (
-                    forward.session,
-                    forward.request.from,
-                    forward.client_addr,
-                    Some(forward.request.to),
-                )
-            }
+            ServerMsg::ForwardRequestV4(forward) => (
+                forward.session,
+                forward.request.from,
+                forward.client_addr,
+                Some(forward.request.to),
+            ),
             ServerMsg::QueryRequestV5(query) => {
                 let config = TunConfig {
                     key_id: config.key_id,

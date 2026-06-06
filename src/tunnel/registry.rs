@@ -372,7 +372,11 @@ impl TunnelRegistry {
     }
 
     pub async fn agent_version(&self, key_id: TokenKeyId) -> Option<u8> {
-        self.agents.read().await.get(&key_id).map(|agent| agent.version)
+        self.agents
+            .read()
+            .await
+            .get(&key_id)
+            .map(|agent| agent.version)
     }
 
     pub async fn forward_request_to_agent(
@@ -491,7 +495,10 @@ impl TunnelRegistry {
             anyhow::bail!("no pending tunnel query session");
         };
         respond
-            .send(TunnelStatusResponse { json, agent_version })
+            .send(TunnelStatusResponse {
+                json,
+                agent_version,
+            })
             .map_err(|_| anyhow::anyhow!("pending tunnel query closed"))
     }
 

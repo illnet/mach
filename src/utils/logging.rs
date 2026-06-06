@@ -78,6 +78,14 @@ impl LureLogger {
         debug!("Rate-limited {ip}");
     }
 
+    pub fn proxy_protocol_failure(addr: &SocketAddr, err: &Error) {
+        info!("Proxy protocol failure context: peer={addr}");
+        warn!(
+            "Proxy protocol header parse failure: {}",
+            format_anyhow_chain(err)
+        );
+    }
+
     pub fn new_connection(address: &SocketAddr) {
         info!("New connection {address}");
     }

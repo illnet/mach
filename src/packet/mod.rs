@@ -62,17 +62,17 @@ impl OwnedHandshake {
 impl<'a> OwnedPacket<'a, HandshakeC2s<'a>> for OwnedHandshake {
     fn from_packet(hs: HandshakeC2s<'a>) -> Self {
         Self {
-            protocol_version: hs.protocol_version,
-            server_address: Arc::from(hs.server_address),
-            server_port: hs.server_port,
+            protocol_version: *hs.protocol_version,
+            server_address: Arc::from(hs.server_address.0),
+            server_port: hs.server_port.0,
             next_state: hs.next_state,
         }
     }
     fn as_packet(&'a self) -> HandshakeC2s<'a> {
         HandshakeC2s {
-            protocol_version: self.protocol_version,
-            server_address: &self.server_address,
-            server_port: self.server_port,
+            protocol_version: net::mc::VarInt(self.protocol_version),
+            server_address: net::mc::BoundedStr(&self.server_address),
+            server_port: net::mc::BEu16(self.server_port),
             next_state: self.next_state,
         }
     }

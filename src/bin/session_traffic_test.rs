@@ -103,9 +103,9 @@ async fn run() -> anyhow::Result<()> {
 
         // Send Minecraft handshake.
         let hs = HandshakeC2s {
-            protocol_version: 758,
-            server_address: "test.local",
-            server_port: 25565,
+            protocol_version: net::mc::VarInt(758),
+            server_address: net::mc::BoundedStr("test.local"),
+            server_port: net::mc::BEu16(25565),
             next_state: HandshakeNextState::Login,
         };
         let login = LoginStartC2s {
@@ -116,7 +116,7 @@ async fn run() -> anyhow::Result<()> {
         let mut hs_raw = Vec::new();
         let _ = encode_packet(&mut hs_raw, &hs);
         let mut login_body = Vec::new();
-        let _ = login.encode_body_with_version(&mut login_body, 758);
+        let _ = login.encode_body_with_version(&mut login_body, *hs.protocol_version);
         let mut login_raw = Vec::new();
         let _ = encode_raw_packet(&mut login_raw, LoginStartC2s::ID, &login_body);
 
