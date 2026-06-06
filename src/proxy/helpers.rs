@@ -3,7 +3,7 @@ use std::{
     sync::OnceLock,
 };
 
-use net::mc::{HandshakeC2s, PacketFrame, ProtoError};
+use net::mc::{HandshakeC2s, PacketDecode, PacketFrame, ProtoError};
 
 use crate::{
     packet::OwnedHandshake,

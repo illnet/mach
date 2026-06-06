@@ -260,9 +260,9 @@ fn load_worker(addr: SocketAddr, deadline: Instant) -> anyhow::Result<()> {
 
 fn mc_handshake_and_login(host: &str) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let hs = net::mc::HandshakeC2s {
-        protocol_version: 758,
-        server_address: host,
-        server_port: 25565,
+        protocol_version: net::mc::VarInt(758),
+        server_address: net::mc::BoundedStr(host),
+        server_port: net::mc::BEu16(25565),
         next_state: net::mc::HandshakeNextState::Login,
     };
     let login = net::mc::LoginStartC2s {
@@ -274,7 +274,7 @@ fn mc_handshake_and_login(host: &str) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let mut hs_raw = Vec::new();
     net::mc::encode_packet(&mut hs_raw, &hs)?;
     let mut login_body = Vec::new();
-    login.encode_body_with_version(&mut login_body, hs.protocol_version)?;
+    login.encode_body_with_version(&mut login_body, *hs.protocol_version)?;
     let mut login_raw = Vec::new();
     net::mc::encode_raw_packet(&mut login_raw, net::mc::LoginStartC2s::ID, &login_body)?;
     Ok((hs_raw, login_raw))

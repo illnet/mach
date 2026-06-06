@@ -132,7 +132,7 @@ impl EncodedConnection {
     pub async fn disconnect_player(&mut self, reason: &str) -> anyhow::Result<()> {
         let reason_json = serde_json::json!({"text": reason}).to_string();
         let kick = LoginDisconnectS2c {
-            reason: &reason_json,
+            reason: net::mc::BoundedStr(&reason_json),
         };
         self.send(&kick).await?;
         self.drain_pending_inbound();

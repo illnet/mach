@@ -275,11 +275,7 @@ pub fn decode_agent_hello(buf: &[u8]) -> Result<Option<(AgentHello, usize)>, Tun
                 .map_err(|_| TunnelError::ShortBuffer)?
                 .to_owned();
             consumed += len;
-            (
-                None,
-                None,
-                Some(QueryResponseV5Msg { session, json }),
-            )
+            (None, None, Some(QueryResponseV5Msg { session, json }))
         }
     };
 
@@ -411,8 +407,8 @@ pub fn encode_server_msg(msg: &ServerMsg, out: &mut Vec<u8>) {
             out.push(ServerMsgKind::QueryResponseV5 as u8);
             out.extend_from_slice(&msg.session);
             let json = msg.json.as_bytes();
-            let len = u16::try_from(json.len())
-                .expect("query response json exceeds u16::MAX wire limit");
+            let len =
+                u16::try_from(json.len()).expect("query response json exceeds u16::MAX wire limit");
             out.extend_from_slice(&len.to_be_bytes());
             out.extend_from_slice(json);
         }

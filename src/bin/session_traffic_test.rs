@@ -103,9 +103,9 @@ async fn run() -> anyhow::Result<()> {
 
         // Send Minecraft handshake.
         let hs = HandshakeC2s {
-            protocol_version: 758,
-            server_address: "test.local",
-            server_port: 25565,
+            protocol_version: net::mc::VarInt(758),
+            server_address: net::mc::BoundedStr("test.local"),
+            server_port: net::mc::BEu16(25565),
             next_state: HandshakeNextState::Login,
         };
         let login = LoginStartC2s {
